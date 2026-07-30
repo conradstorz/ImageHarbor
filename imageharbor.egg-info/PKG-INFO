@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: imageharbor
+Version: 0.1.0
+Summary: Deterministic, resumable photo organization system
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: Pillow>=10.0.0
+Requires-Dist: click>=8.0.0
+Provides-Extra: openai
+Requires-Dist: openai>=1.0.0; extra == "openai"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+
+# ImageHarbor
+ImageHarbor: Classify. Verify. Preserve.

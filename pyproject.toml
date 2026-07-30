@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imageharbor"
+version = "0.1.0"
+description = "Deterministic, resumable photo organization system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "Pillow>=10.0.0",
+    "click>=8.0.0",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+imageharbor = "imageharbor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["imageharbor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
