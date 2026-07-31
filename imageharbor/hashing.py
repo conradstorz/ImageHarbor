@@ -71,11 +71,13 @@ def extract_digest_from_stem(stem: str) -> str | None:
 
     Returns the digest portion (43 chars) or None if the stem does not match.
     """
-    # Minimum viable stem: "0-x_" (4 chars) + 43-char digest = 47 chars
-    if len(stem) <= SHA256_B64URL_LEN:
+    # Minimum viable stem: "<pcs>-<d>_" (at least 4 chars) + 43-char digest.
+    if len(stem) < SHA256_B64URL_LEN + 4:
         return None
     sep_idx = len(stem) - SHA256_B64URL_LEN - 1
     if stem[sep_idx] != "_":
+        return None
+    if "-" not in stem[:sep_idx]:
         return None
     return stem[sep_idx + 1 :]
 
