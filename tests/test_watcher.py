@@ -125,6 +125,28 @@ def test_run_pass_counts_stat_race_as_error_without_crashing(
     assert stats.skipped_unchanged == 0
 
 
+def test_run_pass_counts_source_unavailable_as_error_without_crashing(
+    source_dir: Path, organized_dir: Path, catalog: Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulate the whole source root / mount dropping mid-pass: discover_images
+    # itself raises OSError (e.g. a dropped SMB mount), not just a single missing
+    # file. run_pass must count it and return, not crash the watcher. Use a bare
+    # OSError (not FileNotFoundError) to prove the broadened catch.
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+
+    def _boom_discover_images(source, recursive=True):
+        raise OSError("mount dropped")
+        yield  # pragma: no cover - makes this a generator like the real one
+
+    monkeypatch.setattr("imageharbor.watcher.discover_images", _boom_discover_images)
+
+    stats = run_pass(pipeline=pipeline, catalog=catalog, source=source_dir)
+
+    assert stats.errors == 1
+    assert stats.processed == 0
+    assert stats.skipped_unchanged == 0
+
+
 def test_watch_exits_immediately_if_stop_already_set(
     source_dir: Path, organized_dir: Path, catalog: Catalog
 ) -> None:

@@ -64,10 +64,11 @@ def run_pass(
                 stats.errors += 1
             # any other status (e.g. a future "skipped") is neither counted as an
             # error nor recorded as seen
-    except FileNotFoundError:
-        # Source disappeared mid-pass (e.g. flaky network mount); count it rather
-        # than crashing the watcher.
-        logger.warning("Source not found: %s; skipping this pass", source, exc_info=True)
+    except OSError:
+        # The source root vanished or the mount dropped mid-pass (discover_images
+        # itself raises here on a flaky network mount). Count it and end the pass
+        # rather than crashing the watcher; the next pass retries.
+        logger.warning("Source unavailable: %s; skipping this pass", source, exc_info=True)
         stats.errors += 1
     return stats
 
