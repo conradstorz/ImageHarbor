@@ -220,9 +220,12 @@ def catalog_cmd() -> None:
 @click.option("--limit", default=50, show_default=True, help="Maximum rows to display.")
 def catalog_list(catalog_path: Path, limit: int) -> None:
     """List photos in the catalog."""
+    rows = []
     with Catalog(catalog_path) as cat:
-        rows = list(cat.iter_all())
-    rows = rows[:limit]
+        for i, row in enumerate(cat.iter_all()):
+            if i >= limit:
+                break
+            rows.append(row)
     if not rows:
         click.echo("(empty catalog)")
         return
