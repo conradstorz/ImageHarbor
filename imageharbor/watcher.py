@@ -38,29 +38,37 @@ def run_pass(
     """Process new/changed files once. Unchanged files (per the source_seen
     cache) are skipped without hashing."""
     stats = WatchStats()
-    for path in discover_images(source, recursive=recursive):
-        try:
-            st = path.stat()
-        except OSError:
-            # File vanished/changed between discovery and stat (common on a
-            # networked mount). Count it and move on rather than crashing.
-            logger.warning("Could not stat %s; skipping this pass", path, exc_info=True)
-            stats.errors += 1
-            continue
-        if catalog.source_is_unchanged(str(path), st.st_size, st.st_mtime_ns):
-            stats.skipped_unchanged += 1
-            continue
-        result = pipeline.process_file(path)
-        if result.status in ("copied", "duplicate"):
-            # Only record success so a transient error is retried next pass.
-            catalog.record_source_seen(
-                str(path), st.st_size, st.st_mtime_ns, result.sha256_b64url
-            )
-            stats.processed += 1
-        elif result.status == "error":
-            stats.errors += 1
-        # any other status (e.g. a future "skipped") is neither counted as an
-        # error nor recorded as seen
+    try:
+        for path in discover_images(source, recursive=recursive):
+            try:
+                st = path.stat()
+            except OSError:
+                # File vanished/changed between discovery and stat (common on a
+                # networked mount). Count it and move on rather than crashing.
+                logger.warning(
+                    "Could not stat %s; skipping this pass", path, exc_info=True
+                )
+                stats.errors += 1
+                continue
+            if catalog.source_is_unchanged(str(path), st.st_size, st.st_mtime_ns):
+                stats.skipped_unchanged += 1
+                continue
+            result = pipeline.process_file(path)
+            if result.status in ("copied", "duplicate"):
+                # Only record success so a transient error is retried next pass.
+                catalog.record_source_seen(
+                    str(path), st.st_size, st.st_mtime_ns, result.sha256_b64url
+                )
+                stats.processed += 1
+            elif result.status == "error":
+                stats.errors += 1
+            # any other status (e.g. a future "skipped") is neither counted as an
+            # error nor recorded as seen
+    except FileNotFoundError:
+        # Source disappeared mid-pass (e.g. flaky network mount); count it rather
+        # than crashing the watcher.
+        logger.warning("Source not found: %s; skipping this pass", source, exc_info=True)
+        stats.errors += 1
     return stats
 
 
