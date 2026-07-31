@@ -38,6 +38,34 @@ def main(log_level: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Classifier construction (shared by process / watch)
+# ---------------------------------------------------------------------------
+
+
+def _build_classifier(
+    ai_backend: str,
+    api_key: str | None,
+    base_url: str | None,
+    model: str,
+    timeout: float,
+):
+    """Construct the AI classifier for the chosen backend. Raises a clean
+    ClickException if the optional 'openai' package is missing."""
+    if ai_backend == "openai":
+        from .ai_classifier import OpenAIClassifier
+
+        try:
+            return OpenAIClassifier(
+                api_key=api_key, model=model, base_url=base_url, timeout=timeout
+            )
+        except ImportError as exc:
+            raise click.ClickException(str(exc)) from exc
+    from .ai_classifier import StubClassifier
+
+    return StubClassifier()
+
+
+# ---------------------------------------------------------------------------
 # process
 # ---------------------------------------------------------------------------
 
@@ -90,10 +118,32 @@ def main(log_level: str) -> None:
     help="AI classification backend.",
 )
 @click.option(
-    "--openai-key",
+    "--ai-base-url",
+    envvar="IMAGEHARBOR_AI_BASE_URL",
     default=None,
-    envvar="OPENAI_API_KEY",
-    help="OpenAI API key (or set OPENAI_API_KEY env var).",
+    help="Base URL of an OpenAI-compatible server (e.g. a local Jetson).",
+)
+@click.option(
+    "--ai-model",
+    envvar="IMAGEHARBOR_AI_MODEL",
+    default="gpt-4o-mini",
+    show_default=True,
+    help="Model name for the AI backend.",
+)
+@click.option(
+    "--ai-timeout",
+    envvar="IMAGEHARBOR_AI_TIMEOUT",
+    default=60.0,
+    show_default=True,
+    type=float,
+    help="AI request timeout (seconds).",
+)
+@click.option(
+    "--openai-key",
+    "openai_key",
+    default=None,
+    envvar=["IMAGEHARBOR_AI_API_KEY", "OPENAI_API_KEY"],
+    help="API key (or set IMAGEHARBOR_AI_API_KEY / OPENAI_API_KEY).",
 )
 @click.option(
     "--no-recursive",
@@ -109,6 +159,9 @@ def process(
     sidecar: bool,
     dry_run: bool,
     ai_backend: str,
+    ai_base_url: str | None,
+    ai_model: str,
+    ai_timeout: float,
     openai_key: str | None,
     no_recursive: bool,
 ) -> None:
@@ -116,18 +169,7 @@ def process(
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
 
-    # Build classifier
-    if ai_backend == "openai":
-        from .ai_classifier import OpenAIClassifier
-
-        try:
-            classifier = OpenAIClassifier(api_key=openai_key)
-        except ImportError as exc:
-            raise click.ClickException(str(exc)) from exc
-    else:
-        from .ai_classifier import StubClassifier
-
-        classifier = StubClassifier()
+    classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
 
     # In dry-run mode nothing may touch the disk: skip creating the dest
     # directory and use an in-memory catalog (sqlite3 ":memory:" creates no
@@ -158,6 +200,160 @@ def process(
     )
     if stats.errors:
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# watch
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option(
+    "--source",
+    envvar="IMAGEHARBOR_SOURCE",
+    required=True,
+    type=click.Path(exists=True, file_okay=True, dir_okay=True, path_type=Path),
+    help="Read-only source directory (or single image file).",
+)
+@click.option(
+    "--dest",
+    envvar="IMAGEHARBOR_DEST",
+    required=True,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Root directory for the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+@click.option(
+    "--interval",
+    envvar="IMAGEHARBOR_INTERVAL",
+    default=300.0,
+    show_default=True,
+    type=float,
+    help="Seconds between watch passes.",
+)
+@click.option(
+    "--duplicates",
+    "duplicates_dir",
+    envvar="IMAGEHARBOR_DUPLICATES",
+    default=None,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Directory to copy duplicates into.",
+)
+@click.option(
+    "--sidecar/--no-sidecar",
+    envvar="IMAGEHARBOR_SIDECAR",
+    default=False,
+    show_default=True,
+    help="Write a JSON sidecar alongside each organized image.",
+)
+@click.option(
+    "--ai",
+    "ai_backend",
+    envvar="IMAGEHARBOR_AI",
+    default="stub",
+    show_default=True,
+    type=click.Choice(["stub", "openai"], case_sensitive=False),
+    help="AI classification backend.",
+)
+@click.option(
+    "--ai-base-url",
+    envvar="IMAGEHARBOR_AI_BASE_URL",
+    default=None,
+    help="Base URL of an OpenAI-compatible server (e.g. a local Jetson).",
+)
+@click.option(
+    "--ai-model",
+    envvar="IMAGEHARBOR_AI_MODEL",
+    default="gpt-4o-mini",
+    show_default=True,
+    help="Model name for the AI backend.",
+)
+@click.option(
+    "--ai-timeout",
+    envvar="IMAGEHARBOR_AI_TIMEOUT",
+    default=60.0,
+    show_default=True,
+    type=float,
+    help="AI request timeout (seconds).",
+)
+@click.option(
+    "--openai-key",
+    "openai_key",
+    default=None,
+    envvar=["IMAGEHARBOR_AI_API_KEY", "OPENAI_API_KEY"],
+    help="API key (or set IMAGEHARBOR_AI_API_KEY / OPENAI_API_KEY).",
+)
+@click.option(
+    "--no-recursive",
+    is_flag=True,
+    default=False,
+    help="Do not recurse into sub-directories.",
+)
+def watch(
+    source: Path,
+    dest: Path,
+    catalog_path: Path | None,
+    interval: float,
+    duplicates_dir: Path | None,
+    sidecar: bool,
+    ai_backend: str,
+    ai_base_url: str | None,
+    ai_model: str,
+    ai_timeout: float,
+    openai_key: str | None,
+    no_recursive: bool,
+) -> None:
+    """Continuously watch SOURCE and organize new/changed photos into DEST."""
+    import signal
+    import threading
+
+    from . import watcher as _watcher
+
+    if catalog_path is None:
+        catalog_path = dest / "catalog.db"
+
+    classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    stop_event = threading.Event()
+
+    def _handle(signum, _frame):
+        click.echo(f"Received signal {signum}; shutting down after current pass.")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle)
+    signal.signal(signal.SIGTERM, _handle)
+
+    with Catalog(catalog_path) as catalog:
+        pipeline = Pipeline(
+            source_dir=source,
+            organized_dir=dest,
+            catalog=catalog,
+            classifier=classifier,
+            duplicates_dir=duplicates_dir,
+            write_sidecars=sidecar,
+        )
+        click.echo(f"Watching {source} -> {dest} every {interval:.0f}s (Ctrl-C to stop).")
+        stats = _watcher.watch(
+            pipeline=pipeline,
+            catalog=catalog,
+            source=source,
+            interval=interval,
+            recursive=not no_recursive,
+            stop_event=stop_event,
+        )
+
+    click.echo(
+        f"Stopped after {stats.passes} pass(es). "
+        f"Processed={stats.processed} Skipped={stats.skipped_unchanged} Errors={stats.errors}"
+    )
 
 
 # ---------------------------------------------------------------------------
