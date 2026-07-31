@@ -91,7 +91,7 @@ def parse_filename(filename: str) -> ParsedFilename | None:
     """
     p = Path(filename)
     stem = p.stem
-    ext = p.suffix.lstrip(".")
+    ext = p.suffix.lstrip(".").lower()
 
     # Locate the separator '_' that precedes the 43-char digest
     if len(stem) <= SHA256_B64URL_LEN:
