@@ -16,6 +16,14 @@ ENV IMAGEHARBOR_SOURCE=/data/source \
     IMAGEHARBOR_DEST=/data/dest \
     IMAGEHARBOR_CATALOG=/data/catalog/catalog.db
 
+# Create the data mount points and give them to the non-root user. A Docker
+# named volume initializes its ownership from the image directory it mounts
+# over, so /data/catalog must be owned by 'harbor' for the catalog to be
+# writable at runtime (bind mounts for source/dest get their ownership from
+# the host).
+RUN mkdir -p /data/source /data/dest /data/catalog \
+    && chown -R harbor:harbor /data
+
 USER harbor
 
 ENTRYPOINT ["imageharbor"]
