@@ -125,7 +125,7 @@ def read_exif(path: Path) -> dict[str, Any]:
                 gps: dict[str, Any] = {}
                 for gps_id, gps_val in gps_raw.items():
                     gps_name = _GPS_TAGS.get(gps_id, f"GPS_{gps_id}")
-                    if isinstance(gps_val, tuple) and not isinstance(gps_val[0], int):
+                    if isinstance(gps_val, tuple) and gps_val and not isinstance(gps_val[0], int):
                         gps_val = [
                             _rational_to_float(v)
                             if hasattr(v, "numerator")
