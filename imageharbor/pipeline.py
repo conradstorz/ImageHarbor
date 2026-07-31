@@ -274,12 +274,15 @@ class Pipeline:
         classification: PhotoClassification,
         exif_data: dict[str, Any],
     ) -> None:
+        from .filename import parse_filename
+
+        parsed = parse_filename(organized_path.name)
         metadata: dict[str, Any] = {
             "sha256_b64url": sha256_b64url,
             "original_path": str(source_path),
             "organized_path": str(organized_path),
-            "pcs_code": classification.pcs_code,
-            "descriptor": classification.descriptor,
+            "pcs_code": parsed["pcs_code"] if parsed else classification.pcs_code,
+            "descriptor": parsed["descriptor"] if parsed else classification.descriptor,
             "caption": classification.caption,
             "objects": classification.objects,
             "secondary_tags": classification.secondary_tags,
