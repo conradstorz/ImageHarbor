@@ -230,8 +230,15 @@ def _install_fake_openai(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = types.ModuleType("openai")
 
     class FakeOpenAI:
-        def __init__(self, api_key: str | None = None) -> None:
+        def __init__(
+            self,
+            api_key: str | None = None,
+            base_url: str | None = None,
+            timeout: float = 60.0,
+        ) -> None:
             self.api_key = api_key
+            self.base_url = base_url
+            self.timeout = timeout
 
     fake.OpenAI = FakeOpenAI  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "openai", fake)
@@ -383,3 +390,28 @@ def test_openai_objects_list_elements_stringified(
 
     assert result.objects == ["sun", "42"]
     assert result.secondary_tags == ["coast"]
+
+
+def test_openai_classifier_passes_base_url_model_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake = types.ModuleType("openai")
+    fake.OpenAI = _FakeOpenAI  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    clf = OpenAIClassifier(
+        api_key=None,
+        model="llava",
+        base_url="http://jetson.local:11434/v1",
+        timeout=30.0,
+    )
+
+    assert captured["base_url"] == "http://jetson.local:11434/v1"
+    assert captured["timeout"] == 30.0
+    assert captured["api_key"] == "not-needed"  # placeholder when none supplied
+    assert clf._model == "llava"
+    assert clf.MODEL_VERSION == "llava"

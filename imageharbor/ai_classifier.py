@@ -179,7 +179,13 @@ class OpenAIClassifier(AIClassifier):
 
     MODEL_VERSION = "gpt-4o-mini"
 
-    def __init__(self, api_key: str | None = None, model: str = "gpt-4o-mini") -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "gpt-4o-mini",
+        base_url: str | None = None,
+        timeout: float = 60.0,
+    ) -> None:
         try:
             import openai as _openai  # type: ignore[import]
         except ImportError as exc:  # pragma: no cover
@@ -189,7 +195,14 @@ class OpenAIClassifier(AIClassifier):
             ) from exc
 
         self._openai = _openai
-        self._client = _openai.OpenAI(api_key=api_key)
+        # Local OpenAI-compatible servers (e.g. Ollama on the Jetson) usually
+        # ignore the API key, but the SDK requires a non-empty value, so fall
+        # back to a placeholder when none is supplied.
+        self._client = _openai.OpenAI(
+            api_key=api_key or "not-needed",
+            base_url=base_url,
+            timeout=timeout,
+        )
         self._model = model
         self.MODEL_VERSION = model
 
