@@ -122,6 +122,35 @@ def test_extract_digest_from_stem_digest_contains_underscore() -> None:
     assert extract_digest_from_stem(stem) == digest
 
 
+def test_extract_digest_from_stem_too_short() -> None:
+    # Length guard: stem must be at least SHA256_B64URL_LEN + 4 (= 47) chars.
+    assert extract_digest_from_stem("a" * 46) is None
+
+
+def test_extract_digest_from_stem_prefix_without_dash() -> None:
+    # Separator '_' is present at position -(43+1), but the prefix has no '-'.
+    stem = f"nodash_{'A' * 43}"
+    assert extract_digest_from_stem(stem) is None
+
+
+def test_extract_digest_from_stem_separator_not_underscore() -> None:
+    # The character at the computed separator position is not '_'.
+    stem = f"330-beachX{'A' * 43}"
+    assert extract_digest_from_stem(stem) is None
+
+
+def test_extract_digest_from_stem_non_numeric_pcs() -> None:
+    # Prefix present, but the part before '-' is not a numeric PCS code.
+    stem = f"abc-desc_{'A' * 43}"
+    assert extract_digest_from_stem(stem) is None
+
+
+def test_extract_digest_from_stem_empty_descriptor() -> None:
+    # Prefix has a numeric PCS code but nothing follows the '-' before '_'.
+    stem = f"330-_{'A' * 43}"
+    assert extract_digest_from_stem(stem) is None
+
+
 # ---------------------------------------------------------------------------
 # verify_pcs_file
 # ---------------------------------------------------------------------------

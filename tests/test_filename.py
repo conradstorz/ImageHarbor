@@ -73,10 +73,37 @@ class TestGenerateFilename:
         name = generate_filename(900, "a" * 40, _FAKE_DIGEST, "jpg")
         assert len(name) <= 100
 
-    def test_long_descriptor_truncated_not_over_100(self) -> None:
+    def test_long_descriptor_capped_by_normalize_descriptor(self) -> None:
+        # NOTE: this does NOT exercise the truncation branch in generate_filename.
+        # "very " * 20 normalises to just "very-very-very" (3 words, 14 chars)
+        # because normalize_descriptor keeps at most 3 words and 30 chars. The
+        # resulting name is well under 100, so no truncation occurs.
         long_desc = "very " * 20
         name = generate_filename(900, long_desc, _FAKE_DIGEST, "jpg")
+        assert "very-very-very" in name
         assert len(name) <= 100
+
+    def test_truncation_branch_triggered_by_long_extension(self) -> None:
+        # The truncation branch (generate_filename lines ~63-68) is reachable,
+        # but NOT via a long descriptor (normalize_descriptor caps it at 30
+        # chars). It is reached when the *extension* is long enough to push the
+        # total past 100. Here: 3-digit pcs + 30-char descriptor + 43-char
+        # digest + 25-char extension = 104 pre-truncation, which trims the
+        # descriptor down to fit exactly 100.
+        name = generate_filename(900, "a" * 30, _FAKE_DIGEST, "e" * 25)
+        assert len(name) == 100
+        assert len(name) <= 100
+        # Descriptor was truncated from 30 to 26 'a's.
+        assert "900-" + "a" * 26 + "_" in name
+        assert "a" * 27 not in name
+
+    def test_very_long_extension_breaks_100_char_guarantee(self) -> None:
+        # DOCUMENTED REAL BEHAVIOUR / KNOWN LIMITATION: generate_filename's
+        # docstring claims the total length is "guaranteed <= 100", but the
+        # extension is never truncated. With a pathologically long extension the
+        # guarantee is violated even after the descriptor is shrunk to 1 char.
+        name = generate_filename(900, "a" * 30, _FAKE_DIGEST, "e" * 60)
+        assert len(name) == 110  # exceeds 100: the guarantee does not hold
 
     def test_digest_preserved_in_full(self) -> None:
         name = generate_filename(330, "beach", _FAKE_DIGEST, "jpg")
@@ -129,3 +156,23 @@ class TestParseFilename:
         parsed = parse_filename(name)
         assert parsed is not None
         assert parsed["sha256_b64url"] == _FAKE_DIGEST
+
+    def test_stem_too_short_returns_none(self) -> None:
+        # Stem length <= SHA256_B64URL_LEN (43) cannot contain a digest.
+        assert parse_filename("short.jpg") is None
+
+    def test_separator_not_underscore_returns_none(self) -> None:
+        # 44-char stem: sep position holds a non-underscore character.
+        assert parse_filename(f"X{_FAKE_DIGEST}.jpg") is None
+
+    def test_accepts_windows_style_path(self) -> None:
+        full = rf"C:\Users\photos\330-beach_{_FAKE_DIGEST}.jpg"
+        parsed = parse_filename(full)
+        assert parsed is not None
+        assert parsed["pcs_code"] == 330
+        assert parsed["descriptor"] == "beach"
+
+    def test_extension_normalized_to_lowercase(self) -> None:
+        parsed = parse_filename(f"330-beach_{_FAKE_DIGEST}.JPG")
+        assert parsed is not None
+        assert parsed["extension"] == "jpg"

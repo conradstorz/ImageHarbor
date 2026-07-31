@@ -163,3 +163,128 @@ def test_pipeline_process_single_file(
     assert result.status == "copied"
     assert result.organized_path is not None
     assert result.organized_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Failure / error paths
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_integrity_failure_removes_copy(
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Force the post-copy verification to fail: the pipeline must unlink the
+    # copied file and record an error (pipeline.py lines 199-203).
+    monkeypatch.setattr("imageharbor.pipeline.verify_file", lambda *a, **k: False)
+
+    single = source_dir / "beach_photo.jpg"
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    result = pipeline.process_file(single)
+
+    assert result.status == "error"
+    assert "Integrity check failed" in result.error
+    # The organized copy must have been removed, not left behind.
+    assert not list(organized_dir.rglob("*.jpg"))
+    # Nothing was catalogued for the failed image.
+    assert catalog.count() == 0
+
+
+def test_pipeline_integrity_failure_counted_in_stats(
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("imageharbor.pipeline.verify_file", lambda *a, **k: False)
+
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    stats = pipeline.run()
+
+    assert stats.errors >= 1
+    assert stats.copied == 0
+    assert not list(organized_dir.rglob("*.jpg"))
+
+
+def test_pipeline_error_path_captures_message_and_continues(
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Make _do_process blow up at step 1 (hashing). The run must not crash; each
+    # failure is captured as an "error" result (pipeline.py lines 137-144).
+    def _boom(*_a, **_k):
+        raise ValueError("hash exploded")
+
+    monkeypatch.setattr("imageharbor.pipeline.compute_sha256_b64url", _boom)
+
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    stats = pipeline.run()
+
+    assert stats.errors == 2  # both source images fail
+    assert stats.copied == 0
+    for result in stats.results:
+        assert result.status == "error"
+        assert "hash exploded" in result.error
+
+
+def test_pipeline_error_path_logs_error(
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def _boom(*_a, **_k):
+        raise ValueError("hash exploded")
+
+    monkeypatch.setattr("imageharbor.pipeline.compute_sha256_b64url", _boom)
+
+    single = source_dir / "beach_photo.jpg"
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    with caplog.at_level("ERROR"):
+        result = pipeline.process_file(single)
+
+    assert result.status == "error"
+    assert any("Error" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate copying
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_duplicates_copied_to_dir(
+    source_dir: Path, organized_dir: Path, catalog: Catalog, tmp_path: Path
+) -> None:
+    # First run copies everything into the catalog.
+    Pipeline(source_dir, organized_dir, catalog).run()
+
+    # Second run, this time with duplicates_dir set: every image is now a
+    # duplicate and must be copied into duplicates_dir (pipeline.py lines
+    # 156-157, 263-267) and recorded in the catalog history (mark_duplicate).
+    dup_dir = tmp_path / "dups"
+    dup_pipeline = Pipeline(
+        source_dir, organized_dir, catalog, duplicates_dir=dup_dir
+    )
+    stats = dup_pipeline.run()
+
+    assert stats.duplicates == 2
+    copied = sorted(p.name for p in dup_dir.iterdir())
+    assert len(copied) == 2
+
+    # Each duplicate filename is prefixed with the first 8 chars of its digest.
+    from imageharbor.hashing import compute_sha256_b64url
+
+    for src in source_dir.rglob("*.jpg"):
+        digest = compute_sha256_b64url(src)
+        expected = f"{digest[:8]}_{src.name}"
+        assert (dup_dir / expected).exists()
+
+        # The catalog recorded a duplicate_detected event for this digest.
+        row = catalog.get_by_sha256(digest)
+        assert row is not None
+        assert "duplicate_detected" in row["processing_history"]
