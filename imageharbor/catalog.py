@@ -34,6 +34,14 @@ CREATE TABLE IF NOT EXISTS photos (
 CREATE INDEX IF NOT EXISTS idx_sha256 ON photos(sha256_b64url);
 CREATE INDEX IF NOT EXISTS idx_pcs_primary ON photos(pcs_primary);
 CREATE INDEX IF NOT EXISTS idx_processed_at ON photos(processed_at);
+
+CREATE TABLE IF NOT EXISTS source_seen (
+    source_path   TEXT    PRIMARY KEY,
+    size          INTEGER NOT NULL,
+    mtime_ns      INTEGER NOT NULL,
+    sha256_b64url TEXT,
+    seen_at       TEXT    NOT NULL
+);
 """
 
 
@@ -169,6 +177,28 @@ class Catalog:
         )
         self._conn.commit()
 
+    def record_source_seen(
+        self,
+        source_path: str,
+        size: int,
+        mtime_ns: int,
+        sha256_b64url: str | None = None,
+    ) -> None:
+        """Record (or update) that a source file was processed, keyed by path."""
+        self._conn.execute(
+            """
+            INSERT INTO source_seen (source_path, size, mtime_ns, sha256_b64url, seen_at)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(source_path) DO UPDATE SET
+                size          = excluded.size,
+                mtime_ns      = excluded.mtime_ns,
+                sha256_b64url = excluded.sha256_b64url,
+                seen_at       = excluded.seen_at
+            """,
+            (source_path, size, mtime_ns, sha256_b64url, _now_iso()),
+        )
+        self._conn.commit()
+
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
@@ -198,6 +228,18 @@ class Catalog:
             "SELECT 1 FROM photos WHERE sha256_b64url=? LIMIT 1", (sha256_b64url,)
         )
         return cursor.fetchone() is not None
+
+    def source_is_unchanged(self, source_path: str, size: int, mtime_ns: int) -> bool:
+        """Return True if this source path was seen before with the same size
+        and mtime (so it can be skipped without re-hashing)."""
+        cur = self._conn.execute(
+            "SELECT size, mtime_ns FROM source_seen WHERE source_path=?",
+            (source_path,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return False
+        return row["size"] == size and row["mtime_ns"] == mtime_ns
 
     # ------------------------------------------------------------------
     # Lifecycle

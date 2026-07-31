@@ -30,6 +30,9 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 | Run the CLI | `uv run imageharbor --help` |
 | Organize a library | `uv run imageharbor process --source SRC --dest DEST` |
 | Re-verify integrity | `uv run imageharbor verify DEST` |
+| Watch a library continuously | `uv run imageharbor watch --source SRC --dest DEST` |
+| Build the Docker image | `docker build -t imageharbor:latest .` |
+| Run the watcher (compose) | `docker compose up -d` (see `docs/deploy-docker.md`) |
 | Query the catalog | `uv run imageharbor catalog list --catalog DEST/catalog.db` |
 
 There is no linter/formatter configured. `pyproject.toml` is the single source of

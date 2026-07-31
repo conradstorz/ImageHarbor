@@ -419,3 +419,43 @@ def test_process_ai_openai_without_package_fails_gracefully(
     if result.exit_code == 0:
         pytest.skip("openai backend is available in this environment")
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# _build_classifier / watch
+# ---------------------------------------------------------------------------
+
+
+def test_build_classifier_stub_default() -> None:
+    from imageharbor.cli import _build_classifier
+    from imageharbor.ai_classifier import StubClassifier
+
+    clf = _build_classifier("stub", None, None, "gpt-4o-mini", 60.0)
+    assert isinstance(clf, StubClassifier)
+
+
+def test_cli_watch_wires_args(monkeypatch, tmp_path):
+    from imageharbor import watcher as _watcher
+    from imageharbor.watcher import WatchStats
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "beach.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9")
+    dest = tmp_path / "dest"
+
+    captured = {}
+
+    def _fake_watch(**kwargs):
+        captured.update(kwargs)
+        return WatchStats(passes=1)
+
+    monkeypatch.setattr(_watcher, "watch", _fake_watch)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["watch", "--source", str(src), "--dest", str(dest), "--interval", "5"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["interval"] == 5.0
+    assert captured["source"] == src

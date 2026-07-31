@@ -1,0 +1,29 @@
+# ImageHarbor continuous watcher.
+#
+# Prerequisites on the Docker host (NOT in this file):
+#   - Mount the NAS source share read-only, e.g. at /mnt/nas/photos
+#   - Mount the NAS organized share read-write, e.g. at /mnt/nas/photos-organized
+#     (via /etc/fstab or autofs; NAS credentials live there, not here.)
+services:
+  imageharbor:
+    build: .
+    image: imageharbor:latest
+    command: watch
+    environment:
+      IMAGEHARBOR_SOURCE: /data/source
+      IMAGEHARBOR_DEST: /data/dest
+      IMAGEHARBOR_CATALOG: /data/catalog/catalog.db
+      IMAGEHARBOR_INTERVAL: "300"
+      IMAGEHARBOR_AI: openai
+      IMAGEHARBOR_AI_BASE_URL: http://jetson.local:11434/v1
+      IMAGEHARBOR_AI_MODEL: llava
+      IMAGEHARBOR_AI_API_KEY: not-needed
+      IMAGEHARBOR_AI_TIMEOUT: "60"
+    volumes:
+      - /mnt/nas/photos:/data/source:ro          # read-only source
+      - /mnt/nas/photos-organized:/data/dest     # read-write organized library
+      - imageharbor-catalog:/data/catalog        # local catalog volume (NOT on NAS)
+    restart: unless-stopped
+
+volumes:
+  imageharbor-catalog:
