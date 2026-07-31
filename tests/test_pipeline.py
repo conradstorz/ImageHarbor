@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from imageharbor.catalog import Catalog
-from imageharbor.hashing import encode_base64url, verify_pcs_file
+from imageharbor.hashing import verify_pcs_file
 from imageharbor.pipeline import Pipeline
 
 
