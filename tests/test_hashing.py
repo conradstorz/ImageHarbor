@@ -1,7 +1,6 @@
 """Tests for imageharbor.hashing."""
 
 import hashlib
-import base64
 from pathlib import Path
 
 import pytest
