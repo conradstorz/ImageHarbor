@@ -88,16 +88,12 @@ def test_process_dry_run_writes_nothing(runner: CliRunner, tmp_path: Path) -> No
     assert "[DRY-RUN]" in result.output
     assert "Copied=2" in result.output
 
-    # No organized image files written
+    # Dry-run must not create the dest directory at all.
+    assert not dest.exists()
+
+    # No organized image files written, and no catalog.db (or WAL) on disk.
     assert not list(dest.rglob("*.jpg"))
-
-    # Catalog, if it exists at all, is empty (dry-run does not upsert).
-    catalog_db = dest / "catalog.db"
-    if catalog_db.exists():
-        from imageharbor.catalog import Catalog
-
-        with Catalog(catalog_db) as cat:
-            assert cat.count() == 0
+    assert not (dest / "catalog.db").exists()
 
 
 def test_process_twice_reports_duplicates(runner: CliRunner, tmp_path: Path) -> None:
@@ -261,10 +257,12 @@ def test_verify_non_pcs_file_skipped(runner: CliRunner, tmp_path: Path) -> None:
     plain = _make_jpeg(tmp_path / "just_a_photo.jpg")
 
     result = runner.invoke(main, ["verify", str(plain)])
-    assert result.exit_code == 0, result.output
+    # Nothing was actually verified -> non-zero exit with a clear warning.
+    assert result.exit_code != 0, result.output
     # No per-file FAIL line (the summary word "FAILED" does not count).
     assert not any(ln.startswith("FAIL ") for ln in result.output.splitlines())
     assert "0 OK, 0 FAILED" in result.output
+    assert "No PCS-format image files found to verify." in result.output
 
 
 def test_verify_directory_mixes_ok_and_skip(runner: CliRunner, tmp_path: Path) -> None:
@@ -347,6 +345,28 @@ def test_catalog_get_existing(runner: CliRunner, tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
     assert data["sha256_b64url"] == sha
+
+
+def test_catalog_get_decodes_json_columns(runner: CliRunner, tmp_path: Path) -> None:
+    """`catalog get` must emit structured values for JSON-TEXT columns rather
+    than escaped strings."""
+    src = _source_with_two_jpegs(tmp_path)
+    dest = tmp_path / "organized"
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
+    db = dest / "catalog.db"
+
+    sha = compute_sha256_b64url(src / "beach_photo.jpg")
+
+    result = runner.invoke(main, ["catalog", "get", "--catalog", str(db), sha])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+
+    # JSON-TEXT columns decode to native structures, not escaped strings.
+    assert isinstance(data["exif"], dict)
+    assert isinstance(data["processing_history"], list)
+    assert isinstance(data["secondary_tags"], list)
+    assert isinstance(data["objects"], list)
 
 
 def test_catalog_get_missing(runner: CliRunner, tmp_path: Path) -> None:

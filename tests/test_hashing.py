@@ -151,6 +151,13 @@ def test_extract_digest_from_stem_empty_descriptor() -> None:
     assert extract_digest_from_stem(stem) is None
 
 
+def test_extract_digest_from_stem_non_ascii_pcs() -> None:
+    # Arabic-Indic digits satisfy str.isdigit() but are NOT ASCII digits, so
+    # they must be rejected as a PCS code.
+    stem = f"٣٣٠-beach_{'A' * 43}"  # "٣٣٠" == 330 in Arabic-Indic
+    assert extract_digest_from_stem(stem) is None
+
+
 # ---------------------------------------------------------------------------
 # verify_pcs_file
 # ---------------------------------------------------------------------------

@@ -49,7 +49,7 @@ def discover_images(source: Path, recursive: bool = True) -> Iterator[Path]:
         return
 
     pattern = "**/*" if recursive else "*"
-    for candidate in sorted(source.glob(pattern)):
+    for candidate in sorted(source.glob(pattern), key=lambda p: p.as_posix()):
         if not candidate.is_file():
             continue
         if candidate.suffix.lower() in SUPPORTED_EXTENSIONS:

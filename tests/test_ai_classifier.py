@@ -73,10 +73,22 @@ def test_stub_two_instances_agree() -> None:
         ("family_portrait", 110),
         ("my_dog", 210),
         ("eagle", 230),
-        # "scan"/"receipt" first appear in the 710 pattern
-        # ("...|receipt|scan"), which precedes the 730 "receipt|invoice|bill"
-        # pattern -> 710 shadows the dedicated receipts code 730.
+        # "receipt_scan" matches "scan" in the 710 pattern (which precedes 730)
+        # -> 710. Note "receipt" was removed from the 710 pattern, so it is
+        # "scan" (not "receipt") that lands this on 710.
         ("receipt_scan", 710),
+        # Whole-word matching: these stems used to bleed via substrings under
+        # re.search but now must NOT misclassify.
+        # "cathedral" no longer matches "cat" (was 210) -> "cathedral" is a
+        # whole word in the 830 pattern.
+        ("cathedral", 830),
+        # "texture" no longer matches "text" (was 710) -> "texture" is a whole
+        # word in the 930 pattern.
+        ("texture", 930),
+        # "oscar" no longer matches "car" (was 410) -> falls through to 900.
+        ("oscar", 900),
+        # "location" no longer matches "cat" (was 210) -> falls through to 900.
+        ("location", 900),
         # No pattern matches -> default miscellaneous.
         ("random_gibberish_xyz", 900),
     ],
@@ -87,11 +99,12 @@ def test_stub_keyword_mapping(stem: str, expected_code: int) -> None:
     assert result.pcs_code == expected_code
 
 
-def test_stub_receipt_alone_still_hits_710_not_730() -> None:
-    # Documents the shadowing explicitly: a bare "receipt" resolves to 710,
-    # never to the dedicated receipts category 730.
+def test_stub_receipt_alone_hits_730_not_710() -> None:
+    # With "receipt" removed from the 710 pattern, a bare "receipt" now
+    # resolves to the dedicated receipts category 730 (no longer shadowed
+    # by 710).
     stub = StubClassifier()
-    assert stub.classify(Path("receipt.jpg"), {}).pcs_code == 710
+    assert stub.classify(Path("receipt.jpg"), {}).pcs_code == 730
 
 
 # ---------------------------------------------------------------------------
@@ -297,3 +310,76 @@ def test_openai_classify_unknown_code_coerced_to_900(
     # Non-code fields from the model are still preserved.
     assert result.descriptor == "mystery"
     assert result.caption == "Unknown thing."
+
+
+# ---------------------------------------------------------------------------
+# OpenAIClassifier — robustness against well-formed JSON with wrong types
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_code", ["not-a-number", None, [330]])
+def test_openai_pcs_code_wrong_type_falls_back_to_900(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path, bad_code: object
+) -> None:
+    # A non-numeric string, null, or list for pcs_code must not crash; it
+    # falls back to 900 like invalid JSON does.
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    payload = {"pcs_code": bad_code, "descriptor": "mystery"}
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
+
+    result = clf.classify(tiny_image, {})
+
+    assert result.pcs_code == 900
+    assert result.descriptor == "mystery"
+
+
+def test_openai_objects_as_string_becomes_empty_list(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    # A bare string must not be char-split into a list of characters.
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    payload = {"pcs_code": 330, "objects": "sunset", "secondary_tags": "coast"}
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
+
+    result = clf.classify(tiny_image, {})
+
+    assert result.pcs_code == 330
+    assert result.objects == []
+    assert result.secondary_tags == []
+
+
+def test_openai_objects_as_non_iterable_becomes_empty_list(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    # A non-iterable (int) must not raise a TypeError.
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    payload = {"pcs_code": 330, "objects": 5, "secondary_tags": 7}
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
+
+    result = clf.classify(tiny_image, {})
+
+    assert result.pcs_code == 330
+    assert result.objects == []
+    assert result.secondary_tags == []
+
+
+def test_openai_objects_list_elements_stringified(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    # Valid list input is preserved (elements coerced to str).
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    payload = {"pcs_code": 330, "objects": ["sun", 42], "secondary_tags": ["coast"]}
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
+
+    result = clf.classify(tiny_image, {})
+
+    assert result.objects == ["sun", "42"]
+    assert result.secondary_tags == ["coast"]

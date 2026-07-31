@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from imageharbor.catalog import Catalog
+from imageharbor.catalog import Catalog, _from_json
 
 
 @pytest.fixture()
@@ -105,6 +105,22 @@ def test_get_by_original_path_missing(catalog: Catalog) -> None:
 # ---------------------------------------------------------------------------
 # Context manager
 # ---------------------------------------------------------------------------
+
+
+def test_from_json_valid_roundtrip() -> None:
+    assert _from_json('[1, 2, 3]') == [1, 2, 3]
+    assert _from_json('{"a": 1}') == {"a": 1}
+
+
+def test_from_json_malformed_returns_raw_and_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Malformed JSON must not be silently swallowed: the raw text is returned
+    # (behavior unchanged) but a warning is logged so data loss is visible.
+    with caplog.at_level("WARNING"):
+        result = _from_json("not-valid-json{")
+    assert result == "not-valid-json{"
+    assert any("Malformed JSON" in rec.message for rec in caplog.records)
 
 
 def test_context_manager(tmp_path: Path) -> None:

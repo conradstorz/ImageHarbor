@@ -276,15 +276,140 @@ def test_pipeline_duplicates_copied_to_dir(
     copied = sorted(p.name for p in dup_dir.iterdir())
     assert len(copied) == 2
 
-    # Each duplicate filename is prefixed with the first 8 chars of its digest.
+    # Each duplicate filename is prefixed with the FULL digest (never an 8-char
+    # prefix) so that distinct-content collisions cannot silently overwrite.
     from imageharbor.hashing import compute_sha256_b64url
 
     for src in source_dir.rglob("*.jpg"):
         digest = compute_sha256_b64url(src)
-        expected = f"{digest[:8]}_{src.name}"
+        expected = f"{digest}_{src.name}"
         assert (dup_dir / expected).exists()
 
         # The catalog recorded a duplicate_detected event for this digest.
         row = catalog.get_by_sha256(digest)
         assert row is not None
         assert "duplicate_detected" in row["processing_history"]
+
+
+# ---------------------------------------------------------------------------
+# Dry-run intra-run deduplication
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_dry_run_intra_run_dedup(
+    organized_dir: Path, catalog: Catalog, tmp_path: Path
+) -> None:
+    # Two source files with IDENTICAL content in a single dry run. Because the
+    # catalog is never written during dry_run, an in-memory seen-set must dedup
+    # them: one "copied", one "duplicate" -- matching what a real run reports.
+    src = tmp_path / "src_identical"
+    src.mkdir()
+    _make_jpeg(src / "a.jpg")
+    _make_jpeg(src / "b.jpg")  # same default content as a.jpg
+
+    pipeline = Pipeline(src, organized_dir, catalog, dry_run=True)
+    stats = pipeline.run()
+
+    assert stats.copied == 1
+    assert stats.duplicates == 1
+    # Still nothing written and the catalog untouched.
+    assert not list(organized_dir.rglob("*.jpg"))
+    assert catalog.count() == 0
+
+    # A real run over the same input reports the same copied/duplicate counts.
+    real_catalog = Catalog(tmp_path / "real.db")
+    try:
+        real_stats = Pipeline(src, organized_dir, real_catalog).run()
+        assert real_stats.copied == stats.copied
+        assert real_stats.duplicates == stats.duplicates
+    finally:
+        real_catalog.close()
+
+
+# ---------------------------------------------------------------------------
+# Resume safety
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_resume_skips_copy_when_dest_verifies(
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # First run organizes everything (this is our simulated pre-existing state).
+    Pipeline(source_dir, organized_dir, catalog).run()
+    organized = list(organized_dir.rglob("*.jpg"))
+    assert organized
+
+    # Simulate a crash-after-copy-before-catalog resume: use a FRESH catalog so
+    # the images are unknown, but the verified organized files already exist.
+    fresh_catalog = Catalog(tmp_path / "fresh.db")
+
+    # copy2 must NOT be called for a destination that already exists and verifies.
+    def _no_copy(*_a, **_k):
+        raise AssertionError("shutil.copy2 must not be called on a verified resume")
+
+    monkeypatch.setattr("imageharbor.pipeline.shutil.copy2", _no_copy)
+
+    try:
+        stats = Pipeline(source_dir, organized_dir, fresh_catalog).run()
+        assert stats.errors == 0
+        assert stats.copied == 2
+        # The pre-existing verified files were re-catalogued, not re-copied.
+        assert fresh_catalog.count() == 2
+        for result in stats.results:
+            assert result.status == "copied"
+    finally:
+        fresh_catalog.close()
+
+
+# ---------------------------------------------------------------------------
+# Sidecar-failure isolation
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_sidecar_failure_does_not_fail_image(
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A failing sidecar write must not turn an already copied+verified+catalogued
+    # image into an "error": status stays "copied", no errors, warning logged.
+    def _boom(*_a, **_k):
+        raise OSError("sidecar disk full")
+
+    monkeypatch.setattr("imageharbor.pipeline.write_sidecar", _boom)
+
+    single = source_dir / "beach_photo.jpg"
+    pipeline = Pipeline(source_dir, organized_dir, catalog, write_sidecars=True)
+    with caplog.at_level("WARNING"):
+        result = pipeline.process_file(single)
+
+    assert result.status == "copied"
+    assert result.organized_path is not None
+    assert result.organized_path.exists()
+    # Image is catalogued despite the sidecar failure.
+    assert catalog.count() == 1
+    # And a warning was logged rather than the error propagating.
+    assert any("sidecar" in rec.message.lower() for rec in caplog.records)
+
+
+def test_pipeline_sidecar_failure_run_counts_no_errors(
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_a, **_k):
+        raise OSError("sidecar disk full")
+
+    monkeypatch.setattr("imageharbor.pipeline.write_sidecar", _boom)
+
+    stats = Pipeline(source_dir, organized_dir, catalog, write_sidecars=True).run()
+
+    assert stats.errors == 0
+    assert stats.copied == 2

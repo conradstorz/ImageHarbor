@@ -104,6 +104,9 @@ class Pipeline:
         self.duplicates_dir = duplicates_dir
         self.write_sidecars = write_sidecars
         self.dry_run = dry_run
+        # Tracks content digests seen during a dry run, so intra-run duplicates
+        # are detected even though the catalog is never written in dry_run mode.
+        self._dry_run_seen: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -115,6 +118,7 @@ class Pipeline:
         Returns a :class:`PipelineStats` summary.
         """
         stats = PipelineStats()
+        self._dry_run_seen.clear()
         for image_path in discover_images(self.source_dir, recursive=recursive):
             result = self._process_one(image_path)
             stats.record(result)
@@ -147,8 +151,12 @@ class Pipeline:
         # Step 1: hash original
         sha256_b64url = compute_sha256_b64url(source_path)
 
-        # Step 2: duplicate detection
-        if self.catalog.is_known(sha256_b64url):
+        # Step 2: duplicate detection. During a dry run the catalog is never
+        # written, so also treat a digest already seen earlier in this same dry
+        # run as a duplicate (intra-run dedup).
+        if self.catalog.is_known(sha256_b64url) or (
+            self.dry_run and sha256_b64url in self._dry_run_seen
+        ):
             existing = self.catalog.get_by_sha256(sha256_b64url)
             logger.info("Duplicate detected: %s (matches %s)", source_path, existing["organized_path"] if existing else "?")
             if not self.dry_run:
@@ -184,6 +192,9 @@ class Pipeline:
         )
 
         if self.dry_run:
+            # Record the digest so a later identical-content file in the same
+            # dry run is reported as a duplicate rather than another "copied".
+            self._dry_run_seen.add(sha256_b64url)
             return ProcessResult(
                 source_path=source_path,
                 sha256_b64url=sha256_b64url,
@@ -193,14 +204,24 @@ class Pipeline:
 
         # Step 8: copy
         organized_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(source_path), str(organized_path))
-
-        # Step 9: verify
-        if not verify_file(organized_path, sha256_b64url):
-            organized_path.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"Integrity check failed after copying {source_path} -> {organized_path}"
+        if organized_path.exists() and verify_file(organized_path, sha256_b64url):
+            # Resumed/idempotent run: the destination already exists and its
+            # bytes verify against the digest. Skip the copy and re-verify and
+            # proceed straight to cataloging. This closes the crash-after-copy-
+            # before-catalog resume gap and avoids blindly overwriting.
+            logger.debug(
+                "Destination already present and verified, skipping copy: %s",
+                organized_path,
             )
+        else:
+            shutil.copy2(str(source_path), str(organized_path))
+
+            # Step 9: verify
+            if not verify_file(organized_path, sha256_b64url):
+                organized_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Integrity check failed after copying {source_path} -> {organized_path}"
+                )
 
         # Step 10: catalog
         self._update_catalog(
@@ -212,9 +233,18 @@ class Pipeline:
             exif_data=exif_data,
         )
 
-        # Step 11: optional sidecar
+        # Step 11: optional sidecar. A sidecar-write failure must NOT fail an
+        # image that is already copied, verified, and catalogued; log and move
+        # on so the result stays "copied".
         if self.write_sidecars:
-            self._write_sidecar(organized_path, source_path, sha256_b64url, pcs_code, descriptor, classification, exif_data)
+            try:
+                self._write_sidecar(organized_path, source_path, sha256_b64url, pcs_code, descriptor, classification, exif_data)
+            except Exception:
+                logger.warning(
+                    "Failed to write sidecar for %s; image is organized and catalogued",
+                    organized_path,
+                    exc_info=True,
+                )
 
         return ProcessResult(
             source_path=source_path,
@@ -263,7 +293,10 @@ class Pipeline:
     def _copy_to_duplicates(self, source_path: Path, sha256_b64url: str) -> None:
         assert self.duplicates_dir is not None
         self.duplicates_dir.mkdir(parents=True, exist_ok=True)
-        dest = self.duplicates_dir / f"{sha256_b64url[:8]}_{source_path.name}"
+        # Use the FULL digest (not an 8-char prefix) to avoid collisions where
+        # a shared prefix plus identical basename would silently overwrite a
+        # different image. Identical content => identical bytes => harmless.
+        dest = self.duplicates_dir / f"{sha256_b64url}_{source_path.name}"
         shutil.copy2(str(source_path), str(dest))
 
     def _write_sidecar(

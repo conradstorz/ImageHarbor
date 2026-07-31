@@ -67,11 +67,18 @@ def _rational_to_float(value: Any) -> float | Any:
 
 def _dms_to_decimal(dms: tuple, ref: str) -> float:
     """Convert degrees/minutes/seconds tuple to decimal degrees."""
+    # Normalize the hemisphere ref: some encoders emit bytes (e.g. b"S") and
+    # others ints; bytes.upper() != "S" would silently skip the sign flip and
+    # int has no .upper(). Decode/stringify defensively first.
+    if isinstance(ref, (bytes, bytearray)):
+        ref_str = bytes(ref).decode("ascii", "ignore")
+    else:
+        ref_str = str(ref)
     degrees = _rational_to_float(dms[0])
     minutes = _rational_to_float(dms[1]) / 60.0
     seconds = _rational_to_float(dms[2]) / 3600.0
     decimal = degrees + minutes + seconds
-    if ref.upper() in ("S", "W"):
+    if ref_str.upper() in ("S", "W"):
         decimal = -decimal
     return decimal
 
@@ -84,7 +91,6 @@ def read_exif(path: Path) -> dict[str, Any]:
     """
     try:
         from PIL import Image
-        from PIL.ExifTags import TAGS
     except ImportError:
         logger.warning("Pillow not installed; EXIF reading disabled")
         return {}
@@ -134,17 +140,23 @@ def read_exif(path: Path) -> dict[str, Any]:
                         ]
                     gps[gps_name] = gps_val
 
-                # Compute decimal lat/lon when possible
+                # Compute decimal lat/lon when possible. Each coordinate is
+                # handled in its own try/except so a missing or malformed
+                # longitude does not drop an otherwise-valid latitude (and vice
+                # versa).
                 try:
                     lat = _dms_to_decimal(
                         tuple(gps.get("GPSLatitude", [])),
                         gps.get("GPSLatitudeRef", "N"),
                     )
+                    gps["latitude_decimal"] = round(lat, 7)
+                except Exception:
+                    pass
+                try:
                     lon = _dms_to_decimal(
                         tuple(gps.get("GPSLongitude", [])),
                         gps.get("GPSLongitudeRef", "E"),
                     )
-                    gps["latitude_decimal"] = round(lat, 7)
                     gps["longitude_decimal"] = round(lon, 7)
                 except Exception:
                     pass

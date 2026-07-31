@@ -101,6 +101,7 @@ def resolve_code(code: int) -> int:
 
 def parent_folder_name(code: int) -> str:
     """Return the top-level folder name, e.g. ``300-places``."""
+    code = resolve_code(code)
     parent_code = (code // 100) * 100
     cat = PCS_CATEGORIES.get(parent_code)
     name = cat.name if cat else "miscellaneous"

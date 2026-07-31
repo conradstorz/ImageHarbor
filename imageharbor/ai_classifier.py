@@ -98,7 +98,7 @@ class StubClassifier(AIClassifier):
             ("landscape|valley|plains|meadow", 620),
             ("storm|rain|snow|fog|cloud|lightning", 630),
             ("sky|sunset|sunrise|stars|moon", 640),
-            ("document|letter|page|text|receipt|scan", 710),
+            ("document|letter|page|text|scan", 710),
             ("chart|graph|diagram|table", 720),
             ("receipt|invoice|bill", 730),
             ("building|house|apartment|mansion", 810),
@@ -109,8 +109,13 @@ class StubClassifier(AIClassifier):
             ("abstract|pattern|texture|art", 930),
         ]
 
+        # Whole-word matching: tokenize the stem into words (stems use "_"/"-"
+        # as separators, so split on non-alphanumerics) and match each keyword
+        # as an exact word. This avoids substring bleed (e.g. "cathedral" no
+        # longer matches "cat").
+        words = set(re.sub(r"[^a-z0-9]+", " ", stem).split())
         for pattern, code in keyword_map:
-            if re.search(pattern, stem):
+            if any(kw in words for kw in pattern.split("|")):
                 pcs_code = code
                 break
 
@@ -195,7 +200,14 @@ class OpenAIClassifier(AIClassifier):
             image_b64 = base64.b64encode(fh.read()).decode("ascii")
 
         suffix = image_path.suffix.lower().lstrip(".")
-        media_type = f"image/{suffix}" if suffix in ("jpg", "jpeg", "png", "gif", "webp") else "image/jpeg"
+        _MEDIA_TYPES = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "gif": "image/gif",
+            "webp": "image/webp",
+        }
+        media_type = _MEDIA_TYPES.get(suffix, "image/jpeg")
 
         system_msg = _SYSTEM_PROMPT.format(pcs_list=_build_pcs_list())
 
@@ -228,17 +240,28 @@ class OpenAIClassifier(AIClassifier):
             logger.warning("OpenAI returned invalid JSON: %s", raw)
             data = {}
 
-        pcs_code = int(data.get("pcs_code", 900))
+        try:
+            pcs_code = int(data.get("pcs_code", 900))
+        except (TypeError, ValueError):
+            pcs_code = 900
         if pcs_code not in PCS_CATEGORIES:
             logger.warning("OpenAI returned unknown PCS code %s; using 900", pcs_code)
             pcs_code = 900
+
+        # Coerce list fields defensively: a JSON string would char-split under
+        # list(), and a non-iterable (e.g. int) would raise. Only accept real
+        # sequences; otherwise fall back to an empty list.
+        objects_val = data.get("objects", [])
+        objects = [str(x) for x in objects_val] if isinstance(objects_val, (list, tuple)) else []
+        tags_val = data.get("secondary_tags", [])
+        secondary_tags = [str(x) for x in tags_val] if isinstance(tags_val, (list, tuple)) else []
 
         return PhotoClassification(
             pcs_code=pcs_code,
             descriptor=str(data.get("descriptor", "photo")),
             caption=str(data.get("caption", "")),
-            objects=list(data.get("objects", [])),
-            secondary_tags=list(data.get("secondary_tags", [])),
+            objects=objects,
+            secondary_tags=secondary_tags,
             ocr_text=str(data.get("ocr_text", "")),
             model_version=self.MODEL_VERSION,
         )

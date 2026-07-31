@@ -81,6 +81,25 @@ def test_sub_folder_name_unknown_falls_back() -> None:
     assert result == "900-miscellaneous"
 
 
+@pytest.mark.parametrize("code", [1500, 50, -50])
+def test_parent_folder_name_out_of_range_falls_back_to_900(code: int) -> None:
+    # Out-of-range codes are resolved to 900 first, so the prefix is always a
+    # valid top-level code (consistent with sub_folder_name / resolve_code).
+    assert parent_folder_name(code) == "900-miscellaneous"
+
+
+@pytest.mark.parametrize("code", [1500, 50, -50, 999, 0])
+def test_parent_and_sub_folder_agree_on_out_of_range(code: int) -> None:
+    # Both helpers resolve out-of-range codes to 900 before deriving names.
+    assert parent_folder_name(code) == "900-miscellaneous"
+    assert sub_folder_name(code) == "900-miscellaneous"
+
+
+def test_parent_folder_name_places_unchanged() -> None:
+    # In-range codes are unaffected by the resolve step.
+    assert parent_folder_name(330) == "300-places"
+
+
 def test_parent_and_sub_folder_consistent() -> None:
     # For every sub-category, parent folder code prefix should match
     for code, cat in PCS_CATEGORIES.items():

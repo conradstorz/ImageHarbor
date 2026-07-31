@@ -84,6 +84,27 @@ def test_dms_to_decimal_ref_case_insensitive() -> None:
     assert _dms_to_decimal(dms, "s") == pytest.approx(-10.0)
 
 
+def test_dms_to_decimal_bytes_ref_south_negates() -> None:
+    # Some encoders emit the hemisphere ref as bytes (e.g. b"S"). The sign
+    # must still flip (bytes.upper() would not equal "S" without normalization).
+    dms = (Fraction(41, 1), Fraction(30, 1), Fraction(0, 1))
+    assert _dms_to_decimal(dms, b"S") == pytest.approx(-41.5)
+
+
+def test_dms_to_decimal_bytes_ref_north_no_flip() -> None:
+    dms = (Fraction(41, 1), Fraction(30, 1), Fraction(0, 1))
+    assert _dms_to_decimal(dms, b"N") == pytest.approx(41.5)
+
+
+def test_dms_to_decimal_lat_and_lon_independent() -> None:
+    # Each coordinate is computed on its own; a valid latitude tuple and a
+    # valid longitude tuple resolve independently at the helper level.
+    lat_dms = (Fraction(41, 1), Fraction(30, 1), Fraction(0, 1))
+    lon_dms = (Fraction(87, 1), Fraction(0, 1), Fraction(0, 1))
+    assert _dms_to_decimal(lat_dms, "N") == pytest.approx(41.5)
+    assert _dms_to_decimal(lon_dms, "W") == pytest.approx(-87.0)
+
+
 # ---------------------------------------------------------------------------
 # read_exif — no EXIF
 # ---------------------------------------------------------------------------

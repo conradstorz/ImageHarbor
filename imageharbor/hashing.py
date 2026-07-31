@@ -81,8 +81,10 @@ def extract_digest_from_stem(stem: str) -> str | None:
     dash_idx = prefix.find("-")
     if dash_idx < 0:
         return None
-    # The part before '-' must be a numeric PCS code; after '-' must be non-empty descriptor.
-    if not prefix[:dash_idx].isdigit() or not prefix[dash_idx + 1:]:
+    # The part before '-' must be a numeric PCS code (ASCII digits only); after
+    # '-' must be a non-empty descriptor.
+    pcs_part = prefix[:dash_idx]
+    if not (pcs_part.isascii() and pcs_part.isdigit()) or not prefix[dash_idx + 1:]:
         return None
     return stem[sep_idx + 1 :]
 

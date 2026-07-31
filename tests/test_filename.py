@@ -97,13 +97,37 @@ class TestGenerateFilename:
         assert "900-" + "a" * 26 + "_" in name
         assert "a" * 27 not in name
 
-    def test_very_long_extension_breaks_100_char_guarantee(self) -> None:
-        # DOCUMENTED REAL BEHAVIOUR / KNOWN LIMITATION: generate_filename's
-        # docstring claims the total length is "guaranteed <= 100", but the
-        # extension is never truncated. With a pathologically long extension the
-        # guarantee is violated even after the descriptor is shrunk to 1 char.
+    def test_very_long_extension_still_capped_at_100(self) -> None:
+        # Even with a pathologically long extension the <=100 guarantee holds:
+        # after the descriptor is shrunk to 1 char, the extension itself is
+        # truncated by the overflow amount.
         name = generate_filename(900, "a" * 30, _FAKE_DIGEST, "e" * 60)
-        assert len(name) == 110  # exceeds 100: the guarantee does not hold
+        assert len(name) <= 100
+
+    def test_multi_dot_extension_collapsed(self) -> None:
+        # "tar.gz" collapses to the part after the last dot -> "gz".
+        name = generate_filename(900, "beach", _FAKE_DIGEST, "tar.gz")
+        assert name.endswith(".gz")
+        assert ".tar" not in name
+
+    def test_invalid_chars_stripped_from_extension(self) -> None:
+        # Non [a-z0-9] characters are removed from the extension.
+        name = generate_filename(900, "beach", _FAKE_DIGEST, "jp<g>")
+        assert name.endswith(".jpg")
+
+    def test_path_separator_stripped_from_extension(self) -> None:
+        # Path separators must never appear in the generated name.
+        name = generate_filename(900, "beach", _FAKE_DIGEST, "jpg/evil")
+        assert "/" not in name
+        assert "\\" not in name
+        # Both '/' path-injection and the sanitiser collapse to "jpgevil".
+        assert name.endswith(".jpgevil")
+
+    def test_empty_extension_no_trailing_dot(self) -> None:
+        # An empty (or fully invalid) extension yields NO trailing dot.
+        name = generate_filename(900, "beach", _FAKE_DIGEST, "")
+        assert not name.endswith(".")
+        assert "." not in name
 
     def test_digest_preserved_in_full(self) -> None:
         name = generate_filename(330, "beach", _FAKE_DIGEST, "jpg")
@@ -176,3 +200,23 @@ class TestParseFilename:
         parsed = parse_filename(f"330-beach_{_FAKE_DIGEST}.JPG")
         assert parsed is not None
         assert parsed["extension"] == "jpg"
+
+    def test_multi_dot_extension_roundtrip(self) -> None:
+        # generate_filename collapses "tar.gz" -> "gz"; parse recovers it.
+        name = generate_filename(900, "beach", _FAKE_DIGEST, "tar.gz")
+        parsed = parse_filename(name)
+        assert parsed is not None
+        assert parsed["descriptor"] == "beach"
+        assert parsed["extension"] == "gz"
+
+    def test_empty_descriptor_returns_none(self) -> None:
+        # Consistent with extract_digest_from_stem: empty descriptor rejected.
+        assert parse_filename(f"330-_{_FAKE_DIGEST}.jpg") is None
+
+    def test_non_ascii_pcs_returns_none(self) -> None:
+        # Arabic-Indic digits are not ASCII digits and must be rejected.
+        assert parse_filename(f"٣٣٠-beach_{_FAKE_DIGEST}.jpg") is None
+
+    def test_plus_signed_pcs_returns_none(self) -> None:
+        # Permissive int() would accept "+330"; the reused validator rejects it.
+        assert parse_filename(f"+330-beach_{_FAKE_DIGEST}.jpg") is None

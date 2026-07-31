@@ -110,5 +110,5 @@ def test_results_are_sorted(tmp_path: Path) -> None:
         (tmp_path / name).write_bytes(b"")
 
     result = list(discover_images(tmp_path))
-    assert result == sorted(result)
+    assert result == sorted(result, key=lambda p: p.as_posix())
     assert [p.name for p in result] == sorted(names)

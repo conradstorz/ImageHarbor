@@ -48,7 +48,8 @@ def _json(value: Any) -> str:
 def _from_json(text: str) -> Any:
     try:
         return json.loads(text)
-    except Exception:
+    except json.JSONDecodeError:
+        logger.warning("Malformed JSON in catalog field; returning raw text: %r", text)
         return text
 
 
@@ -102,6 +103,8 @@ class Catalog:
 
         params = (
             sha256_b64url,
+            # original_path is intentionally NOT in the ON CONFLICT DO UPDATE SET
+            # list below, so on conflict the first-seen path wins (never updated).
             original_path,
             organized_path,
             pcs_version,
@@ -114,7 +117,7 @@ class Catalog:
             _json(exif or {}),
             model_version,
             _json(history),
-            now,  # created_at (ignored on UPDATE via COALESCE)
+            now,  # created_at (preserved on UPDATE: not in the ON CONFLICT SET list)
             now,  # processed_at
         )
 

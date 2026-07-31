@@ -120,15 +120,24 @@ def process(
     if ai_backend == "openai":
         from .ai_classifier import OpenAIClassifier
 
-        classifier = OpenAIClassifier(api_key=openai_key)
+        try:
+            classifier = OpenAIClassifier(api_key=openai_key)
+        except ImportError as exc:
+            raise click.ClickException(str(exc)) from exc
     else:
         from .ai_classifier import StubClassifier
 
         classifier = StubClassifier()
 
-    dest.mkdir(parents=True, exist_ok=True)
+    # In dry-run mode nothing may touch the disk: skip creating the dest
+    # directory and use an in-memory catalog (sqlite3 ":memory:" creates no
+    # file).  The pipeline performs no upserts in dry-run, so it stays empty.
+    if not dry_run:
+        dest.mkdir(parents=True, exist_ok=True)
 
-    with Catalog(catalog_path) as catalog:
+    catalog_target = Path(":memory:") if dry_run else catalog_path
+
+    with Catalog(catalog_target) as catalog:
         pipeline = Pipeline(
             source_dir=source,
             organized_dir=dest,
@@ -195,6 +204,9 @@ def verify(path: Path) -> None:
         f"\nVerified {ok_count + fail_count} PCS image(s) "
         f"({skip_count} non-image/non-PCS skipped): {ok_count} OK, {fail_count} FAILED"
     )
+    if ok_count + fail_count == 0:
+        click.echo("No PCS-format image files found to verify.", err=True)
+        sys.exit(1)
     if fail_count:
         sys.exit(1)
 
@@ -246,12 +258,19 @@ def catalog_get(catalog_path: Path, sha256: str) -> None:
     """Look up a photo by its SHA-256 Base64url digest."""
     import json as _json
 
+    from .catalog import _from_json
+
     with Catalog(catalog_path) as cat:
         row = cat.get_by_sha256(sha256)
     if row is None:
         click.echo(f"Not found: {sha256}", err=True)
         sys.exit(1)
     data = dict(row)
+    # These columns are stored as JSON TEXT; decode them so the output shows
+    # structured values instead of escaped strings.
+    for col in ("secondary_tags", "objects", "exif", "processing_history"):
+        if col in data and isinstance(data[col], str):
+            data[col] = _from_json(data[col])
     click.echo(_json.dumps(data, indent=2, ensure_ascii=False))
 
 
