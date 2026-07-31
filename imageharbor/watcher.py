@@ -39,7 +39,14 @@ def run_pass(
     cache) are skipped without hashing."""
     stats = WatchStats()
     for path in discover_images(source, recursive=recursive):
-        st = path.stat()
+        try:
+            st = path.stat()
+        except OSError:
+            # File vanished/changed between discovery and stat (common on a
+            # networked mount). Count it and move on rather than crashing.
+            logger.warning("Could not stat %s; skipping this pass", path, exc_info=True)
+            stats.errors += 1
+            continue
         if catalog.source_is_unchanged(str(path), st.st_size, st.st_mtime_ns):
             stats.skipped_unchanged += 1
             continue
@@ -50,8 +57,10 @@ def run_pass(
                 str(path), st.st_size, st.st_mtime_ns, result.sha256_b64url
             )
             stats.processed += 1
-        else:
+        elif result.status == "error":
             stats.errors += 1
+        # any other status (e.g. a future "skipped") is neither counted as an
+        # error nor recorded as seen
     return stats
 
 
