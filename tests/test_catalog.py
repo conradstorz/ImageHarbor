@@ -129,3 +129,34 @@ def test_context_manager(tmp_path: Path) -> None:
         cat.upsert(sha256_b64url="C" * 43, original_path="/cm.jpg")
         assert cat.count() == 1
     # After close, any further use would raise; just check it doesn't explode
+
+
+# ---------------------------------------------------------------------------
+# source_seen cache
+# ---------------------------------------------------------------------------
+
+
+def test_source_seen_unknown_is_not_unchanged(catalog: Catalog) -> None:
+    assert catalog.source_is_unchanged("/src/a.jpg", 100, 111) is False
+
+
+def test_source_seen_roundtrip_unchanged(catalog: Catalog) -> None:
+    catalog.record_source_seen("/src/a.jpg", 100, 111, "A" * 43)
+    assert catalog.source_is_unchanged("/src/a.jpg", 100, 111) is True
+
+
+def test_source_seen_changed_size_is_not_unchanged(catalog: Catalog) -> None:
+    catalog.record_source_seen("/src/a.jpg", 100, 111)
+    assert catalog.source_is_unchanged("/src/a.jpg", 200, 111) is False
+
+
+def test_source_seen_changed_mtime_is_not_unchanged(catalog: Catalog) -> None:
+    catalog.record_source_seen("/src/a.jpg", 100, 111)
+    assert catalog.source_is_unchanged("/src/a.jpg", 100, 222) is False
+
+
+def test_source_seen_upsert_updates(catalog: Catalog) -> None:
+    catalog.record_source_seen("/src/a.jpg", 100, 111)
+    catalog.record_source_seen("/src/a.jpg", 100, 999)  # file changed
+    assert catalog.source_is_unchanged("/src/a.jpg", 100, 999) is True
+    assert catalog.source_is_unchanged("/src/a.jpg", 100, 111) is False
