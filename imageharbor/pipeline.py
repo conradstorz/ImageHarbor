@@ -214,7 +214,7 @@ class Pipeline:
 
         # Step 11: optional sidecar
         if self.write_sidecars:
-            self._write_sidecar(organized_path, source_path, sha256_b64url, classification, exif_data)
+            self._write_sidecar(organized_path, source_path, sha256_b64url, pcs_code, descriptor, classification, exif_data)
 
         return ProcessResult(
             source_path=source_path,
@@ -271,6 +271,8 @@ class Pipeline:
         organized_path: Path,
         source_path: Path,
         sha256_b64url: str,
+        pcs_code: int,
+        descriptor: str,
         classification: PhotoClassification,
         exif_data: dict[str, Any],
     ) -> None:
@@ -281,8 +283,8 @@ class Pipeline:
             "sha256_b64url": sha256_b64url,
             "original_path": str(source_path),
             "organized_path": str(organized_path),
-            "pcs_code": parsed["pcs_code"] if parsed else classification.pcs_code,
-            "descriptor": parsed["descriptor"] if parsed else classification.descriptor,
+            "pcs_code": parsed["pcs_code"] if parsed else pcs_code,
+            "descriptor": parsed["descriptor"] if parsed else descriptor,
             "caption": classification.caption,
             "objects": classification.objects,
             "secondary_tags": classification.secondary_tags,

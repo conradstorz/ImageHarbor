@@ -77,7 +77,12 @@ def extract_digest_from_stem(stem: str) -> str | None:
     sep_idx = len(stem) - SHA256_B64URL_LEN - 1
     if stem[sep_idx] != "_":
         return None
-    if "-" not in stem[:sep_idx]:
+    prefix = stem[:sep_idx]
+    dash_idx = prefix.find("-")
+    if dash_idx < 0:
+        return None
+    # The part before '-' must be a numeric PCS code; after '-' must be non-empty descriptor.
+    if not prefix[:dash_idx].isdigit() or not prefix[dash_idx + 1:]:
         return None
     return stem[sep_idx + 1 :]
 
