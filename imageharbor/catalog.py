@@ -49,8 +49,21 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def _json_default(o: Any) -> Any:
+    """Fallback for values ``json.dumps`` cannot serialize natively.
+
+    Real EXIF carries raw ``bytes`` (e.g. ExifVersion, SceneType, MakerNote)
+    and other exotic types; without this a single odd metadata value would
+    raise and fail the whole image. Bytes become a lossy text form; anything
+    else falls back to its string representation.
+    """
+    if isinstance(o, (bytes, bytearray)):
+        return bytes(o).decode("utf-8", "replace")
+    return str(o)
+
+
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
 
 
 def _from_json(text: str) -> Any:

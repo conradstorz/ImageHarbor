@@ -42,6 +42,26 @@ def test_upsert_and_retrieve(catalog: Catalog) -> None:
     assert row["original_path"] == "/photos/beach.jpg"
 
 
+def test_upsert_serializes_bytes_in_exif(catalog: Catalog) -> None:
+    # Real EXIF tags (e.g. ExifVersion, SceneType, MakerNote) are raw bytes,
+    # which are not JSON-serializable. upsert must not crash on them — a single
+    # odd metadata value should never fail an image.
+    import json
+
+    digest = _fake_digest(40)
+    catalog.upsert(
+        sha256_b64url=digest,
+        original_path="/photos/real.jpg",
+        exif={"ExifVersion": b"0230", "SceneType": b"\x01", "Make": "FUJIFILM"},
+    )
+    row = catalog.get_by_sha256(digest)
+    assert row is not None
+    exif = json.loads(row["exif"])
+    assert exif["Make"] == "FUJIFILM"
+    assert exif["ExifVersion"] == "0230"  # bytes decoded to text
+    assert "SceneType" in exif
+
+
 def test_upsert_updates_on_duplicate_sha256(catalog: Catalog) -> None:
     digest = _fake_digest(2)
     catalog.upsert(sha256_b64url=digest, original_path="/a.jpg", ai_caption="first")
