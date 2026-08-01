@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 from pathlib import Path
 
 # SHA-256 produces 32 bytes → 43 unpadded Base64url characters (always).
 SHA256_B64URL_LEN = 43
+
+# PCS codes are plain integers ("330") or, on taxonomy overflow, a base code
+# with a "~N" suffix ("540~1"). '~' is filesystem-safe and NOT in the
+# base64url alphabet, so the 43-char digest counting-back logic is unaffected.
+_PCS_CODE_RE = re.compile(r"^\d+(~\d+)*$")
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +87,10 @@ def extract_digest_from_stem(stem: str) -> str | None:
     dash_idx = prefix.find("-")
     if dash_idx < 0:
         return None
-    # The part before '-' must be a numeric PCS code (ASCII digits only); after
-    # '-' must be a non-empty descriptor.
+    # The part before '-' must be a valid PCS code (ASCII digits, optionally
+    # with '~N' overflow suffixes); after '-' must be a non-empty descriptor.
     pcs_part = prefix[:dash_idx]
-    if not (pcs_part.isascii() and pcs_part.isdigit()) or not prefix[dash_idx + 1:]:
+    if not (pcs_part.isascii() and _PCS_CODE_RE.match(pcs_part)) or not prefix[dash_idx + 1:]:
         return None
     return stem[sep_idx + 1 :]
 
