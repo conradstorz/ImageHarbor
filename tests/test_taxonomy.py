@@ -74,9 +74,11 @@ def test_resolve_reuses_target_when_label_names_it(tax: Taxonomy) -> None:
     assert code == "140"
     assert tax.children("140") == []  # no redundant leaf minted
 
-    # Same when the label names the top_parent target itself.
-    assert tax.resolve_or_create("600", "landscapes", sub_parent="620") == "620"
-    assert tax.children("620") == []
+    # And when the label names the top_parent target itself (no sub_parent):
+    # reuse it, don't mint a "601-nature"-style leaf under it.
+    before = {c.code for c in tax.children("600")}
+    assert tax.resolve_or_create("600", "nature") == "600"
+    assert {c.code for c in tax.children("600")} == before  # nothing minted
 
 
 def test_resolve_mints_when_new(tax: Taxonomy) -> None:
