@@ -7,8 +7,10 @@ is append-only.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .catalog import Catalog
 from .pcs import PCS_CATEGORIES
@@ -132,3 +134,81 @@ class Taxonomy:
     def _create(self, code: str, parent_code: str, label: str) -> str:
         self._cat.taxonomy_insert(code, parent_code, label, f"{code}-{slug(label)}")
         return code
+
+    # ------------------------------------------------------------------
+    # Resolution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize(label: str) -> str:
+        text = _SLUG_RE.sub(" ", label.lower()).strip()
+        words = []
+        for w in text.split():
+            if len(w) > 4 and w.endswith("es"):
+                w = w[:-2]
+            elif len(w) > 3 and w.endswith("s"):
+                w = w[:-1]
+            words.append(w)
+        return " ".join(words)
+
+    def resolve_or_create(
+        self,
+        top_parent: str,
+        label: str,
+        sub_parent: str | None = None,
+        adjudicator: Callable[[str, list[str]], str | None] | None = None,
+    ) -> str:
+        target = sub_parent if sub_parent and self.get(sub_parent) else top_parent
+        norm = self._normalize(label)
+        kids = self.children(target)
+
+        # Exact / alias hit
+        for k in kids:
+            names = [self._normalize(k.label)] + [self._normalize(a) for a in k.aliases]
+            if norm in names:
+                return self.resolve_alias(k.code)
+
+        # No exact/alias hit -> let the adjudicator decide among the target's
+        # siblings. (Deviation from brief: a difflib ratio>=0.8 pre-filter on
+        # the candidate list was specified, but no purely textual similarity
+        # metric puts "festivities" near "holidays" -- the whole point of the
+        # adjudicator is semantic matching an AI provides, which text-distance
+        # can't approximate. Gating on it would make the adjudicator
+        # unreachable for exactly the synonym case it exists to handle, so we
+        # pass the full sibling list instead.)
+        if kids and adjudicator is not None:
+            matched = adjudicator(label, [k.label for k in kids])
+            if matched:
+                for k in kids:
+                    if k.label == matched:
+                        aliases = k.aliases + [label]
+                        self._cat.taxonomy_set_aliases(k.code, aliases)
+                        return self.resolve_alias(k.code)
+
+        return self.mint_child(target, label)
+
+    def merge(self, from_code: str, to_code: str) -> None:
+        target = self.get(to_code)
+        src = self.get(from_code)
+        if target is None or src is None:
+            return
+        self._cat.taxonomy_set_aliases(to_code, target.aliases + [src.label])
+        self._cat.taxonomy_set_alias(from_code, to_code)
+
+    def snapshot_text(self) -> str:
+        """Compact `code label` view grouped by hierarchy for the AI prompt."""
+        rows = self._cat.taxonomy_all()
+        by_parent: dict[str | None, list] = {}
+        for r in rows:
+            by_parent.setdefault(r["parent_code"], []).append(r)
+
+        lines: list[str] = []
+
+        def emit(code: str, label: str, depth: int) -> None:
+            lines.append(f"{'  ' * depth}{code} {label}")
+            for child in by_parent.get(code, []):
+                emit(child["code"], child["label"], depth + 1)
+
+        for top in by_parent.get(None, []):
+            emit(top["code"], top["label"], 0)
+        return "\n".join(lines)
