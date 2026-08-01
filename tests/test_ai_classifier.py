@@ -16,7 +16,7 @@ from imageharbor.ai_classifier import (
     StubClassifier,
     _build_pcs_list,
 )
-from imageharbor.pcs import PCS_CATEGORIES, PCS_VERSION
+from imageharbor.pcs import PCS_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -36,75 +36,89 @@ def tiny_image(tmp_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# StubClassifier — parent + label contract
+# ---------------------------------------------------------------------------
+
+
+def test_stub_returns_parent_and_label() -> None:
+    c = StubClassifier().classify(Path("beach_sunset.jpg"), {}, taxonomy_snapshot="")
+    assert c.top_parent == "300"
+    assert c.label == "beach"
+    assert c.sub_parent is None
+
+
+def test_stub_unknown_is_misc() -> None:
+    c = StubClassifier().classify(Path("random_xyz.jpg"), {}, taxonomy_snapshot="")
+    assert c.top_parent == "900"
+    assert c.label == "miscellaneous"
+
+
+def test_stub_adjudicate_returns_none() -> None:
+    assert StubClassifier().adjudicate("festivities", ["holidays"]) is None
+
+
+# ---------------------------------------------------------------------------
 # StubClassifier — determinism (a core project principle)
 # ---------------------------------------------------------------------------
 
 
-def test_stub_is_deterministic() -> None:
-    stub = StubClassifier()
-    path = Path("beach_sunset.jpg")
-    first = stub.classify(path, {})
-    second = stub.classify(path, {})
-    assert first.pcs_code == second.pcs_code
-    assert first.descriptor == second.descriptor
+def test_stub_classify_is_deterministic() -> None:
+    a = StubClassifier().classify(Path("my_dog.jpg"), {}, "")
+    b = StubClassifier().classify(Path("my_dog.jpg"), {}, "")
+    assert (a.top_parent, a.label, a.descriptor) == (b.top_parent, b.label, b.descriptor)
 
 
 def test_stub_two_instances_agree() -> None:
     # Determinism must not depend on instance state.
     path = Path("my_dog.jpg")
-    a = StubClassifier().classify(path, {})
-    b = StubClassifier().classify(path, {})
-    assert a.pcs_code == b.pcs_code
+    a = StubClassifier().classify(path, {}, "")
+    b = StubClassifier().classify(path, {}, "")
+    assert a.top_parent == b.top_parent
+    assert a.label == b.label
     assert a.descriptor == b.descriptor
 
 
 # ---------------------------------------------------------------------------
-# StubClassifier — keyword mapping (expected codes derived from keyword_map
-# order; patterns are ORed regexes and the FIRST match wins).
+# StubClassifier — keyword mapping now expressed as (top_parent, label).
+# Codes are scanned in keyword_map order; the FIRST match wins.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "stem, expected_code",
+    "stem, top_parent, label",
     [
         # "beach" (330) is scanned before "sunset" (640).
-        ("beach_sunset", 330),
+        ("beach_sunset", "300", "beach"),
         # "portrait" (110) is scanned before "family" (120).
-        ("family_portrait", 110),
-        ("my_dog", 210),
-        ("eagle", 230),
-        # "receipt_scan" matches "scan" in the 710 pattern (which precedes 730)
-        # -> 710. Note "receipt" was removed from the 710 pattern, so it is
-        # "scan" (not "receipt") that lands this on 710.
-        ("receipt_scan", 710),
-        # Whole-word matching: these stems used to bleed via substrings under
-        # re.search but now must NOT misclassify.
-        # "cathedral" no longer matches "cat" (was 210) -> "cathedral" is a
-        # whole word in the 830 pattern.
-        ("cathedral", 830),
-        # "texture" no longer matches "text" (was 710) -> "texture" is a whole
-        # word in the 930 pattern.
-        ("texture", 930),
-        # "oscar" no longer matches "car" (was 410) -> falls through to 900.
-        ("oscar", 900),
-        # "location" no longer matches "cat" (was 210) -> falls through to 900.
-        ("location", 900),
+        ("family_portrait", "100", "portraits"),
+        ("my_dog", "200", "pets"),
+        ("eagle", "200", "birds"),
+        # "receipt_scan" matches "scan" in the 710 (text) pattern.
+        ("receipt_scan", "700", "text"),
+        # Whole-word matching: "cathedral" -> 830 historic (not 210 via "cat").
+        ("cathedral", "800", "historic"),
+        # "texture" -> 930 abstract (not 710 via "text").
+        ("texture", "900", "abstract"),
+        # "oscar" no longer matches "car" -> falls through to 900 misc.
+        ("oscar", "900", "miscellaneous"),
+        # "location" no longer matches "cat" -> falls through to 900 misc.
+        ("location", "900", "miscellaneous"),
         # No pattern matches -> default miscellaneous.
-        ("random_gibberish_xyz", 900),
+        ("random_gibberish_xyz", "900", "miscellaneous"),
     ],
 )
-def test_stub_keyword_mapping(stem: str, expected_code: int) -> None:
-    stub = StubClassifier()
-    result = stub.classify(Path(f"{stem}.jpg"), {})
-    assert result.pcs_code == expected_code
+def test_stub_keyword_mapping(stem: str, top_parent: str, label: str) -> None:
+    result = StubClassifier().classify(Path(f"{stem}.jpg"), {}, "")
+    assert result.top_parent == top_parent
+    assert result.label == label
 
 
-def test_stub_receipt_alone_hits_730_not_710() -> None:
-    # With "receipt" removed from the 710 pattern, a bare "receipt" now
-    # resolves to the dedicated receipts category 730 (no longer shadowed
-    # by 710).
-    stub = StubClassifier()
-    assert stub.classify(Path("receipt.jpg"), {}).pcs_code == 730
+def test_stub_receipt_alone_hits_receipts_not_text() -> None:
+    # With "receipt" removed from the 710 pattern, a bare "receipt" resolves to
+    # the dedicated receipts category 730.
+    result = StubClassifier().classify(Path("receipt.jpg"), {}, "")
+    assert result.top_parent == "700"
+    assert result.label == "receipts"
 
 
 # ---------------------------------------------------------------------------
@@ -113,33 +127,28 @@ def test_stub_receipt_alone_hits_730_not_710() -> None:
 
 
 def test_stub_descriptor_first_two_words() -> None:
-    stub = StubClassifier()
-    result = stub.classify(Path("beach_sunset.jpg"), {})
+    result = StubClassifier().classify(Path("beach_sunset.jpg"), {}, "")
     assert result.descriptor == "beach sunset"
 
 
 def test_stub_descriptor_only_first_two_words() -> None:
-    stub = StubClassifier()
-    result = stub.classify(Path("red_car_on_road.jpg"), {})
+    result = StubClassifier().classify(Path("red_car_on_road.jpg"), {}, "")
     assert result.descriptor == "red car"
 
 
 def test_stub_descriptor_skips_single_char_words() -> None:
-    stub = StubClassifier()
     # "a" is a single char and is dropped; "dog" and "run" remain.
-    result = stub.classify(Path("a_dog_run.jpg"), {})
+    result = StubClassifier().classify(Path("a_dog_run.jpg"), {}, "")
     assert result.descriptor == "dog run"
 
 
 def test_stub_descriptor_falls_back_to_photo_when_all_single_char() -> None:
-    stub = StubClassifier()
-    result = stub.classify(Path("a_b_c.jpg"), {})
+    result = StubClassifier().classify(Path("a_b_c.jpg"), {}, "")
     assert result.descriptor == "photo"
 
 
 def test_stub_descriptor_falls_back_to_photo_when_empty_stem() -> None:
-    stub = StubClassifier()
-    result = stub.classify(Path("_.jpg"), {})
+    result = StubClassifier().classify(Path("_.jpg"), {}, "")
     assert result.descriptor == "photo"
 
 
@@ -149,8 +158,7 @@ def test_stub_descriptor_falls_back_to_photo_when_empty_stem() -> None:
 
 
 def test_stub_returns_photo_classification_with_model_version() -> None:
-    stub = StubClassifier()
-    result = stub.classify(Path("eagle.jpg"), {})
+    result = StubClassifier().classify(Path("eagle.jpg"), {}, "")
     assert isinstance(result, PhotoClassification)
     assert result.model_version == "stub-1.0"
     assert result.pcs_version == PCS_VERSION
@@ -166,14 +174,15 @@ def test_stub_is_an_ai_classifier() -> None:
 
 
 def test_stub_exif_data_does_not_affect_output() -> None:
-    stub = StubClassifier()
     path = Path("mountain_peak.jpg")
-    empty = stub.classify(path, {})
-    populated = stub.classify(
+    empty = StubClassifier().classify(path, {}, "")
+    populated = StubClassifier().classify(
         path,
         {"Make": "TestMake", "Model": "TestModel", "gps_lat": 41.5},
+        "",
     )
-    assert empty.pcs_code == populated.pcs_code
+    assert empty.top_parent == populated.top_parent
+    assert empty.label == populated.label
     assert empty.descriptor == populated.descriptor
     assert empty.caption == populated.caption
 
@@ -259,7 +268,8 @@ def test_openai_classify_success(monkeypatch: pytest.MonkeyPatch, tiny_image: Pa
     clf = OpenAIClassifier(api_key="unused", model="gpt-4o-mini")
 
     payload = {
-        "pcs_code": 330,
+        "top_parent": "300",
+        "label": "beach",
         "descriptor": "beach-sunset",
         "caption": "A sunset over the beach.",
         "objects": ["sun", "sand", "water"],
@@ -269,9 +279,11 @@ def test_openai_classify_success(monkeypatch: pytest.MonkeyPatch, tiny_image: Pa
     clf._client = Mock()
     clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
 
-    result = clf.classify(tiny_image, {})
+    result = clf.classify(tiny_image, {}, taxonomy_snapshot="300 places\n  330 beach")
 
-    assert result.pcs_code == 330
+    assert result.top_parent == "300"
+    assert result.label == "beach"
+    assert result.sub_parent is None
     assert result.descriptor == "beach-sunset"
     assert result.caption == "A sunset over the beach."
     assert result.objects == ["sun", "sand", "water"]
@@ -282,6 +294,41 @@ def test_openai_classify_success(monkeypatch: pytest.MonkeyPatch, tiny_image: Pa
     assert clf._client.chat.completions.create.called
 
 
+def test_openai_classify_embeds_snapshot_in_system_prompt(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    # The live taxonomy snapshot must be passed to the model in the system
+    # message so it can reuse existing labels.
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response(
+        json.dumps({"top_parent": "300", "label": "beach"})
+    )
+
+    snapshot = "300 places\n  330 beach\n  340 mountains"
+    clf.classify(tiny_image, {}, taxonomy_snapshot=snapshot)
+
+    _, kwargs = clf._client.chat.completions.create.call_args
+    system_msg = next(m["content"] for m in kwargs["messages"] if m["role"] == "system")
+    assert snapshot in system_msg
+
+
+def test_openai_classify_parses_sub_parent(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    payload = {"top_parent": "500", "label": "holidays", "sub_parent": "540"}
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
+
+    result = clf.classify(tiny_image, {}, "")
+    assert result.top_parent == "500"
+    assert result.label == "holidays"
+    assert result.sub_parent == "540"
+
+
 def test_openai_classify_invalid_json_falls_back(
     monkeypatch: pytest.MonkeyPatch, tiny_image: Path
 ) -> None:
@@ -290,30 +337,28 @@ def test_openai_classify_invalid_json_falls_back(
     clf._client = Mock()
     clf._client.chat.completions.create.return_value = _mock_response("this is not json {")
 
-    result = clf.classify(tiny_image, {})
+    result = clf.classify(tiny_image, {}, "")
 
-    assert result.pcs_code == 900
+    assert result.top_parent == "900"
+    assert result.label == "miscellaneous"
     assert result.descriptor == "photo"
     assert result.caption == ""
 
 
-def test_openai_classify_unknown_code_coerced_to_900(
+def test_openai_classify_missing_fields_default(
     monkeypatch: pytest.MonkeyPatch, tiny_image: Path
 ) -> None:
+    # Well-formed JSON that omits top_parent/label falls back to misc defaults.
     _install_fake_openai(monkeypatch)
     clf = OpenAIClassifier(api_key="unused")
-    payload = {
-        "pcs_code": 999,  # not a valid PCS code
-        "descriptor": "mystery",
-        "caption": "Unknown thing.",
-    }
+    payload = {"descriptor": "mystery", "caption": "Unknown thing."}
     clf._client = Mock()
     clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
 
-    result = clf.classify(tiny_image, {})
+    result = clf.classify(tiny_image, {}, "")
 
-    assert 999 not in PCS_CATEGORIES
-    assert result.pcs_code == 900
+    assert result.top_parent == "900"
+    assert result.label == "miscellaneous"
     # Non-code fields from the model are still preserved.
     assert result.descriptor == "mystery"
     assert result.caption == "Unknown thing."
@@ -324,22 +369,19 @@ def test_openai_classify_unknown_code_coerced_to_900(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad_code", ["not-a-number", None, [330]])
-def test_openai_pcs_code_wrong_type_falls_back_to_900(
-    monkeypatch: pytest.MonkeyPatch, tiny_image: Path, bad_code: object
+def test_openai_top_parent_coerced_to_string(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
 ) -> None:
-    # A non-numeric string, null, or list for pcs_code must not crash; it
-    # falls back to 900 like invalid JSON does.
+    # A numeric top_parent must be coerced to a string (codes are strings now).
     _install_fake_openai(monkeypatch)
     clf = OpenAIClassifier(api_key="unused")
-    payload = {"pcs_code": bad_code, "descriptor": "mystery"}
+    payload = {"top_parent": 300, "label": "beach"}
     clf._client = Mock()
     clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
 
-    result = clf.classify(tiny_image, {})
-
-    assert result.pcs_code == 900
-    assert result.descriptor == "mystery"
+    result = clf.classify(tiny_image, {}, "")
+    assert result.top_parent == "300"
+    assert isinstance(result.top_parent, str)
 
 
 def test_openai_objects_as_string_becomes_empty_list(
@@ -348,13 +390,13 @@ def test_openai_objects_as_string_becomes_empty_list(
     # A bare string must not be char-split into a list of characters.
     _install_fake_openai(monkeypatch)
     clf = OpenAIClassifier(api_key="unused")
-    payload = {"pcs_code": 330, "objects": "sunset", "secondary_tags": "coast"}
+    payload = {"top_parent": "300", "label": "beach", "objects": "sunset", "secondary_tags": "coast"}
     clf._client = Mock()
     clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
 
-    result = clf.classify(tiny_image, {})
+    result = clf.classify(tiny_image, {}, "")
 
-    assert result.pcs_code == 330
+    assert result.label == "beach"
     assert result.objects == []
     assert result.secondary_tags == []
 
@@ -365,13 +407,12 @@ def test_openai_objects_as_non_iterable_becomes_empty_list(
     # A non-iterable (int) must not raise a TypeError.
     _install_fake_openai(monkeypatch)
     clf = OpenAIClassifier(api_key="unused")
-    payload = {"pcs_code": 330, "objects": 5, "secondary_tags": 7}
+    payload = {"top_parent": "300", "label": "beach", "objects": 5, "secondary_tags": 7}
     clf._client = Mock()
     clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
 
-    result = clf.classify(tiny_image, {})
+    result = clf.classify(tiny_image, {}, "")
 
-    assert result.pcs_code == 330
     assert result.objects == []
     assert result.secondary_tags == []
 
@@ -382,14 +423,42 @@ def test_openai_objects_list_elements_stringified(
     # Valid list input is preserved (elements coerced to str).
     _install_fake_openai(monkeypatch)
     clf = OpenAIClassifier(api_key="unused")
-    payload = {"pcs_code": 330, "objects": ["sun", 42], "secondary_tags": ["coast"]}
+    payload = {"top_parent": "300", "label": "beach", "objects": ["sun", 42], "secondary_tags": ["coast"]}
     clf._client = Mock()
     clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
 
-    result = clf.classify(tiny_image, {})
+    result = clf.classify(tiny_image, {}, "")
 
     assert result.objects == ["sun", "42"]
     assert result.secondary_tags == ["coast"]
+
+
+# ---------------------------------------------------------------------------
+# OpenAIClassifier — adjudicate
+# ---------------------------------------------------------------------------
+
+
+def test_openai_adjudicate_parses_matching_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response("holidays")
+
+    assert clf.adjudicate("festivities", ["sports", "holidays"]) == "holidays"
+    assert clf._client.chat.completions.create.called
+
+
+def test_openai_adjudicate_returns_none_when_no_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response("NONE")
+
+    assert clf.adjudicate("festivities", ["sports", "holidays"]) is None
 
 
 def test_openai_classifier_passes_base_url_model_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
