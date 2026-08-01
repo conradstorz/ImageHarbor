@@ -97,19 +97,3 @@ def get_category(code: int) -> Optional[PCSCategory]:
 def resolve_code(code: int) -> int:
     """Return *code* if it is a known leaf/branch; fall back to 900."""
     return code if code in PCS_CATEGORIES else 900
-
-
-def parent_folder_name(code: int) -> str:
-    """Return the top-level folder name, e.g. ``300-places``."""
-    code = resolve_code(code)
-    parent_code = (code // 100) * 100
-    cat = PCS_CATEGORIES.get(parent_code)
-    name = cat.name if cat else "miscellaneous"
-    return f"{parent_code}-{name}"
-
-
-def sub_folder_name(code: int) -> str:
-    """Return the sub-folder name, e.g. ``330-beach``."""
-    code = resolve_code(code)
-    cat = PCS_CATEGORIES[code]
-    return f"{code}-{cat.name}"

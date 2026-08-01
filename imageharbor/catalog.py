@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS photos (
     original_path    TEXT    NOT NULL,
     organized_path   TEXT,
     pcs_version      TEXT    NOT NULL DEFAULT '1',
-    pcs_primary      INTEGER NOT NULL DEFAULT 900,
+    pcs_primary      TEXT    NOT NULL DEFAULT '900',
     pcs_name         TEXT    NOT NULL DEFAULT 'miscellaneous',
     secondary_tags   TEXT    NOT NULL DEFAULT '[]',
     ai_caption       TEXT    NOT NULL DEFAULT '',
@@ -42,6 +42,18 @@ CREATE TABLE IF NOT EXISTS source_seen (
     sha256_b64url TEXT,
     seen_at       TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS taxonomy (
+    code         TEXT    PRIMARY KEY,
+    parent_code  TEXT,
+    label        TEXT    NOT NULL,
+    folder_name  TEXT    NOT NULL,
+    aliases      TEXT    NOT NULL DEFAULT '[]',
+    alias_of     TEXT,
+    active       INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_parent ON taxonomy(parent_code);
 """
 
 
@@ -98,7 +110,7 @@ class Catalog:
         original_path: str,
         organized_path: str | None = None,
         pcs_version: str = "1",
-        pcs_primary: int = 900,
+        pcs_primary: str = "900",
         pcs_name: str = "miscellaneous",
         secondary_tags: list[str] | None = None,
         ai_caption: str = "",
@@ -253,6 +265,60 @@ class Catalog:
         if row is None:
             return False
         return row["size"] == size and row["mtime_ns"] == mtime_ns
+
+    # ------------------------------------------------------------------
+    # Taxonomy
+    # ------------------------------------------------------------------
+
+    def taxonomy_is_empty(self) -> bool:
+        cur = self._conn.execute("SELECT 1 FROM taxonomy LIMIT 1")
+        return cur.fetchone() is None
+
+    def taxonomy_insert(
+        self,
+        code: str,
+        parent_code: str | None,
+        label: str,
+        folder_name: str,
+        aliases: list[str] | None = None,
+        alias_of: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO taxonomy (code, parent_code, label, folder_name,
+                                  aliases, alias_of, active, created_at)
+            VALUES (?,?,?,?,?,?,1,?)
+            ON CONFLICT(code) DO NOTHING
+            """,
+            (code, parent_code, label, folder_name, _json(aliases or []), alias_of, _now_iso()),
+        )
+        self._conn.commit()
+
+    def taxonomy_get(self, code: str) -> sqlite3.Row | None:
+        cur = self._conn.execute("SELECT * FROM taxonomy WHERE code=?", (code,))
+        return cur.fetchone()
+
+    def taxonomy_children(self, parent_code: str | None) -> list[sqlite3.Row]:
+        cur = self._conn.execute(
+            "SELECT * FROM taxonomy WHERE parent_code IS ? ORDER BY code", (parent_code,)
+        )
+        return cur.fetchall()
+
+    def taxonomy_all(self) -> list[sqlite3.Row]:
+        cur = self._conn.execute("SELECT * FROM taxonomy WHERE active=1 ORDER BY code")
+        return cur.fetchall()
+
+    def taxonomy_set_alias(self, from_code: str, to_code: str) -> None:
+        self._conn.execute(
+            "UPDATE taxonomy SET alias_of=?, active=0 WHERE code=?", (to_code, from_code)
+        )
+        self._conn.commit()
+
+    def taxonomy_set_aliases(self, code: str, aliases: list[str]) -> None:
+        self._conn.execute(
+            "UPDATE taxonomy SET aliases=? WHERE code=?", (_json(aliases), code)
+        )
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Lifecycle

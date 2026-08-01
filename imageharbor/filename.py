@@ -44,7 +44,7 @@ def normalize_descriptor(text: str) -> str:
 
 
 def generate_filename(
-    pcs_code: int,
+    pcs_code: str,
     descriptor: str,
     sha256_b64url: str,
     extension: str,
@@ -92,7 +92,7 @@ def generate_filename(
 
 
 class ParsedFilename(TypedDict):
-    pcs_code: int
+    pcs_code: str
     descriptor: str
     sha256_b64url: str
     extension: str
@@ -120,7 +120,7 @@ def parse_filename(filename: str) -> ParsedFilename | None:
     # Split on the FIRST "-"; both parts are guaranteed valid and non-empty
     # because extract_digest_from_stem already validated them.
     pcs_str, descriptor = prefix.split("-", 1)
-    pcs_code = int(pcs_str)
+    pcs_code = pcs_str  # keep as string; codes may contain '~'
 
     return ParsedFilename(
         pcs_code=pcs_code,

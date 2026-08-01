@@ -14,8 +14,8 @@ from .discovery import discover_images
 from .exif_reader import read_exif
 from .filename import generate_filename, normalize_descriptor
 from .hashing import compute_sha256_b64url, verify_file
-from .pcs import parent_folder_name, resolve_code, sub_folder_name
 from .sidecar import write_sidecar
+from .taxonomy import Taxonomy
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,7 @@ class Pipeline:
         self.organized_dir = organized_dir
         self.catalog = catalog
         self.classifier: AIClassifier = classifier or StubClassifier()
+        self.taxonomy = Taxonomy(catalog)
         self.duplicates_dir = duplicates_dir
         self.write_sidecars = write_sidecars
         self.dry_run = dry_run
@@ -119,6 +120,9 @@ class Pipeline:
         """
         stats = PipelineStats()
         self._dry_run_seen.clear()
+        # A dry run must perform ZERO taxonomy writes: skip seeding entirely.
+        if not self.dry_run:
+            self.taxonomy.ensure_seeded()
         for image_path in discover_images(self.source_dir, recursive=recursive):
             result = self._process_one(image_path)
             stats.record(result)
@@ -127,6 +131,8 @@ class Pipeline:
 
     def process_file(self, image_path: Path) -> ProcessResult:
         """Process a single image file and return its result."""
+        if not self.dry_run:
+            self.taxonomy.ensure_seeded()
         result = self._process_one(image_path)
         _log_result(result)
         return result
@@ -169,38 +175,47 @@ class Pipeline:
                 status="duplicate",
             )
 
-        # Step 3: EXIF
-        exif_data = read_exif(source_path)
-
-        # Step 4: AI classification
-        classification = self.classifier.classify(source_path, exif_data)
-
-        # Step 5: resolve PCS code
-        pcs_code = resolve_code(classification.pcs_code)
-
-        # Step 6: generate filename
-        descriptor = normalize_descriptor(classification.descriptor)
-        extension = source_path.suffix.lstrip(".").lower()
-        filename = generate_filename(pcs_code, descriptor, sha256_b64url, extension)
-
-        # Step 7: determine output path
-        organized_path = (
-            self.organized_dir
-            / parent_folder_name(pcs_code)
-            / sub_folder_name(pcs_code)
-            / filename
-        )
-
+        # Dry-run short-circuit: report the file as "copied" WITHOUT touching the
+        # taxonomy or invoking the AI classifier. This must happen before EXIF/
+        # classify/resolve so a dry run performs zero taxonomy writes and zero AI
+        # calls. Record the digest for intra-run dedup (a later identical-content
+        # file in the same dry run is reported as a duplicate, not "copied").
         if self.dry_run:
-            # Record the digest so a later identical-content file in the same
-            # dry run is reported as a duplicate rather than another "copied".
             self._dry_run_seen.add(sha256_b64url)
             return ProcessResult(
                 source_path=source_path,
                 sha256_b64url=sha256_b64url,
                 status="copied",
-                organized_path=organized_path,
+                organized_path=None,
             )
+
+        # Step 3: EXIF
+        exif_data = read_exif(source_path)
+
+        # Step 4: AI classification (the classifier gets the current taxonomy
+        # snapshot so it can reuse an existing category label when one fits).
+        snapshot = self.taxonomy.snapshot_text()
+        classification = self.classifier.classify(source_path, exif_data, snapshot)
+
+        # Step 5: resolve label -> code (dedup + optional AI adjudication).
+        pcs_code = self.taxonomy.resolve_or_create(
+            classification.top_parent,
+            classification.label,
+            classification.sub_parent,
+            adjudicator=self.classifier.adjudicate,
+        )
+        node = self.taxonomy.get(pcs_code)
+        pcs_name = node.label if node else classification.label
+
+        # Step 6: generate filename (pcs_code is a string, e.g. "330" or "540~1")
+        descriptor = normalize_descriptor(classification.descriptor)
+        extension = source_path.suffix.lstrip(".").lower()
+        filename = generate_filename(pcs_code, descriptor, sha256_b64url, extension)
+
+        # Step 7: determine output path from the taxonomy folder tree
+        organized_path = (
+            self.organized_dir / self.taxonomy.folder_path(pcs_code) / filename
+        )
 
         # Step 8: copy
         organized_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,6 +245,7 @@ class Pipeline:
             sha256_b64url=sha256_b64url,
             classification=classification,
             pcs_code=pcs_code,
+            pcs_name=pcs_name,
             exif_data=exif_data,
         )
 
@@ -260,14 +276,10 @@ class Pipeline:
         organized_path: Path,
         sha256_b64url: str,
         classification: PhotoClassification,
-        pcs_code: int,
+        pcs_code: str,
+        pcs_name: str,
         exif_data: dict[str, Any],
     ) -> None:
-        from .pcs import PCS_CATEGORIES
-
-        cat = PCS_CATEGORIES.get(pcs_code)
-        pcs_name = cat.name if cat else "miscellaneous"
-
         self.catalog.upsert(
             sha256_b64url=sha256_b64url,
             original_path=str(source_path),
@@ -304,7 +316,7 @@ class Pipeline:
         organized_path: Path,
         source_path: Path,
         sha256_b64url: str,
-        pcs_code: int,
+        pcs_code: str,
         descriptor: str,
         classification: PhotoClassification,
         exif_data: dict[str, Any],

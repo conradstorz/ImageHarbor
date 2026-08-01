@@ -56,6 +56,39 @@ def catalog(tmp_path: Path) -> Catalog:
 # ---------------------------------------------------------------------------
 
 
+def test_pipeline_uses_taxonomy_codes(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    stats = pipeline.run()
+    assert stats.copied == 2 and stats.errors == 0
+    # beach_photo.jpg -> 300-places/330-beach ; mountain_view.jpg -> 340-mountains
+    organized = [p.as_posix() for p in organized_dir.rglob("*.jpg")]
+    assert any("300-places/330-beach/330-" in p for p in organized)
+    assert any("300-places/340-mountains/340-" in p for p in organized)
+
+
+def test_pipeline_mints_new_category(
+    organized_dir: Path, catalog: Catalog, tmp_path: Path
+) -> None:
+    # A custom classifier that proposes a brand-new label under events.
+    from imageharbor.ai_classifier import AIClassifier, PhotoClassification
+
+    class NewCatClassifier(AIClassifier):
+        def classify(self, image_path, exif_data, taxonomy_snapshot):
+            return PhotoClassification(top_parent="500", label="holidays", descriptor="xmas")
+
+    src = tmp_path / "src2"
+    src.mkdir()
+    _make_jpeg(src / "a.jpg")
+    pipeline = Pipeline(src, organized_dir, catalog, classifier=NewCatClassifier())
+    pipeline.run()
+    assert any(
+        "500-events/540-holidays/540-" in p.as_posix()
+        for p in organized_dir.rglob("*.jpg")
+    )
+
+
 def test_pipeline_copies_files(source_dir: Path, organized_dir: Path, catalog: Catalog) -> None:
     pipeline = Pipeline(source_dir, organized_dir, catalog)
     stats = pipeline.run()
@@ -122,6 +155,11 @@ def test_pipeline_dry_run_writes_nothing(
     # No real files written
     assert not list(organized_dir.rglob("*.jpg"))
     assert catalog.count() == 0
+    # A dry run must perform ZERO taxonomy writes: no seeding, no minting.
+    assert catalog.taxonomy_is_empty()
+    # No destination path is computed in dry-run (taxonomy/classify are skipped).
+    for result in stats.results:
+        assert result.organized_path is None
 
 
 def test_pipeline_sidecar_written(
@@ -315,6 +353,8 @@ def test_pipeline_dry_run_intra_run_dedup(
     # Still nothing written and the catalog untouched.
     assert not list(organized_dir.rglob("*.jpg"))
     assert catalog.count() == 0
+    # And the taxonomy table was never written during the dry run.
+    assert catalog.taxonomy_is_empty()
 
     # A real run over the same input reports the same copied/duplicate counts.
     real_catalog = Catalog(tmp_path / "real.db")

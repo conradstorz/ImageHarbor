@@ -438,7 +438,7 @@ def catalog_list(catalog_path: Path, limit: int) -> None:
         click.echo("(empty catalog)")
         return
     for row in rows:
-        click.echo(f"{row['sha256_b64url'][:12]}…  {row['pcs_primary']:3d}  {row['organized_path']}")
+        click.echo(f"{row['sha256_b64url'][:12]}…  {str(row['pcs_primary']):>5}  {row['organized_path']}")
 
 
 @catalog_cmd.command(name="get")

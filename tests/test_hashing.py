@@ -158,6 +158,16 @@ def test_extract_digest_from_stem_non_ascii_pcs() -> None:
     assert extract_digest_from_stem(stem) is None
 
 
+def test_extract_digest_accepts_tilde_code() -> None:
+    digest = "A" * 43
+    assert extract_digest_from_stem(f"540~1-holiday_{digest}") == digest
+
+
+def test_extract_digest_rejects_dotted_code() -> None:
+    digest = "A" * 43
+    assert extract_digest_from_stem(f"540.1-holiday_{digest}") is None
+
+
 # ---------------------------------------------------------------------------
 # verify_pcs_file
 # ---------------------------------------------------------------------------

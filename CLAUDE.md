@@ -52,16 +52,44 @@ Module responsibilities:
   ordering and the `PipelineStats`/`ProcessResult` result types. If a post-copy
   integrity check fails, the copy is deleted and an error is raised — nothing enters
   the catalog unverified.
-- **`pcs.py`** — the PCS taxonomy (`PCS_CATEGORIES`, codes 100–900 with sub-codes).
-  Maps a code to its two-level folder path (`parent_folder_name` → `sub_folder_name`,
-  e.g. `300-places/330-beach/`). `resolve_code` falls back **unknown → 900
-  (miscellaneous)**; this fallback is relied on throughout, so classifiers may return
-  any int safely.
+- **`pcs.py`** — **seed data + helpers only**: `PCS_CATEGORIES` defines the 9 fixed
+  top-level classes (100–900) and their original sub-codes, used once to seed the
+  catalog `taxonomy` table on first run (`Taxonomy.ensure_seeded`). `resolve_code`
+  (int → int, unknown → 900) is retained for legacy/tooling use, but the pipeline no
+  longer calls it — code assignment and folder-path resolution now live in
+  `taxonomy.py`. `pcs.parent_folder_name`/`sub_folder_name` were **removed**.
+- **`taxonomy.py`** — the self-extending PCS taxonomy: a `Taxonomy` class backed by
+  the catalog `taxonomy` table (append-only, never renumbered). The 9 top-level
+  classes are fixed; growth happens beneath them. Codes are **strings** matching
+  `^\d+(~\d+)*$` — plain integers for the common case (e.g. `"330"`), with a `~N`
+  suffix minted when a parent's normal integer slots are exhausted or a leaf needs a
+  child of its own (**never a dot**). `resolve_or_create(top_parent, label,
+  sub_parent=None, adjudicator=None)` is how the pipeline turns a classifier's label
+  into a code: it normalizes the label, checks the target parent's children for an
+  exact/alias match, and — only when there's no exact match and an `adjudicator` is
+  supplied — asks the AI classifier's `adjudicate(label, candidates)` whether the
+  label is a synonym of one of the parent's *existing* children (semantic match, not
+  a string-similarity/fuzzy-ratio gate — true synonyms are often string-dissimilar,
+  e.g. "festivities" vs. "holidays", so a text-distance pre-filter would make the
+  adjudicator unreachable for the case it exists to handle). A match records an alias
+  and reuses the code; otherwise a new code is minted. `merge(from_code, to_code)`
+  aliases one code onto another after the fact. `folder_path(code)` walks
+  parent_code links to build the slash-joined destination folder tree (this is what
+  the pipeline now uses instead of `pcs.parent_folder_name`/`sub_folder_name`).
+  `snapshot_text()` renders the current taxonomy for the classifier prompt.
 - **`ai_classifier.py`** — `AIClassifier` ABC with two implementations chosen by the
-  `--ai` flag: `StubClassifier` (default; deterministic, no network — infers a code
-  from filename keywords, used by all tests) and `OpenAIClassifier` (optional, gated
-  behind the `openai` extra and imported lazily). Both return a `PhotoClassification`.
-  Add new backends by subclassing `AIClassifier` and wiring them in `cli.py`.
+  `--ai` flag: `StubClassifier` (default; deterministic, no network — infers a
+  category from filename keywords, used by all tests) and `OpenAIClassifier`
+  (optional, gated behind the `openai` extra and imported lazily). `classify(path,
+  exif_data, taxonomy_snapshot)` returns a `PhotoClassification` — **the classifier
+  never picks a numeric PCS code**; it returns `top_parent` (one of the 9 fixed
+  classes), a `label` (reused from the snapshot or newly proposed), and an optional
+  `sub_parent` to nest a new leaf under. The pipeline resolves that triple to a code
+  via `Taxonomy.resolve_or_create`. The ABC also defines `adjudicate(label,
+  candidates) -> str | None` (default: no match) so a real-model backend can decide
+  whether a proposed label is a synonym of an existing sibling category;
+  `OpenAIClassifier` implements it as a follow-up chat call. Add new backends by
+  subclassing `AIClassifier` and wiring them in `cli.py`.
   **Design intent (important):** this abstraction exists so the *AI server doing the
   work is swappable*, not just the vendor. The project was inspired by a self-hosted
   AI server (a Jetson Orin Nano on the local network), but nothing is hard-wired to
@@ -70,10 +98,12 @@ Module responsibilities:
 - **`hashing.py`** + **`filename.py`** — content addressing. SHA-256 is encoded as
   **unpadded Base64url, always exactly 43 chars** (`SHA256_B64URL_LEN`). Filename
   format is `<pcs>-<descriptor>_<sha256>.<ext>`.
-- **`catalog.py`** — SQLite (WAL mode), one `photos` table keyed by the unique
-  `sha256_b64url`. `upsert` is idempotent (`ON CONFLICT … DO UPDATE`); list/dict
-  fields are stored as JSON text. This table is the source of truth for
-  **resumability and duplicate detection** (`is_known`).
+- **`catalog.py`** — SQLite (WAL mode). The `photos` table (keyed by the unique
+  `sha256_b64url`) is the source of truth for **resumability and duplicate
+  detection** (`is_known`); `upsert` is idempotent (`ON CONFLICT … DO UPDATE`) and
+  list/dict fields are stored as JSON text. A second `taxonomy` table persists the
+  self-extending PCS registry (`code`, `parent_code`, `label`, `folder_name`,
+  `aliases`, `alias_of`, `active`), backing `taxonomy.py`.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
@@ -83,6 +113,26 @@ Module responsibilities:
 
 ## Critical invariants — do not break these
 
+- **PCS codes are strings, not ints, and are owned by the taxonomy, not the
+  classifier.** A valid code matches `^\d+(~\d+)*$` — plain integers for the common
+  case (`"330"`), or a `~N` suffix appended when a parent's decimal slots are used up
+  or a leaf needs a child (**never a dot**, e.g. `"330~1"` not `"330.1"`). Codes are
+  minted append-only by `taxonomy.Taxonomy` and persisted in the catalog `taxonomy`
+  table, seeded once from `pcs.PCS_CATEGORIES` (now seed data only). The **9
+  top-level classes are fixed**; all growth happens beneath them, and existing codes
+  are never renumbered or reused.
+- **Classifiers propose a label, they never pick a number.** `AIClassifier.classify`
+  returns `(top_parent, label, sub_parent?)`; only `Taxonomy.resolve_or_create` (in
+  the pipeline) turns that into a code — by reusing an exact/alias match among the
+  target parent's existing children, or, failing that, consulting
+  `AIClassifier.adjudicate(label, candidates)` for a semantic synonym match before
+  minting a new one. Do not add string-similarity/fuzzy-ratio gating in front of the
+  adjudicator — it was tried and dropped because true synonyms (e.g. "festivities"
+  vs. "holidays") are string-dissimilar, which made the adjudicator unreachable.
+- **Folder paths come from `taxonomy.folder_path(code)`**, which walks `parent_code`
+  links from the top-level ancestor down to `code`. `pcs.parent_folder_name` and
+  `pcs.sub_folder_name` were **removed** — do not reintroduce a two-level-only
+  folder scheme; the taxonomy can now be deeper than two levels via `~N` codes.
 - **The 43-char digest is located by counting back from the end of the stem, NOT by
   splitting on the last `_`.** Base64url legitimately contains `_`, so a naive rsplit
   corrupts parsing. This logic is duplicated in `hashing.extract_digest_from_stem`
