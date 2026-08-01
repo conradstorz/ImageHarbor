@@ -120,7 +120,9 @@ class Pipeline:
         """
         stats = PipelineStats()
         self._dry_run_seen.clear()
-        self.taxonomy.ensure_seeded()
+        # A dry run must perform ZERO taxonomy writes: skip seeding entirely.
+        if not self.dry_run:
+            self.taxonomy.ensure_seeded()
         for image_path in discover_images(self.source_dir, recursive=recursive):
             result = self._process_one(image_path)
             stats.record(result)
@@ -129,7 +131,8 @@ class Pipeline:
 
     def process_file(self, image_path: Path) -> ProcessResult:
         """Process a single image file and return its result."""
-        self.taxonomy.ensure_seeded()
+        if not self.dry_run:
+            self.taxonomy.ensure_seeded()
         result = self._process_one(image_path)
         _log_result(result)
         return result
@@ -172,6 +175,20 @@ class Pipeline:
                 status="duplicate",
             )
 
+        # Dry-run short-circuit: report the file as "copied" WITHOUT touching the
+        # taxonomy or invoking the AI classifier. This must happen before EXIF/
+        # classify/resolve so a dry run performs zero taxonomy writes and zero AI
+        # calls. Record the digest for intra-run dedup (a later identical-content
+        # file in the same dry run is reported as a duplicate, not "copied").
+        if self.dry_run:
+            self._dry_run_seen.add(sha256_b64url)
+            return ProcessResult(
+                source_path=source_path,
+                sha256_b64url=sha256_b64url,
+                status="copied",
+                organized_path=None,
+            )
+
         # Step 3: EXIF
         exif_data = read_exif(source_path)
 
@@ -199,17 +216,6 @@ class Pipeline:
         organized_path = (
             self.organized_dir / self.taxonomy.folder_path(pcs_code) / filename
         )
-
-        if self.dry_run:
-            # Record the digest so a later identical-content file in the same
-            # dry run is reported as a duplicate rather than another "copied".
-            self._dry_run_seen.add(sha256_b64url)
-            return ProcessResult(
-                source_path=source_path,
-                sha256_b64url=sha256_b64url,
-                status="copied",
-                organized_path=organized_path,
-            )
 
         # Step 8: copy
         organized_path.parent.mkdir(parents=True, exist_ok=True)

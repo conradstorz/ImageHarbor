@@ -101,6 +101,19 @@ def test_resolve_adjudicator_exception_falls_back_to_mint(tax: Taxonomy) -> None
     assert code == "550"  # minted as new sibling, exception did not propagate
 
 
+def test_resolve_invalid_top_parent_falls_back_to_900(tax: Taxonomy) -> None:
+    # A backend may return a top_parent that is not one of the 9 fixed classes
+    # (e.g. a label like "events" or an out-of-range "999"). It must resolve
+    # under 900 (miscellaneous), NOT mint an orphan under a nonexistent parent.
+    code = tax.resolve_or_create("events", "whatever")
+    node = tax.get(code)
+    assert node is not None
+    assert node.parent_code == "900"
+    # No node anywhere should have "events" as its parent.
+    assert all(n.parent_code != "events" for n in tax.children("900"))
+    assert tax.get("events") is None
+
+
 def test_resolve_sub_parent_places_leaf(tax: Taxonomy) -> None:
     tax.resolve_or_create("500", "holidays")  # 540
     code = tax.resolve_or_create("500", "christmas", sub_parent="540")

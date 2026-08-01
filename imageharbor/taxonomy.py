@@ -161,6 +161,13 @@ class Taxonomy:
         sub_parent: str | None = None,
         adjudicator: Callable[[str, list[str]], str | None] | None = None,
     ) -> str:
+        # Guard an invalid top_parent: a real backend may return a code that is
+        # not one of the 9 fixed classes (e.g. "events" or "999"). Rather than
+        # minting an orphan under a nonexistent parent, fall back to the
+        # miscellaneous class (900). The sub_parent path keeps its own existence
+        # check below.
+        if not sub_parent and self.get(top_parent) is None:
+            top_parent = "900"
         target = sub_parent if sub_parent and self.get(sub_parent) else top_parent
         norm = self._normalize(label)
         kids = self.children(target)

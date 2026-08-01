@@ -155,6 +155,11 @@ def test_pipeline_dry_run_writes_nothing(
     # No real files written
     assert not list(organized_dir.rglob("*.jpg"))
     assert catalog.count() == 0
+    # A dry run must perform ZERO taxonomy writes: no seeding, no minting.
+    assert catalog.taxonomy_is_empty()
+    # No destination path is computed in dry-run (taxonomy/classify are skipped).
+    for result in stats.results:
+        assert result.organized_path is None
 
 
 def test_pipeline_sidecar_written(
@@ -348,6 +353,8 @@ def test_pipeline_dry_run_intra_run_dedup(
     # Still nothing written and the catalog untouched.
     assert not list(organized_dir.rglob("*.jpg"))
     assert catalog.count() == 0
+    # And the taxonomy table was never written during the dry run.
+    assert catalog.taxonomy_is_empty()
 
     # A real run over the same input reports the same copied/duplicate counts.
     real_catalog = Catalog(tmp_path / "real.db")
