@@ -8,12 +8,15 @@ is append-only.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Callable
 
 from .catalog import Catalog
 from .pcs import PCS_CATEGORIES
+
+logger = logging.getLogger(__name__)
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TOP_RE = re.compile(r"^[1-9]00$")
@@ -177,7 +180,11 @@ class Taxonomy:
         # unreachable for exactly the synonym case it exists to handle, so we
         # pass the full sibling list instead.)
         if kids and adjudicator is not None:
-            matched = adjudicator(label, [k.label for k in kids])
+            try:
+                matched = adjudicator(label, [k.label for k in kids])
+            except Exception:
+                logger.warning("adjudicator failed for label %r; minting new", label, exc_info=True)
+                matched = None
             if matched:
                 for k in kids:
                     if k.label == matched:

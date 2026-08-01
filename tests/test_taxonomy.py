@@ -91,6 +91,16 @@ def test_resolve_no_adjudicator_mints_new(tax: Taxonomy) -> None:
     assert code == "550"  # minted as new sibling
 
 
+def test_resolve_adjudicator_exception_falls_back_to_mint(tax: Taxonomy) -> None:
+    tax.resolve_or_create("500", "holidays")  # 540
+
+    def boom(label, candidates):
+        raise RuntimeError("Jetson is down")
+
+    code = tax.resolve_or_create("500", "festivities", adjudicator=boom)
+    assert code == "550"  # minted as new sibling, exception did not propagate
+
+
 def test_resolve_sub_parent_places_leaf(tax: Taxonomy) -> None:
     tax.resolve_or_create("500", "holidays")  # 540
     code = tax.resolve_or_create("500", "christmas", sub_parent="540")
