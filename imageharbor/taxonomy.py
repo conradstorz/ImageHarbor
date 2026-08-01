@@ -177,6 +177,19 @@ class Taxonomy:
             target = "900"
         target = self.resolve_alias(target)   # never mint under a merged/inactive parent
         norm = self._normalize(label)
+
+        # If the label names the target category ITSELF (the AI often over-
+        # specifies a sub_parent equal to the category it means), reuse the
+        # target rather than minting a redundant same-named child — e.g. avoid
+        # 140-celebrations -> 141-celebrations, or 620-landscapes -> 621-landscapes.
+        target_node = self.get(target)
+        if target_node is not None:
+            target_names = [self._normalize(target_node.label)] + [
+                self._normalize(a) for a in target_node.aliases
+            ]
+            if norm in target_names:
+                return target
+
         kids = self.children(target)
 
         # Exact / alias hit

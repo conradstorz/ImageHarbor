@@ -66,6 +66,19 @@ def test_resolve_reuses_existing_child(tax: Taxonomy) -> None:
     assert tax.resolve_or_create("300", "Beaches") == "330"  # normalized reuse
 
 
+def test_resolve_reuses_target_when_label_names_it(tax: Taxonomy) -> None:
+    # The AI often over-specifies sub_parent = the category it means: e.g.
+    # sub_parent="140" (celebrations) + label="celebrations". Reuse 140 rather
+    # than minting a redundant same-named child 141-celebrations.
+    code = tax.resolve_or_create("100", "celebrations", sub_parent="140")
+    assert code == "140"
+    assert tax.children("140") == []  # no redundant leaf minted
+
+    # Same when the label names the top_parent target itself.
+    assert tax.resolve_or_create("600", "landscapes", sub_parent="620") == "620"
+    assert tax.children("620") == []
+
+
 def test_resolve_mints_when_new(tax: Taxonomy) -> None:
     code = tax.resolve_or_create("500", "holidays")
     assert code == "540"
