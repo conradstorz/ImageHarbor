@@ -30,14 +30,14 @@ def test_upsert_and_retrieve(catalog: Catalog) -> None:
         sha256_b64url=digest,
         original_path="/photos/beach.jpg",
         organized_path="/organized/300-places/330-beach/330-beach_AAAA.jpg",
-        pcs_primary=330,
+        pcs_primary="330",
         pcs_name="beach",
         ai_caption="A sunny beach",
         objects=["sand", "waves"],
     )
     row = catalog.get_by_sha256(digest)
     assert row is not None
-    assert row["pcs_primary"] == 330
+    assert row["pcs_primary"] == "330"
     assert row["ai_caption"] == "A sunny beach"
     assert row["original_path"] == "/photos/beach.jpg"
 
@@ -180,3 +180,38 @@ def test_source_seen_upsert_updates(catalog: Catalog) -> None:
     catalog.record_source_seen("/src/a.jpg", 100, 999)  # file changed
     assert catalog.source_is_unchanged("/src/a.jpg", 100, 999) is True
     assert catalog.source_is_unchanged("/src/a.jpg", 100, 111) is False
+
+
+# ---------------------------------------------------------------------------
+# taxonomy
+# ---------------------------------------------------------------------------
+
+
+def test_taxonomy_seed_insert_get_children(catalog: Catalog) -> None:
+    assert catalog.taxonomy_is_empty() is True
+    catalog.taxonomy_insert("500", None, "events", "500-events")
+    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
+    assert catalog.taxonomy_is_empty() is False
+    row = catalog.taxonomy_get("540")
+    assert row["label"] == "holidays"
+    assert row["parent_code"] == "500"
+    kids = catalog.taxonomy_children("500")
+    assert [k["code"] for k in kids] == ["540"]
+    tops = catalog.taxonomy_children(None)
+    assert [t["code"] for t in tops] == ["500"]
+
+
+def test_taxonomy_set_alias(catalog: Catalog) -> None:
+    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
+    catalog.taxonomy_insert("550", "500", "festivities", "550-festivities")
+    catalog.taxonomy_set_alias("550", "540")
+    row = catalog.taxonomy_get("550")
+    assert row["alias_of"] == "540"
+    assert row["active"] == 0
+
+
+def test_taxonomy_set_aliases(catalog: Catalog) -> None:
+    import json
+    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
+    catalog.taxonomy_set_aliases("540", ["festivities", "xmas"])
+    assert json.loads(catalog.taxonomy_get("540")["aliases"]) == ["festivities", "xmas"]
