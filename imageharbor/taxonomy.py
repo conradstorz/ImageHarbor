@@ -40,7 +40,6 @@ class TaxonomyNode:
 
 
 def _node(row) -> TaxonomyNode:
-    import json
     return TaxonomyNode(
         code=row["code"],
         parent_code=row["parent_code"],
@@ -53,7 +52,12 @@ def _node(row) -> TaxonomyNode:
 
 
 class Taxonomy:
-    """Catalog-backed taxonomy registry."""
+    """Catalog-backed taxonomy registry.
+
+    Single-writer only: this class is NOT concurrency-safe. Minting/seeding do a
+    read-then-insert without locking, so concurrent writers could race on code
+    allocation (matches the project's deferred concurrency-locking note).
+    """
 
     def __init__(self, catalog: Catalog) -> None:
         self._cat = catalog
@@ -161,14 +165,16 @@ class Taxonomy:
         sub_parent: str | None = None,
         adjudicator: Callable[[str, list[str]], str | None] | None = None,
     ) -> str:
-        # Guard an invalid top_parent: a real backend may return a code that is
-        # not one of the 9 fixed classes (e.g. "events" or "999"). Rather than
-        # minting an orphan under a nonexistent parent, fall back to the
-        # miscellaneous class (900). The sub_parent path keeps its own existence
-        # check below.
-        if not sub_parent and self.get(top_parent) is None:
-            top_parent = "900"
+        # Guard an invalid target: a real backend may return a sub_parent and/or
+        # top_parent that are not real codes (e.g. "events", "999"). Resolve the
+        # target first, then validate it — if it does not exist, fall back to the
+        # miscellaneous class (900). Validating the RESOLVED target (rather than
+        # top_parent alone) closes the case where a truthy-but-nonexistent
+        # sub_parent would otherwise mint an unparseable orphan like "events~1"
+        # and break filename-integrity verification.
         target = sub_parent if sub_parent and self.get(sub_parent) else top_parent
+        if self.get(target) is None:
+            target = "900"
         norm = self._normalize(label)
         kids = self.children(target)
 

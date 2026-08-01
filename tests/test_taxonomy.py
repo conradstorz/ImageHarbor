@@ -114,6 +114,21 @@ def test_resolve_invalid_top_parent_falls_back_to_900(tax: Taxonomy) -> None:
     assert tax.get("events") is None
 
 
+def test_resolve_invalid_sub_and_top_parent_falls_back_to_900(tax: Taxonomy) -> None:
+    # Both a truthy-but-nonexistent sub_parent AND an invalid non-numeric
+    # top_parent: the RESOLVED target must be validated so we never mint an
+    # unparseable orphan (e.g. "events~1") that would break filename verify.
+    code = tax.resolve_or_create("events", "whatever", sub_parent="540")
+    node = tax.get(code)
+    assert node is not None
+    assert node.parent_code == "900"
+    # No node anywhere should be parented on the bogus "events" or "540" codes.
+    all_parents = {n.parent_code for n in tax.children("900")}
+    assert "events" not in all_parents and "540" not in all_parents
+    assert tax.get("events") is None
+    assert tax.get("540") is None
+
+
 def test_resolve_sub_parent_places_leaf(tax: Taxonomy) -> None:
     tax.resolve_or_create("500", "holidays")  # 540
     code = tax.resolve_or_create("500", "christmas", sub_parent="540")
@@ -127,6 +142,25 @@ def test_merge_redirects_future_resolution(tax: Taxonomy) -> None:
     assert tax.resolve_alias(b) == a
     # a future exact-hit on the merged label redirects
     assert tax.resolve_or_create("500", "festivities") == a
+
+
+def test_normalize_singularizes_plural_es() -> None:
+    # "Beaches" -> lowercase, strip trailing "es" -> "beach" (why "Beaches"
+    # reuses the seeded 330 "beach" leaf).
+    assert Taxonomy._normalize("Beaches") == "beach"
+
+
+def test_normalize_singularizes_plural_s() -> None:
+    # "Holidays" -> "holiday" (trailing "s" dropped for words len>3).
+    assert Taxonomy._normalize("Holidays") == "holiday"
+
+
+def test_normalize_lossy_singularization_collision() -> None:
+    # KNOWN LIMITATION, not desired behavior: the naive singularization is lossy
+    # and collides unrelated words. "wines" -> "win" (strip "es") and
+    # "wins" -> "win" (strip "s") both normalize to the same token. Pinned here
+    # so any future change to _normalize is a conscious one.
+    assert Taxonomy._normalize("wines") == Taxonomy._normalize("wins")
 
 
 def test_snapshot_text_lists_categories(tax: Taxonomy) -> None:
