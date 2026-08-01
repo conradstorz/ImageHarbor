@@ -23,7 +23,7 @@ merge escape hatch. The **web dashboard is a separate session** and out of scope
 |----------|--------|
 | Governance | **Guard-railed auto-growth** — AI can trigger new codes, but only through system rules |
 | Classifier contract | **AI returns a label + parent; the system owns all numbering** (AI never picks numbers) |
-| Hierarchy shape | **Three bounded levels** under a **fixed 9-class spine**; decimals for overflow / rare 4th level |
+| Hierarchy shape | **Three bounded levels** under a **fixed 9-class spine**; a `~`-suffix for overflow / rare 4th level (the dot is banned from codes) |
 | Top-level classes | **Fixed** (`100-people … 900-miscellaneous`) — never grow, never renumber |
 | Dedup guardrail | **Normalize, then AI-adjudicate near-misses** (option B); embeddings (C) out of scope |
 | Merge | A `merge(X → Y)` alias operation is included |
@@ -71,19 +71,26 @@ Codes are hierarchical strings under the fixed spine:
 - **Level 2 (sub):** children of `P00` are `P10,P20,…,P90` (9 integer slots).
 - **Level 3 (leaf):** children of `PY0` are `PY1,…,PY9` (9 integer slots).
 - **Overflow / depth:** when a node's 9 integer child slots are exhausted, or the
-  node is already a leaf, the next child is a **decimal**: `C.1, C.2, …`
-  (`parent_code` of `540.1` is `540`). This unifies "10th sibling" overflow and
-  "4th level" depth into one rule: `C.N` is the N-th decimal child of `C`.
+  node is already a leaf, the next child appends a **filename-safe `~`
+  separator**: `C~1, C~2, …` (`parent_code` of `540~1` is `540`). This unifies
+  "10th sibling" overflow and "4th level" depth into one rule: `C~N` is the N-th
+  extended child of `C`.
+
+**The dot is banned from codes.** A `.` in the code would collide with the
+extension separator (the exact multi-dot hazard already fixed in `generate_filename`).
+`~` is legal on all target filesystems (Windows/SMB/Synology/macOS/Linux) and is
+**not** in the base64url alphabet, so it can never collide with the 43-char digest.
 
 **Folders** mirror ancestry: code `541` → `500-events/540-holidays/541-christmas/`;
-code `540.1` → `500-events/540-holidays/540.1-<label>/`. The **leaf code** is what
+code `540~1` → `500-events/540-holidays/540~1-<label>/`. The **leaf code** is what
 goes in the filename: `541-christmas_<sha>.jpg`.
 
-**Filename-invariant impact:** the `<pcs>` field becomes a **string token that may
-contain a dot** (`^\d+(\.\d+)?$`), so:
+**Filename-invariant impact:** the `<pcs>` field becomes a **string token matching
+`^\d+(~\d+)*$`** (digits, optionally followed by `~`-separated groups — **never a
+dot**), so:
 - `hashing.extract_digest_from_stem` — its PCS validation changes from
-  `isdigit()` to matching the code pattern (digits with an optional single
-  `.` group). The 43-char digest counting-back logic is **unchanged**.
+  `isdigit()` to matching the code pattern `^\d+(~\d+)*$`. The 43-char digest
+  counting-back logic is **unchanged** (base64url never contains `~`).
 - `filename.parse_filename` — `pcs_code` becomes a **`str`**, not `int`.
 - `pcs.parent_folder_name`/`sub_folder_name` are replaced by
   `taxonomy.folder_path(code)`.
@@ -173,7 +180,7 @@ registry, the same photo always resolves to the same code.
 ## 11. Testing (offline, deterministic — no network)
 
 - **Registry:** seeding from `PCS_CATEGORIES`; `children`; `folder_path` for
-  1/2/3-level and decimal codes; append-only mint; overflow → decimal.
+  1/2/3-level and `~`-extended codes; append-only mint; overflow → `~N`.
 - **Resolution:** exact/alias reuse; fuzzy near-miss → adjudicator reuse (mocked
   adjudicator); no-match → mint next code; `adjudicator=None` → deterministic new.
 - **Merge:** `resolve_alias` follows `alias_of`; a merged code redirects future
@@ -182,7 +189,8 @@ registry, the same photo always resolves to the same code.
   `OpenAIClassifier` prompt includes the taxonomy and parses the proposal (mocked
   client); `adjudicate` mocked.
 - **Filename/hashing:** `extract_digest_from_stem` and `parse_filename` accept
-  dotted codes (`540.1`); digest counting-back intact; `pcs_code` is a `str`.
+  `~`-extended codes (`540~1`) and reject codes containing a dot; digest
+  counting-back intact; `pcs_code` is a `str`.
 - **Determinism:** same photo + same registry → same code, twice.
 - The full existing suite stays green.
 
@@ -205,7 +213,7 @@ registry, the same photo always resolves to the same code.
    real, reused-or-minted code instead of dumping into `900`.
 4. Dedup reuses existing codes via normalize + alias + AI-adjudicated near-miss;
    `merge(X→Y)` aliases codes without moving existing files.
-5. Filenames/folders support dotted codes; the 43-char digest invariant is
-   intact; `parse_filename` handles string codes.
+5. Filenames/folders support `~`-extended codes (no dots in codes); the 43-char
+   digest invariant is intact; `parse_filename` handles string codes.
 6. Determinism holds: fixed registry → same photo → same code.
 7. The full existing suite plus the new tests pass.
