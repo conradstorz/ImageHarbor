@@ -135,6 +135,23 @@ def test_resolve_sub_parent_places_leaf(tax: Taxonomy) -> None:
     assert code == "541"
 
 
+def test_resolve_follows_alias_of_merged_target(tax: Taxonomy) -> None:
+    # 540 is merged into 550, so 540 is now inactive (alias_of=550). A later
+    # resolve targeting 540 must mint under the canonical 550, never the
+    # merged/inactive 540.
+    a = tax.resolve_or_create("500", "holidays")     # 540
+    b = tax.resolve_or_create("500", "festivities")  # 550
+    assert a == "540" and b == "550"
+    tax.merge("540", "550")  # 540 -> alias_of 550
+
+    code = tax.resolve_or_create("500", "newthing", sub_parent="540")
+    node = tax.get(code)
+    assert node is not None
+    assert node.parent_code == "550"  # canonical target, NOT the merged 540
+    # The new node is reachable/active in the snapshot view.
+    assert code in tax.snapshot_text()
+
+
 def test_merge_redirects_future_resolution(tax: Taxonomy) -> None:
     a = tax.resolve_or_create("500", "holidays")     # 540
     b = tax.resolve_or_create("500", "festivities")  # 550

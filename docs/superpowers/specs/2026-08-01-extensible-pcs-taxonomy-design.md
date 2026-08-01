@@ -38,7 +38,7 @@ organized tree if ever lost.
 
 ```sql
 CREATE TABLE IF NOT EXISTS taxonomy (
-    code         TEXT PRIMARY KEY,              -- "100","540","541","540.1"
+    code         TEXT PRIMARY KEY,              -- "100","540","541","540~1"
     parent_code  TEXT,                          -- NULL for top-level; else parent's code
     label        TEXT    NOT NULL,              -- canonical label, e.g. "holidays"
     folder_name  TEXT    NOT NULL,              -- "<code>-<slug(label)>"
@@ -137,7 +137,7 @@ signature gains the snapshot argument.
    match, **reuse that code** and record the incoming label as an alias. If the
    adjudicator is `None` (stub/tests) or returns none, treat as new.
 4. **No match → mint**: `mint_child(parent_or_sub, label)` assigns the lowest
-   free integer child at the next level, or the next `.N` decimal on overflow;
+   free integer child at the next level, or the next `~N` extended code on overflow;
    insert the row; return the new code.
 
 Resolution only ever **adds** rows; it never renumbers or deletes.
@@ -209,7 +209,7 @@ registry, the same photo always resolves to the same code.
 2. The classifier returns a label + parent and **never** picks a number; the
    system assigns every code.
 3. A genuinely new label mints the next code under its parent (3 integer levels,
-   decimal overflow), append-only; the old `540`-style hallucination now yields a
+   `~N` extended-code overflow), append-only; the old `540`-style hallucination now yields a
    real, reused-or-minted code instead of dumping into `900`.
 4. Dedup reuses existing codes via normalize + alias + AI-adjudicated near-miss;
    `merge(X→Y)` aliases codes without moving existing files.

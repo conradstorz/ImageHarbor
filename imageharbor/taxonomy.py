@@ -123,7 +123,7 @@ class Taxonomy:
         if _SUB_RE.match(parent_code):
             base = int(parent_code)
             return [str(base + k) for k in range(1, 10)]
-        return []  # leaf or ~-extended node: decimal children only
+        return []  # leaf or ~-extended node: only ~N extended children
 
     def mint_child(self, parent_code: str, label: str) -> str:
         existing = {n.code for n in self.children(parent_code)}
@@ -175,6 +175,7 @@ class Taxonomy:
         target = sub_parent if sub_parent and self.get(sub_parent) else top_parent
         if self.get(target) is None:
             target = "900"
+        target = self.resolve_alias(target)   # never mint under a merged/inactive parent
         norm = self._normalize(label)
         kids = self.children(target)
 
