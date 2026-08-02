@@ -215,3 +215,20 @@ def test_taxonomy_set_aliases(catalog: Catalog) -> None:
     catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
     catalog.taxonomy_set_aliases("540", ["festivities", "xmas"])
     assert json.loads(catalog.taxonomy_get("540")["aliases"]) == ["festivities", "xmas"]
+
+
+# ---------------------------------------------------------------------------
+# learned_concepts
+# ---------------------------------------------------------------------------
+
+
+def test_learned_concept_roundtrip(catalog: Catalog) -> None:
+    assert catalog.learned_concept_get("marching band") is None
+    catalog.learned_concept_remember("marching band", "500")
+    assert catalog.learned_concept_get("marching band") == "500"
+
+
+def test_learned_concept_remember_updates_and_counts(catalog: Catalog) -> None:
+    catalog.learned_concept_remember("widget", "200")
+    catalog.learned_concept_remember("widget", "300")  # correction / re-seen
+    assert catalog.learned_concept_get("widget") == "300"
