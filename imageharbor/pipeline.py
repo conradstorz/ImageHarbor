@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .ai_classifier import AIClassifier, PhotoClassification, StubClassifier
+from . import concept_map
+from .ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from .catalog import Catalog
 from .discovery import discover_images
 from .exif_reader import read_exif
@@ -192,27 +193,34 @@ class Pipeline:
         # Step 3: EXIF
         exif_data = read_exif(source_path)
 
-        # Step 4: AI classification (the classifier gets the current taxonomy
-        # snapshot so it can reuse an existing category label when one fits).
-        snapshot = self.taxonomy.snapshot_text()
-        classification = self.classifier.classify(source_path, exif_data, snapshot)
+        # Step 4: Perception — the AI only describes the image.
+        content = self.classifier.describe(source_path, exif_data)
 
-        # Step 5: resolve label -> code (dedup + optional AI adjudication).
+        # Step 5: Organization — our code decides the class (concept-map first,
+        # AI fallback). A learned/seed hit is deterministic and network-free; a
+        # genuine miss asks the AI to pick a class and memoizes the answer so the
+        # next identical subject is a deterministic hit.
+        cls = concept_map.class_for(
+            content.primary_subject, content.objects, content.scene, self.catalog
+        )
+        if cls is None:
+            cls = self.classifier.pick_class(content, self._classes())
+            concept_map.remember(self.catalog, content.primary_subject, cls)
+
+        # Step 6: resolve class -> code; primary_subject is the level-2 label
+        # (dedup + optional AI adjudication).
         pcs_code = self.taxonomy.resolve_or_create(
-            classification.top_parent,
-            classification.label,
-            classification.sub_parent,
-            adjudicator=self.classifier.adjudicate,
+            cls, content.primary_subject, adjudicator=self.classifier.adjudicate
         )
         node = self.taxonomy.get(pcs_code)
-        pcs_name = node.label if node else classification.label
+        pcs_name = node.label if node else content.primary_subject
 
-        # Step 6: generate filename (pcs_code is a string, e.g. "330" or "540~1")
-        descriptor = normalize_descriptor(classification.descriptor)
+        # Step 7: generate filename (pcs_code is a string, e.g. "330" or "540~1")
+        descriptor = normalize_descriptor(content.primary_subject)
         extension = source_path.suffix.lstrip(".").lower()
         filename = generate_filename(pcs_code, descriptor, sha256_b64url, extension)
 
-        # Step 7: determine output path from the taxonomy folder tree
+        # Step 8: determine output path from the taxonomy folder tree
         organized_path = (
             self.organized_dir / self.taxonomy.folder_path(pcs_code) / filename
         )
@@ -243,7 +251,7 @@ class Pipeline:
             source_path=source_path,
             organized_path=organized_path,
             sha256_b64url=sha256_b64url,
-            classification=classification,
+            content=content,
             pcs_code=pcs_code,
             pcs_name=pcs_name,
             exif_data=exif_data,
@@ -254,7 +262,7 @@ class Pipeline:
         # on so the result stays "copied".
         if self.write_sidecars:
             try:
-                self._write_sidecar(organized_path, source_path, sha256_b64url, pcs_code, descriptor, classification, exif_data)
+                self._write_sidecar(organized_path, source_path, sha256_b64url, pcs_code, descriptor, content, exif_data)
             except Exception:
                 logger.warning(
                     "Failed to write sidecar for %s; image is organized and catalogued",
@@ -269,13 +277,17 @@ class Pipeline:
             organized_path=organized_path,
         )
 
+    def _classes(self) -> list[tuple[str, str]]:
+        """The 9 fixed top-level classes, as (code, label) pairs."""
+        return [(n.code, n.label) for n in self.taxonomy.children(None)]
+
     def _update_catalog(
         self,
         *,
         source_path: Path,
         organized_path: Path,
         sha256_b64url: str,
-        classification: PhotoClassification,
+        content: ContentDescription,
         pcs_code: str,
         pcs_name: str,
         exif_data: dict[str, Any],
@@ -284,15 +296,14 @@ class Pipeline:
             sha256_b64url=sha256_b64url,
             original_path=str(source_path),
             organized_path=str(organized_path),
-            pcs_version=classification.pcs_version,
             pcs_primary=pcs_code,
             pcs_name=pcs_name,
-            secondary_tags=classification.secondary_tags,
-            ai_caption=classification.caption,
-            objects=classification.objects,
-            ocr_text=classification.ocr_text,
+            secondary_tags=content.tags,
+            ai_caption=content.caption,
+            objects=content.objects,
+            ocr_text=content.ocr_text,
             exif=exif_data,
-            model_version=classification.model_version,
+            model_version=content.model_version,
             processing_history=[
                 {
                     "event": "processed",
@@ -318,7 +329,7 @@ class Pipeline:
         sha256_b64url: str,
         pcs_code: str,
         descriptor: str,
-        classification: PhotoClassification,
+        content: ContentDescription,
         exif_data: dict[str, Any],
     ) -> None:
         from .filename import parse_filename
@@ -330,11 +341,11 @@ class Pipeline:
             "organized_path": str(organized_path),
             "pcs_code": parsed["pcs_code"] if parsed else pcs_code,
             "descriptor": parsed["descriptor"] if parsed else descriptor,
-            "caption": classification.caption,
-            "objects": classification.objects,
-            "secondary_tags": classification.secondary_tags,
-            "ocr_text": classification.ocr_text,
-            "model_version": classification.model_version,
+            "caption": content.caption,
+            "objects": content.objects,
+            "secondary_tags": content.tags,
+            "ocr_text": content.ocr_text,
+            "model_version": content.model_version,
             "exif": exif_data,
         }
         write_sidecar(organized_path, metadata)
