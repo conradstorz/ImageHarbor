@@ -44,6 +44,19 @@ class PhotoClassification:
     pcs_version: str = PCS_VERSION
 
 
+@dataclass
+class ContentDescription:
+    """Pure perception output — what is in the photo, no taxonomy knowledge."""
+
+    primary_subject: str = "photo"  # 1-3 words, the main subject
+    scene: str = ""  # setting/context
+    objects: list[str] = field(default_factory=list)
+    caption: str = ""
+    tags: list[str] = field(default_factory=list)
+    ocr_text: str = ""
+    model_version: str = "stub-1.0"
+
+
 # ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
@@ -70,6 +83,10 @@ class AIClassifier(ABC):
         one of the existing *candidates*.
         """
         return None
+
+    def pick_class(self, content: "ContentDescription", classes: list[tuple[str, str]]) -> str:
+        """Pick the best class CODE from `classes`. Default: miscellaneous."""
+        return "900"
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +174,30 @@ class StubClassifier(AIClassifier):
             model_version=self.MODEL_VERSION,
         )
 
+    def describe(self, image_path: Path, exif_data: dict[str, Any]) -> ContentDescription:
+        stem = image_path.stem.lower()
+        words = [w for w in re.sub(r"[^a-z0-9]+", " ", stem).split() if len(w) > 1]
+        primary = words[0] if words else "photo"
+        return ContentDescription(
+            primary_subject=primary,
+            caption=f"Stub description for {image_path.name}",
+            tags=words[:3],
+            model_version=self.MODEL_VERSION,
+        )
+    # pick_class inherits the ABC default (900) — deterministic, no network.
+
 
 # ---------------------------------------------------------------------------
 # OpenAI Vision classifier (optional; requires `pip install openai`)
 # ---------------------------------------------------------------------------
+
+_MEDIA_TYPES = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
 
 _SYSTEM_PROMPT = """\
 You are a photo archivist that classifies images into an extensible taxonomy.
@@ -250,13 +287,6 @@ class OpenAIClassifier(AIClassifier):
             image_b64 = base64.b64encode(fh.read()).decode("ascii")
 
         suffix = image_path.suffix.lower().lstrip(".")
-        _MEDIA_TYPES = {
-            "jpg": "image/jpeg",
-            "jpeg": "image/jpeg",
-            "png": "image/png",
-            "gif": "image/gif",
-            "webp": "image/webp",
-        }
         media_type = _MEDIA_TYPES.get(suffix, "image/jpeg")
 
         system_msg = _SYSTEM_PROMPT.format(taxonomy_snapshot=taxonomy_snapshot)
@@ -330,3 +360,78 @@ class OpenAIClassifier(AIClassifier):
             if c.lower() == answer.lower():
                 return c
         return None
+
+    def describe(self, image_path: Path, exif_data: dict[str, Any]) -> ContentDescription:
+        import base64
+
+        with open(image_path, "rb") as fh:
+            image_b64 = base64.b64encode(fh.read()).decode("ascii")
+        suffix = image_path.suffix.lower().lstrip(".")
+        media_type = _MEDIA_TYPES.get(suffix, "image/jpeg")
+        system = (
+            "You are a photo describer. Look at the image and respond ONLY with a "
+            "JSON object with keys: primary_subject (1-3 words), scene (short), "
+            "objects (array), caption (one sentence), tags (array), ocr_text (string). "
+            "Do NOT categorize or classify — only describe what you see."
+        )
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{image_b64}",
+                                "detail": "low",
+                            },
+                        },
+                        {"type": "text", "text": "Describe this image."},
+                    ],
+                },
+            ],
+            max_tokens=400,
+        )
+        raw = resp.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("OpenAI describe returned invalid JSON: %s", raw)
+            data = {}
+
+        def _list(v: Any) -> list[str]:
+            return [str(x) for x in v] if isinstance(v, (list, tuple)) else []
+
+        return ContentDescription(
+            primary_subject=str(data.get("primary_subject") or "photo"),
+            scene=str(data.get("scene", "")),
+            objects=_list(data.get("objects", [])),
+            caption=str(data.get("caption", "")),
+            tags=_list(data.get("tags", [])),
+            ocr_text=str(data.get("ocr_text", "")),
+            model_version=self.MODEL_VERSION,
+        )
+
+    def pick_class(self, content: ContentDescription, classes: list[tuple[str, str]]) -> str:
+        options = "\n".join(f"{code}: {label}" for code, label in classes)
+        prompt = (
+            "Pick the single best top-level class for this photo description.\n"
+            f"subject: {content.primary_subject}\nscene: {content.scene}\n"
+            f"objects: {content.objects}\ncaption: {content.caption}\n"
+            f"classes:\n{options}\n"
+            "Reply with ONLY the class code (e.g. 500)."
+        )
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=8,
+        )
+        ans = (resp.choices[0].message.content or "").strip()
+        valid = {code for code, _ in classes}
+        for tok in re.findall(r"\d+", ans):
+            if tok in valid:
+                return tok
+        return "900"

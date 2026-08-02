@@ -11,6 +11,7 @@ from PIL import Image
 
 from imageharbor.ai_classifier import (
     AIClassifier,
+    ContentDescription,
     OpenAIClassifier,
     PhotoClassification,
     StubClassifier,
@@ -484,3 +485,105 @@ def test_openai_classifier_passes_base_url_model_timeout(monkeypatch: pytest.Mon
     assert captured["api_key"] == "not-needed"  # placeholder when none supplied
     assert clf._model == "llava"
     assert clf.MODEL_VERSION == "llava"
+
+
+# ---------------------------------------------------------------------------
+# ContentDescription / describe / pick_class — perception contract (additive)
+# ---------------------------------------------------------------------------
+
+
+def test_content_description_and_stub_describe() -> None:
+    c = StubClassifier().describe(Path("marching_band_2007.jpg"), {})
+    assert isinstance(c, ContentDescription)
+    assert c.primary_subject == "marching"  # first >1-char word of the stem
+    # deterministic
+    assert StubClassifier().describe(Path("marching_band_2007.jpg"), {}).primary_subject == "marching"
+
+
+def test_stub_describe_returns_expected_fields() -> None:
+    c = StubClassifier().describe(Path("marching_band_2007.jpg"), {})
+    assert c.caption == "Stub description for marching_band_2007.jpg"
+    assert c.tags == ["marching", "band", "2007"]
+    assert c.model_version == "stub-1.0"
+
+
+def test_stub_describe_falls_back_to_photo_when_empty_stem() -> None:
+    c = StubClassifier().describe(Path("_.jpg"), {})
+    assert c.primary_subject == "photo"
+
+
+def test_stub_pick_class_default_900() -> None:
+    c = ContentDescription(primary_subject="mystery")
+    assert StubClassifier().pick_class(c, [("100", "people"), ("900", "miscellaneous")]) == "900"
+
+
+def test_openai_describe_parses_content(monkeypatch: pytest.MonkeyPatch, tiny_image: Path) -> None:
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+
+    payload = {
+        "primary_subject": "dog",
+        "scene": "backyard",
+        "objects": ["dog", "grass", "ball"],
+        "caption": "A dog playing in a backyard.",
+        "tags": ["pet", "outdoor"],
+        "ocr_text": "",
+    }
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response(json.dumps(payload))
+
+    result = clf.describe(tiny_image, {})
+
+    assert isinstance(result, ContentDescription)
+    assert result.primary_subject == "dog"
+    assert result.scene == "backyard"
+    assert result.objects == ["dog", "grass", "ball"]
+    assert result.caption == "A dog playing in a backyard."
+    assert result.tags == ["pet", "outdoor"]
+    assert result.ocr_text == ""
+    assert result.model_version == "gpt-4o-mini"
+    assert clf._client.chat.completions.create.called
+
+
+def test_openai_describe_invalid_json_falls_back(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response("not json {")
+
+    result = clf.describe(tiny_image, {})
+
+    assert result.primary_subject == "photo"
+    assert result.objects == []
+    assert result.tags == []
+
+
+def test_openai_pick_class_returns_valid_code(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response("500")
+
+    content = ContentDescription(primary_subject="band", scene="stage")
+    result = clf.pick_class(content, [("100", "people"), ("500", "events")])
+
+    assert result == "500"
+    assert clf._client.chat.completions.create.called
+
+
+def test_openai_pick_class_invalid_reply_falls_back_to_900(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response("I have no idea")
+
+    content = ContentDescription(primary_subject="mystery")
+    result = clf.pick_class(content, [("100", "people"), ("500", "events")])
+
+    assert result == "900"
