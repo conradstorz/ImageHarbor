@@ -46,15 +46,23 @@ def _build_static_seed() -> dict[str, str]:
 
 STATIC_SEED: dict[str, str] = _build_static_seed()
 
+# The 9 fixed top-level class codes. Learned/returned classes are validated
+# against these so an invalid value can never be stored or treated as a hit
+# (which would permanently poison a subject's mapping).
+_VALID_CLASSES: frozenset[str] = frozenset(
+    str(code) for code, cat in PCS_CATEGORIES.items() if cat.parent is None
+)
+
 
 def class_for(
     primary_subject: str, objects: list[str], scene: str, catalog: Catalog
 ) -> str | None:
     """Return a top-level class code for this content, or None (a miss)."""
     subj = _normalize_label(primary_subject)
-    # 1. Learned store wins (exact normalized subject).
+    # 1. Learned store wins (exact normalized subject) — but only if it's a
+    #    real class; an invalid stored value is ignored, not treated as a hit.
     learned = catalog.learned_concept_get(subj)
-    if learned:
+    if learned in _VALID_CLASSES:
         return learned
     # 2. Static seed: the subject, then object/scene keywords.
     if subj in STATIC_SEED:
@@ -68,6 +76,12 @@ def class_for(
 
 def remember(catalog: Catalog, primary_subject: str, class_code: str) -> None:
     """Memoize an AI-decided subject -> class so the next repeat is deterministic."""
+    if class_code not in _VALID_CLASSES:
+        logger.warning(
+            "refusing to learn %r -> invalid class %r (not a fixed top-level class)",
+            primary_subject, class_code,
+        )
+        return
     subj = _normalize_label(primary_subject)
     logger.info("concept-map learned: %r -> class %s", subj, class_code)
     catalog.learned_concept_remember(subj, class_code)

@@ -32,6 +32,20 @@ def test_class_for_miss_returns_none(catalog: Catalog) -> None:
     assert concept_map.class_for("qwertyunknownthing", [], "", catalog) is None
 
 
+def test_remember_rejects_invalid_class(catalog: Catalog) -> None:
+    from imageharbor.taxonomy import _normalize_label
+    concept_map.remember(catalog, "gizmo", "999")  # not a fixed top-level class
+    assert catalog.learned_concept_get(_normalize_label("gizmo")) is None
+    assert concept_map.class_for("gizmo", [], "", catalog) is None
+
+
+def test_class_for_ignores_invalid_learned_value(catalog: Catalog) -> None:
+    from imageharbor.taxonomy import _normalize_label
+    # Poison the store directly (bypassing remember's guard) with a bad code.
+    catalog.learned_concept_remember(_normalize_label("gremlin"), "zzz")
+    assert concept_map.class_for("gremlin", [], "", catalog) is None  # ignored, not a hit
+
+
 def test_learned_beats_static_and_roundtrips(catalog: Catalog) -> None:
     concept_map.remember(catalog, "Beach", "600")  # user/AI override
     assert concept_map.class_for("beach", [], "", catalog) == "600"  # learned wins

@@ -342,6 +342,7 @@ class Pipeline:
             "pcs_code": parsed["pcs_code"] if parsed else pcs_code,
             "descriptor": parsed["descriptor"] if parsed else descriptor,
             "caption": content.caption,
+            "scene": content.scene,
             "objects": content.objects,
             "secondary_tags": content.tags,
             "ocr_text": content.ocr_text,
