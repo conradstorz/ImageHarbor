@@ -81,6 +81,16 @@ def test_resolve_reuses_target_when_label_names_it(tax: Taxonomy) -> None:
     assert {c.code for c in tax.children("600")} == before  # nothing minted
 
 
+def test_resolve_degenerate_label_uses_parent(tax: Taxonomy) -> None:
+    # A weak model emits meaningless labels; those must not spawn junk
+    # categories (e.g. 421-none) — file under the resolved target parent instead.
+    # includes punctuation variants that normalize to a degenerate token
+    for junk in ["none", "N/A", "unknown", "   ", "misc", "123", "!!!",
+                 "unknown.", "none!", "misc."]:
+        assert tax.resolve_or_create("400", junk, sub_parent="420") == "420"
+    assert tax.children("420") == []  # nothing minted
+
+
 def test_resolve_mints_when_new(tax: Taxonomy) -> None:
     code = tax.resolve_or_create("500", "holidays")
     assert code == "540"
