@@ -8,7 +8,9 @@ A deterministic, resumable CLI that organizes a photo library. Its three verbs �
 **Classify. Verify. Preserve.** — map directly to the design:
 
 - **Classify** — each image is assigned a PCS (Photo Classification Standard) code
-  by a pluggable AI classifier, which decides the destination folder tree.
+  that decides the destination folder tree. A pluggable AI backend only *perceives*
+  the image (subject/scene/objects/caption/tags); the organizer (`concept_map.py` +
+  `taxonomy.py`) is what actually decides the class and folder.
 - **Verify** — every file is content-addressed by SHA-256; the digest is embedded
   in the filename so any file can later be re-verified against its own name.
 - **Preserve** — originals are treated as read-only. Files are *copied* (never
@@ -43,15 +45,23 @@ truth for deps, extras, pytest config, and the `imageharbor` entry point.
 Single package `imageharbor/`, orchestrated by a linear pipeline. The flow for one
 image (`pipeline.Pipeline._do_process`) is the spine of the whole system, in order:
 
-`hash → duplicate check → EXIF → classify → resolve PCS code → build filename →
-compute dest path → copy → verify copy → upsert catalog → optional sidecar`
+`hash → duplicate check → EXIF → describe (perception) → concept_map.class_for
+(AI pick_class + remember on miss) → taxonomy.resolve_or_create(class,
+primary_subject) → build filename → compute dest path → copy → verify copy →
+upsert catalog (content) → optional sidecar`
 
 Module responsibilities:
 
-- **`pipeline.py`** — the orchestrator above. Owns the copy-then-verify-then-catalog
-  ordering and the `PipelineStats`/`ProcessResult` result types. If a post-copy
-  integrity check fails, the copy is deleted and an error is raised — nothing enters
-  the catalog unverified.
+- **`pipeline.py`** — the orchestrator above. After hashing/dedup/EXIF, it calls
+  `classifier.describe()` for pure perception, then `concept_map.class_for()` to
+  pick one of the 9 fixed top-level classes; only on a concept-map miss does it
+  fall back to `classifier.pick_class()` and memoize the result via
+  `concept_map.remember()`. It then calls `taxonomy.resolve_or_create(cls,
+  content.primary_subject, adjudicator=...)` with a top-level class and **no
+  `sub_parent`** — `primary_subject` is the level-2 label. Owns the
+  copy-then-verify-then-catalog ordering and the `PipelineStats`/`ProcessResult`
+  result types. If a post-copy integrity check fails, the copy is deleted and an
+  error is raised — nothing enters the catalog unverified.
 - **`pcs.py`** — **seed data + helpers only**: `PCS_CATEGORIES` defines the 9 fixed
   top-level classes (100–900) and their original sub-codes, used once to seed the
   catalog `taxonomy` table on first run (`Taxonomy.ensure_seeded`). `resolve_code`
@@ -64,7 +74,7 @@ Module responsibilities:
   `^\d+(~\d+)*$` — plain integers for the common case (e.g. `"330"`), with a `~N`
   suffix minted when a parent's normal integer slots are exhausted or a leaf needs a
   child of its own (**never a dot**). `resolve_or_create(top_parent, label,
-  sub_parent=None, adjudicator=None)` is how the pipeline turns a classifier's label
+  sub_parent=None, adjudicator=None)` is how the pipeline turns a class + label pair
   into a code: it normalizes the label, checks the target parent's children for an
   exact/alias match, and — only when there's no exact match and an `adjudicator` is
   supplied — asks the AI classifier's `adjudicate(label, candidates)` whether the
@@ -77,17 +87,26 @@ Module responsibilities:
   parent_code links to build the slash-joined destination folder tree (this is what
   the pipeline now uses instead of `pcs.parent_folder_name`/`sub_folder_name`).
   `snapshot_text()` renders the current taxonomy for the classifier prompt.
-- **`ai_classifier.py`** — `AIClassifier` ABC with two implementations chosen by the
-  `--ai` flag: `StubClassifier` (default; deterministic, no network — infers a
-  category from filename keywords, used by all tests) and `OpenAIClassifier`
-  (optional, gated behind the `openai` extra and imported lazily). `classify(path,
-  exif_data, taxonomy_snapshot)` returns a `PhotoClassification` — **the classifier
-  never picks a numeric PCS code**; it returns `top_parent` (one of the 9 fixed
-  classes), a `label` (reused from the snapshot or newly proposed), and an optional
-  `sub_parent` to nest a new leaf under. The pipeline resolves that triple to a code
-  via `Taxonomy.resolve_or_create`. The ABC also defines `adjudicate(label,
-  candidates) -> str | None` (default: no match) so a real-model backend can decide
-  whether a proposed label is a synonym of an existing sibling category;
+  `taxonomy.py` itself was not touched by the perception/organization reframe — the
+  pipeline now calls `resolve_or_create(class, primary_subject)` with a fixed
+  top-level class and **no `sub_parent`**, so in practice the taxonomy is
+  effectively **two levels** (fixed class → `primary_subject` sub-category); the
+  `sub_parent`/`~N`-under-a-leaf machinery still exists but its call sites are
+  currently unused.
+- **`ai_classifier.py`** — perception only. `AIClassifier` ABC with two
+  implementations chosen by the `--ai` flag: `StubClassifier` (default;
+  deterministic, no network — derives a subject/tags from filename keywords, used
+  by all tests) and `OpenAIClassifier` (optional, gated behind the `openai` extra
+  and imported lazily). `describe(image_path, exif_data) -> ContentDescription`
+  (`primary_subject`, `scene`, `objects`, `caption`, `tags`, `ocr_text`,
+  `model_version`) is the only required method — **the classifier never picks a
+  class or a PCS code; it only reports what it sees.** `PhotoClassification` and
+  `classify()` are gone. Two more ABC methods support the organizer: `pick_class
+  (content, classes) -> str` is a **text-only fallback** the pipeline calls only
+  when `concept_map.class_for` misses (default: `"900"`; `OpenAIClassifier` asks
+  the model to choose among the 9 fixed classes), and `adjudicate(label,
+  candidates) -> str | None` (default: no match) lets a real-model backend decide
+  whether a proposed label is a synonym of an existing sibling category —
   `OpenAIClassifier` implements it as a follow-up chat call. Add new backends by
   subclassing `AIClassifier` and wiring them in `cli.py`.
   **Design intent (important):** this abstraction exists so the *AI server doing the
@@ -95,6 +114,17 @@ Module responsibilities:
   AI server (a Jetson Orin Nano on the local network), but nothing is hard-wired to
   it — a local/Jetson HTTP backend is an expected future implementation that does not
   exist yet. Keep the classifier decoupled from any specific host or provider.
+- **`concept_map.py`** — decides the top-level **class** (the organizer's job, not
+  the AI's). `STATIC_SEED` is built once at import time from
+  `pcs.PCS_CATEGORIES`' sub-category names plus a small curated
+  keyword/synonym table, mapping normalized subject/object/scene tokens to one of
+  the 9 fixed classes. `class_for(primary_subject, objects, scene, catalog)` checks,
+  in order: the catalog's `learned_concepts` store (exact normalized-subject match),
+  then the static seed against the subject, then against each object/scene token —
+  returning `None` on a genuine miss. On a miss the pipeline falls back to
+  `classifier.pick_class()` and calls `remember(catalog, primary_subject,
+  class_code)` to memoize the decision in `learned_concepts`, so the next photo with
+  the same normalized subject is a deterministic, network-free hit.
 - **`hashing.py`** + **`filename.py`** — content addressing. SHA-256 is encoded as
   **unpadded Base64url, always exactly 43 chars** (`SHA256_B64URL_LEN`). Filename
   format is `<pcs>-<descriptor>_<sha256>.<ext>`.
@@ -103,7 +133,9 @@ Module responsibilities:
   detection** (`is_known`); `upsert` is idempotent (`ON CONFLICT … DO UPDATE`) and
   list/dict fields are stored as JSON text. A second `taxonomy` table persists the
   self-extending PCS registry (`code`, `parent_code`, `label`, `folder_name`,
-  `aliases`, `alias_of`, `active`), backing `taxonomy.py`.
+  `aliases`, `alias_of`, `active`), backing `taxonomy.py`. A third `learned_concepts`
+  table (`subject`, `class_code`, `hits`, timestamps) is the self-learning store
+  behind `concept_map.py`'s `learned_concept_get`/`learned_concept_remember`.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
@@ -121,14 +153,19 @@ Module responsibilities:
   table, seeded once from `pcs.PCS_CATEGORIES` (now seed data only). The **9
   top-level classes are fixed**; all growth happens beneath them, and existing codes
   are never renumbered or reused.
-- **Classifiers propose a label, they never pick a number.** `AIClassifier.classify`
-  returns `(top_parent, label, sub_parent?)`; only `Taxonomy.resolve_or_create` (in
-  the pipeline) turns that into a code — by reusing an exact/alias match among the
-  target parent's existing children, or, failing that, consulting
-  `AIClassifier.adjudicate(label, candidates)` for a semantic synonym match before
-  minting a new one. Do not add string-similarity/fuzzy-ratio gating in front of the
-  adjudicator — it was tried and dropped because true synonyms (e.g. "festivities"
-  vs. "holidays") are string-dissimilar, which made the adjudicator unreachable.
+- **The classifier perceives; it never classifies.** `AIClassifier.describe` returns
+  a `ContentDescription` (subject/scene/objects/caption/tags/ocr_text) and nothing
+  taxonomy-shaped. Deciding the top-level **class** is `concept_map.class_for`'s job
+  (static seed + learned store); the classifier is only consulted as a **text-only
+  fallback** (`pick_class`) on a concept-map miss, and that answer is immediately
+  memoized via `concept_map.remember` so the same subject never asks the AI twice.
+  Deciding the **code** for a (class, label) pair is `Taxonomy.resolve_or_create`'s
+  job — by reusing an exact/alias match among the target parent's existing children,
+  or, failing that, consulting `AIClassifier.adjudicate(label, candidates)` for a
+  semantic synonym match before minting a new one. Do not add
+  string-similarity/fuzzy-ratio gating in front of the adjudicator — it was tried and
+  dropped because true synonyms (e.g. "festivities" vs. "holidays") are
+  string-dissimilar, which made the adjudicator unreachable.
 - **Folder paths come from `taxonomy.folder_path(code)`**, which walks `parent_code`
   links from the top-level ancestor down to `code`. `pcs.parent_folder_name` and
   `pcs.sub_folder_name` were **removed** — do not reintroduce a two-level-only
