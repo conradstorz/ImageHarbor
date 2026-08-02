@@ -8,9 +8,13 @@ pipeline falls through to the text-only pick_class step.
 """
 from __future__ import annotations
 
+import logging
+
 from .catalog import Catalog
 from .pcs import PCS_CATEGORIES
 from .taxonomy import _normalize_label
+
+logger = logging.getLogger(__name__)
 
 
 def _build_static_seed() -> dict[str, str]:
@@ -64,4 +68,6 @@ def class_for(
 
 def remember(catalog: Catalog, primary_subject: str, class_code: str) -> None:
     """Memoize an AI-decided subject -> class so the next repeat is deterministic."""
-    catalog.learned_concept_remember(_normalize_label(primary_subject), class_code)
+    subj = _normalize_label(primary_subject)
+    logger.info("concept-map learned: %r -> class %s", subj, class_code)
+    catalog.learned_concept_remember(subj, class_code)

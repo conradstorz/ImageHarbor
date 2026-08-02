@@ -208,6 +208,9 @@ class OpenAIClassifier(AIClassifier):
         except json.JSONDecodeError:
             logger.warning("OpenAI describe returned invalid JSON: %s", raw)
             data = {}
+        if not isinstance(data, dict):
+            logger.warning("OpenAI describe returned non-object JSON: %s", raw)
+            data = {}
 
         def _list(v: Any) -> list[str]:
             return [str(x) for x in v] if isinstance(v, (list, tuple)) else []

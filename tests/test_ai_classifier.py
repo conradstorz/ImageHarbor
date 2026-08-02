@@ -227,6 +227,25 @@ def test_openai_describe_invalid_json_falls_back(
     assert result.tags == []
 
 
+def test_openai_describe_non_object_json_falls_back(
+    monkeypatch: pytest.MonkeyPatch, tiny_image: Path
+) -> None:
+    # A 3B model can return a valid top-level JSON array/string/number; json.loads
+    # succeeds but data.get(...) would raise AttributeError. The guard must coerce
+    # a non-dict payload to defaults rather than error the image.
+    _install_fake_openai(monkeypatch)
+    clf = OpenAIClassifier(api_key="unused")
+    clf._client = Mock()
+    clf._client.chat.completions.create.return_value = _mock_response('["dog", "cat"]')
+
+    result = clf.describe(tiny_image, {})
+
+    assert isinstance(result, ContentDescription)
+    assert result.primary_subject == "photo"
+    assert result.objects == []
+    assert result.tags == []
+
+
 def test_openai_pick_class_returns_valid_code(
     monkeypatch: pytest.MonkeyPatch, tiny_image: Path
 ) -> None:
