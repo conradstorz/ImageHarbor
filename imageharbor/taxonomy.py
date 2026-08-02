@@ -28,6 +28,15 @@ def slug(label: str) -> str:
     return _SLUG_RE.sub("-", label.lower()).strip("-") or "unnamed"
 
 
+# Meaningless labels a weak vision model sometimes emits; these must NOT spawn
+# their own categories — the image is filed directly under its parent instead.
+_DEGENERATE_LABELS = frozenset({
+    "none", "n/a", "na", "unknown", "unclear", "unidentified", "undefined",
+    "misc", "miscellaneous", "other", "others", "various", "general",
+    "untitled", "unlabeled", "unlabelled", "no label", "label",
+})
+
+
 @dataclass
 class TaxonomyNode:
     code: str
@@ -177,6 +186,14 @@ class Taxonomy:
             target = "900"
         target = self.resolve_alias(target)   # never mint under a merged/inactive parent
         norm = self._normalize(label)
+
+        # Reject degenerate labels a weak model emits (e.g. "none", "", "unknown",
+        # or something with no letters like "123"): don't spawn a junk category —
+        # file the image directly under the resolved target parent.
+        if not norm or label.strip().lower() in _DEGENERATE_LABELS or not any(
+            c.isalpha() for c in label
+        ):
+            return target
 
         # If the label names the target category ITSELF (the AI often over-
         # specifies a sub_parent equal to the category it means), reuse the
