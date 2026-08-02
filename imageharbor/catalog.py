@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS taxonomy (
     created_at   TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_taxonomy_parent ON taxonomy(parent_code);
+
+CREATE TABLE IF NOT EXISTS learned_concepts (
+    subject     TEXT    PRIMARY KEY,
+    class_code  TEXT    NOT NULL,
+    hits        INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT
+);
 """
 
 
@@ -317,6 +325,32 @@ class Catalog:
     def taxonomy_set_aliases(self, code: str, aliases: list[str]) -> None:
         self._conn.execute(
             "UPDATE taxonomy SET aliases=? WHERE code=?", (_json(aliases), code)
+        )
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Learned concepts
+    # ------------------------------------------------------------------
+
+    def learned_concept_get(self, subject: str) -> str | None:
+        cur = self._conn.execute(
+            "SELECT class_code FROM learned_concepts WHERE subject=?", (subject,)
+        )
+        row = cur.fetchone()
+        return row["class_code"] if row else None
+
+    def learned_concept_remember(self, subject: str, class_code: str) -> None:
+        now = _now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO learned_concepts (subject, class_code, hits, created_at, updated_at)
+            VALUES (?,?,1,?,?)
+            ON CONFLICT(subject) DO UPDATE SET
+                class_code = excluded.class_code,
+                hits       = hits + 1,
+                updated_at = excluded.updated_at
+            """,
+            (subject, class_code, now, now),
         )
         self._conn.commit()
 
