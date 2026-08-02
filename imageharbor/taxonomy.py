@@ -28,6 +28,20 @@ def slug(label: str) -> str:
     return _SLUG_RE.sub("-", label.lower()).strip("-") or "unnamed"
 
 
+def _normalize_label(text: str) -> str:
+    """Lowercase, punctuation -> spaces, naive singularize. Shared by fuzzy
+    label matching and the degenerate-label blocklist."""
+    text = _SLUG_RE.sub(" ", text.lower()).strip()
+    words = []
+    for w in text.split():
+        if len(w) > 4 and w.endswith("es"):
+            w = w[:-2]
+        elif len(w) > 3 and w.endswith("s"):
+            w = w[:-1]
+        words.append(w)
+    return " ".join(words)
+
+
 # Meaningless labels a weak vision model sometimes emits; these must NOT spawn
 # their own categories — the image is filed directly under its parent instead.
 _DEGENERATE_LABELS = frozenset({
@@ -35,6 +49,8 @@ _DEGENERATE_LABELS = frozenset({
     "misc", "miscellaneous", "other", "others", "various", "general",
     "untitled", "unlabeled", "unlabelled", "no label", "label",
 })
+# Normalized forms too, so punctuation variants ("none!", "unknown.") are caught.
+_DEGENERATE_NORM = frozenset(_normalize_label(x) for x in _DEGENERATE_LABELS)
 
 
 @dataclass
@@ -157,15 +173,7 @@ class Taxonomy:
 
     @staticmethod
     def _normalize(label: str) -> str:
-        text = _SLUG_RE.sub(" ", label.lower()).strip()
-        words = []
-        for w in text.split():
-            if len(w) > 4 and w.endswith("es"):
-                w = w[:-2]
-            elif len(w) > 3 and w.endswith("s"):
-                w = w[:-1]
-            words.append(w)
-        return " ".join(words)
+        return _normalize_label(label)
 
     def resolve_or_create(
         self,
@@ -190,7 +198,7 @@ class Taxonomy:
         # Reject degenerate labels a weak model emits (e.g. "none", "", "unknown",
         # or something with no letters like "123"): don't spawn a junk category —
         # file the image directly under the resolved target parent.
-        if not norm or label.strip().lower() in _DEGENERATE_LABELS or not any(
+        if not norm or norm in _DEGENERATE_NORM or not any(
             c.isalpha() for c in label
         ):
             return target
