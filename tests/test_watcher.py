@@ -237,3 +237,29 @@ def test_watch_sleeps_breaker_backoff_when_open(
     watch(pipeline=pipeline, catalog=catalog, source=src, interval=300.0,
           stop_event=stop, sleep=_sleep, breaker=breaker)
     assert slept and abs(slept[0] - 60.0) < 1.0   # slept the backoff, not the interval
+
+
+def test_watch_probe_uses_backoff_not_interval_after_midpass_trip(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    # A pass that trips the breaker mid-run must NOT then sleep the full poll
+    # interval; the next wait should be the (short) backoff so the recovery
+    # probe fires promptly.
+    src = _src_with(tmp_path, 3)
+    pipeline = Pipeline(src, organized_dir, catalog, classifier=_AlwaysFails())
+    clock = [1000.0]
+    breaker = CircuitBreaker(trip_threshold=2, backoff_base=60.0, now=lambda: clock[0])
+    stop = threading.Event()
+    slept: list[float] = []
+
+    def _sleep(d: float) -> bool:
+        slept.append(d)
+        clock[0] += d          # advance clock so backoff elapses realistically
+        stop.set()             # stop after observing the first between-pass wait
+        return True
+
+    watch(pipeline=pipeline, catalog=catalog, source=src, interval=300.0,
+          stop_event=stop, sleep=_sleep, breaker=breaker, poison_max_fails=5)
+    # First pass trips (2 fails). The observed wait must be the ~60s backoff,
+    # not the 300s interval.
+    assert slept and abs(slept[0] - 60.0) < 1.0

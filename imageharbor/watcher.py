@@ -227,5 +227,13 @@ def watch(
         )
         if stop_event.is_set():
             break
+        # If the breaker tripped this pass it is now OPEN; let the OPEN branch at
+        # the top of the loop govern the wait (the remaining backoff) instead of
+        # sleeping the full poll interval. Otherwise a short early backoff
+        # (60/120/240s) would be floored at `interval`, delaying the quick
+        # recovery probe the exponential schedule intends. No time is lost either
+        # way — seconds_until_probe() is absolute-clock based.
+        if breaker is not None and breaker.is_open():
+            continue
         sleep(interval)
     return wstats
