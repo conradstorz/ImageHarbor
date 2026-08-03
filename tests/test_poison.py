@@ -61,10 +61,7 @@ def test_poison_file_quarantined_after_k_healthy_passes(
     breaker = _fresh_breaker()
 
     for _ in range(4):
-        # 'good.jpg' succeeds each pass -> pass_had_success -> 'bad.jpg' counts.
-        # Touch mtime so 'good.jpg' is re-seen? No: good is recorded seen after
-        # pass 1, but bad.jpg is retried every pass (never recorded). We need a
-        # success in EVERY pass, so re-create good.jpg unseen each pass:
+        # Fresh unseen success each pass proves the backend is up (healthy-pass gate).
         _make_jpeg(src / f"good_{_}.jpg", b"\xff\xd8\xff\xe0" + bytes([_ + 1]) * 16 + b"\xff\xd9")
         run_pass(pipeline=pipeline, catalog=catalog, source=src, breaker=breaker,
                  poison_max_fails=5)
