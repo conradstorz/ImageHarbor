@@ -131,9 +131,47 @@ def run_pass(
     return stats
 
 
-def _reconcile_poison(**_kw) -> None:
-    """Placeholder — implemented in Task 4."""
-    return None
+def _reconcile_poison(
+    *,
+    catalog: Catalog,
+    failed_buffer: list[tuple[str, int, int, str]],
+    pass_had_success: bool,
+    tripped: bool,
+    poison_max_fails: int,
+    quarantine_dir: Optional[Path],
+    stats: WatchStats,
+) -> None:
+    """Decide whether this pass's failures count toward poison-quarantine.
+
+    - Breaker tripped this pass  -> systemic outage: discard (never counts).
+    - Pass had >=1 success       -> backend proven up: count each failure; a
+      file reaching poison_max_fails is quarantined (and optionally copied).
+    - Neither                    -> health unknowable: discard (conservative).
+    """
+    if tripped or not pass_had_success or not failed_buffer:
+        return
+    for source_path, size, mtime_ns, error in failed_buffer:
+        count = catalog.record_file_failure(source_path, size, mtime_ns, error)
+        if count >= poison_max_fails:
+            catalog.quarantine_file(source_path)
+            stats.quarantined += 1
+            logger.warning(
+                "Quarantined poison file after %d failures: %s (%s)",
+                count,
+                source_path,
+                error,
+            )
+            if quarantine_dir is not None:
+                try:
+                    _copy_to_quarantine(quarantine_dir, source_path)
+                except OSError:
+                    logger.warning(
+                        "Failed to copy quarantined file %s to %s; still marked "
+                        "quarantined in the catalog",
+                        source_path,
+                        quarantine_dir,
+                        exc_info=True,
+                    )
 
 
 def watch(
