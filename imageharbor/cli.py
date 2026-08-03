@@ -65,6 +65,14 @@ def _build_classifier(
     return StubClassifier()
 
 
+def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
+    from .circuit_breaker import CircuitBreaker
+
+    return CircuitBreaker(
+        trip_threshold=threshold, backoff_base=backoff, backoff_cap=backoff_cap
+    )
+
+
 # ---------------------------------------------------------------------------
 # process
 # ---------------------------------------------------------------------------
@@ -151,6 +159,14 @@ def _build_classifier(
     default=False,
     help="Do not recurse into sub-directories.",
 )
+@click.option(
+    "--breaker-threshold",
+    envvar="IMAGEHARBOR_BREAKER_THRESHOLD",
+    default=5,
+    show_default=True,
+    type=int,
+    help="Consecutive AI failures before aborting (0 disables).",
+)
 def process(
     source: Path,
     dest: Path,
@@ -164,6 +180,7 @@ def process(
     ai_timeout: float,
     openai_key: str | None,
     no_recursive: bool,
+    breaker_threshold: int,
 ) -> None:
     """Discover, classify, copy and catalog photos from SOURCE to DEST."""
     if catalog_path is None:
@@ -189,7 +206,8 @@ def process(
             write_sidecars=sidecar,
             dry_run=dry_run,
         )
-        stats = pipeline.run(recursive=not no_recursive)
+        breaker = _build_breaker(breaker_threshold, 60.0, 900.0)
+        stats = pipeline.run(recursive=not no_recursive, breaker=breaker)
 
     # Summary
     if dry_run:
@@ -198,6 +216,15 @@ def process(
         f"Done. Total={stats.total}  Copied={stats.copied}  "
         f"Duplicates={stats.duplicates}  Errors={stats.errors}"
     )
+
+    if breaker.is_open():
+        click.echo(
+            f"AI backend appears down — aborted after {breaker.trip_threshold} "
+            f"consecutive failures ({stats.copied + stats.duplicates} processed).",
+            err=True,
+        )
+        sys.exit(1)
+
     if stats.errors:
         sys.exit(1)
 
@@ -296,6 +323,46 @@ def process(
     default=False,
     help="Do not recurse into sub-directories.",
 )
+@click.option(
+    "--breaker-threshold",
+    envvar="IMAGEHARBOR_BREAKER_THRESHOLD",
+    default=5,
+    show_default=True,
+    type=int,
+    help="Consecutive AI failures before the breaker trips (0 disables).",
+)
+@click.option(
+    "--breaker-backoff",
+    envvar="IMAGEHARBOR_BREAKER_BACKOFF",
+    default=60.0,
+    show_default=True,
+    type=float,
+    help="Base backoff seconds after the breaker trips.",
+)
+@click.option(
+    "--breaker-backoff-cap",
+    envvar="IMAGEHARBOR_BREAKER_BACKOFF_CAP",
+    default=900.0,
+    show_default=True,
+    type=float,
+    help="Maximum backoff seconds.",
+)
+@click.option(
+    "--poison-max-fails",
+    envvar="IMAGEHARBOR_POISON_MAX_FAILS",
+    default=5,
+    show_default=True,
+    type=int,
+    help="Healthy-pass failures before a file is quarantined.",
+)
+@click.option(
+    "--quarantine-dir",
+    "quarantine_dir",
+    envvar="IMAGEHARBOR_QUARANTINE",
+    default=None,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="If set, copy quarantined originals here.",
+)
 def watch(
     source: Path,
     dest: Path,
@@ -309,6 +376,11 @@ def watch(
     ai_timeout: float,
     openai_key: str | None,
     no_recursive: bool,
+    breaker_threshold: int,
+    breaker_backoff: float,
+    breaker_backoff_cap: float,
+    poison_max_fails: int,
+    quarantine_dir: Path | None,
 ) -> None:
     """Continuously watch SOURCE and organize new/changed photos into DEST."""
     import signal
@@ -341,6 +413,7 @@ def watch(
             write_sidecars=sidecar,
         )
         click.echo(f"Watching {source} -> {dest} every {interval:.0f}s (Ctrl-C to stop).")
+        breaker = _build_breaker(breaker_threshold, breaker_backoff, breaker_backoff_cap)
         stats = _watcher.watch(
             pipeline=pipeline,
             catalog=catalog,
@@ -348,11 +421,15 @@ def watch(
             interval=interval,
             recursive=not no_recursive,
             stop_event=stop_event,
+            breaker=breaker,
+            poison_max_fails=poison_max_fails,
+            quarantine_dir=quarantine_dir,
         )
 
     click.echo(
         f"Stopped after {stats.passes} pass(es). "
-        f"Processed={stats.processed} Skipped={stats.skipped_unchanged} Errors={stats.errors}"
+        f"Processed={stats.processed} Skipped={stats.skipped_unchanged} "
+        f"Errors={stats.errors} Quarantined={stats.quarantined}"
     )
 
 

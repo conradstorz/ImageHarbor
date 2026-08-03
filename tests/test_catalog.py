@@ -232,3 +232,41 @@ def test_learned_concept_remember_updates_and_counts(catalog: Catalog) -> None:
     catalog.learned_concept_remember("widget", "200")
     catalog.learned_concept_remember("widget", "300")  # correction / re-seen
     assert catalog.learned_concept_get("widget") == "300"
+
+
+# ---------------------------------------------------------------------------
+# failed_files (poison-file tracking)
+# ---------------------------------------------------------------------------
+
+
+def test_record_file_failure_increments(catalog: Catalog) -> None:
+    assert catalog.record_file_failure("/src/a.jpg", 100, 111, "boom") == 1
+    assert catalog.record_file_failure("/src/a.jpg", 100, 111, "boom") == 2
+    assert catalog.record_file_failure("/src/a.jpg", 100, 111, "boom") == 3
+
+
+def test_changed_file_resets_fail_count_and_quarantine(catalog: Catalog) -> None:
+    catalog.record_file_failure("/src/a.jpg", 100, 111, "boom")
+    catalog.record_file_failure("/src/a.jpg", 100, 111, "boom")
+    catalog.quarantine_file("/src/a.jpg")
+    assert catalog.is_quarantined("/src/a.jpg", 100, 111) is True
+    # File changed (new size/mtime): count resets, quarantine cleared.
+    assert catalog.record_file_failure("/src/a.jpg", 200, 222, "boom") == 1
+    assert catalog.is_quarantined("/src/a.jpg", 200, 222) is False
+
+
+def test_is_quarantined_requires_flag_and_matching_stat(catalog: Catalog) -> None:
+    catalog.record_file_failure("/src/a.jpg", 100, 111, "boom")
+    assert catalog.is_quarantined("/src/a.jpg", 100, 111) is False  # not flagged yet
+    catalog.quarantine_file("/src/a.jpg")
+    assert catalog.is_quarantined("/src/a.jpg", 100, 111) is True
+    assert catalog.is_quarantined("/src/a.jpg", 999, 111) is False  # size differs
+    assert catalog.is_quarantined("/src/missing.jpg", 100, 111) is False  # no row
+
+
+def test_clear_file_failure_removes_row(catalog: Catalog) -> None:
+    catalog.record_file_failure("/src/a.jpg", 100, 111, "boom")
+    catalog.quarantine_file("/src/a.jpg")
+    catalog.clear_file_failure("/src/a.jpg")
+    assert catalog.is_quarantined("/src/a.jpg", 100, 111) is False
+    assert catalog.record_file_failure("/src/a.jpg", 100, 111, "boom") == 1  # fresh row

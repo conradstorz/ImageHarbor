@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from imageharbor.catalog import Catalog
+from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.pipeline import Pipeline
 from imageharbor.watcher import WatchStats, run_pass, watch
 
@@ -155,3 +156,110 @@ def test_watch_exits_immediately_if_stop_already_set(
     stop.set()
     wstats = watch(pipeline=pipeline, catalog=catalog, source=source_dir, interval=1.0, stop_event=stop)
     assert wstats.passes == 0
+
+
+class _AlwaysFails:
+    """Classifier whose describe() always raises — simulates a dead backend."""
+    def describe(self, image_path, exif_data):
+        raise RuntimeError("backend down")
+    def adjudicate(self, label, candidates):
+        return None
+    def pick_class(self, content, classes):
+        return "900"
+
+
+def _src_with(tmp_path: Path, n: int) -> Path:
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(n):
+        _make_jpeg(src / f"img_{i}.jpg", b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
+    return src
+
+
+def test_run_pass_aborts_remaining_files_when_breaker_trips(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    src = _src_with(tmp_path, 5)
+    pipeline = Pipeline(src, organized_dir, catalog, classifier=_AlwaysFails())
+    breaker = CircuitBreaker(trip_threshold=2, now=lambda: 0.0)
+    stats = run_pass(pipeline=pipeline, catalog=catalog, source=src, breaker=breaker)
+    # 2 failures trip the breaker; the pass aborts before the other 3 files.
+    assert stats.errors == 2
+    assert breaker.is_open()
+
+
+def test_run_pass_half_open_failure_tries_only_one_file(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    src = _src_with(tmp_path, 5)
+    pipeline = Pipeline(src, organized_dir, catalog, classifier=_AlwaysFails())
+    clock = [0.0]
+    breaker = CircuitBreaker(trip_threshold=2, backoff_base=60.0, now=lambda: clock[0])
+    breaker.record_failure(); breaker.record_failure()   # OPEN
+    clock[0] = 60.0
+    breaker.begin_probe()                                  # HALF_OPEN
+    stats = run_pass(pipeline=pipeline, catalog=catalog, source=src, breaker=breaker)
+    assert stats.errors == 1          # only the probe file was tried
+    assert breaker.is_open()          # probe failed -> reopened
+
+
+def test_run_pass_half_open_success_resumes_full_pass(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    src = _src_with(tmp_path, 3)
+    pipeline = Pipeline(src, organized_dir, catalog)   # StubClassifier: all succeed
+    clock = [0.0]
+    breaker = CircuitBreaker(trip_threshold=2, backoff_base=60.0, now=lambda: clock[0])
+    breaker.record_failure(); breaker.record_failure()
+    clock[0] = 60.0
+    breaker.begin_probe()                               # HALF_OPEN
+    stats = run_pass(pipeline=pipeline, catalog=catalog, source=src, breaker=breaker)
+    assert stats.processed == 3                         # probe closed it, rest ran
+    assert breaker.state.name == "CLOSED"
+
+
+def test_watch_sleeps_breaker_backoff_when_open(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    src = _src_with(tmp_path, 1)
+    pipeline = Pipeline(src, organized_dir, catalog)
+    clock = [1000.0]
+    breaker = CircuitBreaker(trip_threshold=1, backoff_base=60.0, now=lambda: clock[0])
+    breaker.record_failure()          # OPEN at t=1000, backoff=60
+    stop = threading.Event()
+    slept: list[float] = []
+
+    def _sleep(d: float) -> bool:
+        slept.append(d)
+        stop.set()                    # exit after first sleep
+        return True
+
+    watch(pipeline=pipeline, catalog=catalog, source=src, interval=300.0,
+          stop_event=stop, sleep=_sleep, breaker=breaker)
+    assert slept and abs(slept[0] - 60.0) < 1.0   # slept the backoff, not the interval
+
+
+def test_watch_probe_uses_backoff_not_interval_after_midpass_trip(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    # A pass that trips the breaker mid-run must NOT then sleep the full poll
+    # interval; the next wait should be the (short) backoff so the recovery
+    # probe fires promptly.
+    src = _src_with(tmp_path, 3)
+    pipeline = Pipeline(src, organized_dir, catalog, classifier=_AlwaysFails())
+    clock = [1000.0]
+    breaker = CircuitBreaker(trip_threshold=2, backoff_base=60.0, now=lambda: clock[0])
+    stop = threading.Event()
+    slept: list[float] = []
+
+    def _sleep(d: float) -> bool:
+        slept.append(d)
+        clock[0] += d          # advance clock so backoff elapses realistically
+        stop.set()             # stop after observing the first between-pass wait
+        return True
+
+    watch(pipeline=pipeline, catalog=catalog, source=src, interval=300.0,
+          stop_event=stop, sleep=_sleep, breaker=breaker, poison_max_fails=5)
+    # First pass trips (2 fails). The observed wait must be the ~60s backoff,
+    # not the 300s interval.
+    assert slept and abs(slept[0] - 60.0) < 1.0

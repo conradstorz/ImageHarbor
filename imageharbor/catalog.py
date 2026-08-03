@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS learned_concepts (
     created_at  TEXT    NOT NULL,
     updated_at  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS failed_files (
+    source_path     TEXT    PRIMARY KEY,
+    size            INTEGER NOT NULL,
+    mtime_ns        INTEGER NOT NULL,
+    fail_count      INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT    NOT NULL DEFAULT '',
+    first_failed_at TEXT    NOT NULL,
+    last_failed_at  TEXT    NOT NULL,
+    quarantined     INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -351,6 +362,77 @@ class Catalog:
                 updated_at = excluded.updated_at
             """,
             (subject, class_code, now, now),
+        )
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Failed files (poison-file tracking)
+    # ------------------------------------------------------------------
+
+    def record_file_failure(
+        self, source_path: str, size: int, mtime_ns: int, error: str
+    ) -> int:
+        """Record a processing failure for a source file; return new fail_count.
+
+        If the stored size/mtime differ from the incoming values the file has
+        changed on disk, so the count resets to 1 and any quarantine is cleared.
+        """
+        now = _now_iso()
+        row = self._conn.execute(
+            "SELECT size, mtime_ns, fail_count FROM failed_files WHERE source_path=?",
+            (source_path,),
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                """
+                INSERT INTO failed_files
+                    (source_path, size, mtime_ns, fail_count, last_error,
+                     first_failed_at, last_failed_at, quarantined)
+                VALUES (?,?,?,?,?,?,?,0)
+                """,
+                (source_path, size, mtime_ns, 1, error, now, now),
+            )
+            self._conn.commit()
+            return 1
+        if row["size"] != size or row["mtime_ns"] != mtime_ns:
+            self._conn.execute(
+                """
+                UPDATE failed_files
+                   SET size=?, mtime_ns=?, fail_count=1, last_error=?,
+                       last_failed_at=?, quarantined=0
+                 WHERE source_path=?
+                """,
+                (size, mtime_ns, error, now, source_path),
+            )
+            self._conn.commit()
+            return 1
+        new_count = row["fail_count"] + 1
+        self._conn.execute(
+            "UPDATE failed_files SET fail_count=?, last_error=?, last_failed_at=? "
+            "WHERE source_path=?",
+            (new_count, error, now, source_path),
+        )
+        self._conn.commit()
+        return new_count
+
+    def quarantine_file(self, source_path: str) -> None:
+        self._conn.execute(
+            "UPDATE failed_files SET quarantined=1 WHERE source_path=?", (source_path,)
+        )
+        self._conn.commit()
+
+    def is_quarantined(self, source_path: str, size: int, mtime_ns: int) -> bool:
+        row = self._conn.execute(
+            "SELECT quarantined, size, mtime_ns FROM failed_files WHERE source_path=?",
+            (source_path,),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(row["quarantined"]) and row["size"] == size and row["mtime_ns"] == mtime_ns
+
+    def clear_file_failure(self, source_path: str) -> None:
+        self._conn.execute(
+            "DELETE FROM failed_files WHERE source_path=?", (source_path,)
         )
         self._conn.commit()
 
