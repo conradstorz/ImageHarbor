@@ -459,3 +459,62 @@ def test_cli_watch_wires_args(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert captured["interval"] == 5.0
     assert captured["source"] == src
+
+
+# ---------------------------------------------------------------------------
+# circuit breaker wiring
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_run_aborts_on_breaker_trip(tmp_path):
+    from imageharbor.catalog import Catalog
+    from imageharbor.circuit_breaker import CircuitBreaker
+    from imageharbor.pipeline import Pipeline
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(5):
+        (src / f"img_{i}.jpg").write_bytes(b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
+
+    class _AllFail:
+        def describe(self, image_path, exif_data):
+            raise RuntimeError("down")
+        def adjudicate(self, label, candidates):
+            return None
+        def pick_class(self, content, classes):
+            return "900"
+
+    with Catalog(tmp_path / "cat.db") as cat:
+        pipeline = Pipeline(src, tmp_path / "org", cat, classifier=_AllFail())
+        breaker = CircuitBreaker(trip_threshold=2, now=lambda: 0.0)
+        stats = pipeline.run(breaker=breaker)
+    assert breaker.is_open()
+    assert stats.errors == 2          # aborted after the trip, 3 files untried
+
+
+def test_process_command_aborts_and_reports_when_backend_down(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from imageharbor.cli import main
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(4):
+        (src / f"img_{i}.jpg").write_bytes(b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
+
+    # Force the stub classifier to fail so the breaker trips.
+    from imageharbor.ai_classifier import StubClassifier
+
+    def _boom(self, image_path, exif_data):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(StubClassifier, "describe", _boom)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["process", "--source", str(src), "--dest", str(tmp_path / "org"),
+         "--breaker-threshold", "2"],
+    )
+    assert result.exit_code == 1
+    assert "backend appears down" in result.output.lower()

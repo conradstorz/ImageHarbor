@@ -11,6 +11,7 @@ from typing import Any
 from . import concept_map
 from .ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from .catalog import Catalog
+from .circuit_breaker import CircuitBreaker
 from .discovery import discover_images
 from .exif_reader import read_exif
 from .filename import generate_filename, normalize_descriptor
@@ -114,9 +115,14 @@ class Pipeline:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, recursive: bool = True) -> PipelineStats:
+    def run(
+        self, recursive: bool = True, breaker: "CircuitBreaker | None" = None
+    ) -> PipelineStats:
         """Process all images under :attr:`source_dir`.
 
+        When a *breaker* is supplied, each result feeds it; if it trips (a
+        systemic run of AI failures) the run aborts early — the one-shot command
+        has no backoff/retry loop, so continuing would just churn a dead backend.
         Returns a :class:`PipelineStats` summary.
         """
         stats = PipelineStats()
@@ -128,6 +134,19 @@ class Pipeline:
             result = self._process_one(image_path)
             stats.record(result)
             _log_result(result)
+            if breaker is not None:
+                if result.status == "error":
+                    breaker.record_failure()
+                elif result.status in ("copied", "duplicate"):
+                    breaker.record_success()
+                if breaker.is_open():
+                    logger.error(
+                        "AI backend appears down — aborted after %d consecutive "
+                        "failures (%d processed)",
+                        breaker.trip_threshold,
+                        stats.copied + stats.duplicates,
+                    )
+                    break
         return stats
 
     def process_file(self, image_path: Path) -> ProcessResult:
