@@ -428,7 +428,8 @@ def watch(
 
     click.echo(
         f"Stopped after {stats.passes} pass(es). "
-        f"Processed={stats.processed} Skipped={stats.skipped_unchanged} Errors={stats.errors}"
+        f"Processed={stats.processed} Skipped={stats.skipped_unchanged} "
+        f"Errors={stats.errors} Quarantined={stats.quarantined}"
     )
 
 

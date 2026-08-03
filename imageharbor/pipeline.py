@@ -6,18 +6,20 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import concept_map
 from .ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from .catalog import Catalog
-from .circuit_breaker import CircuitBreaker
 from .discovery import discover_images
 from .exif_reader import read_exif
 from .filename import generate_filename, normalize_descriptor
 from .hashing import compute_sha256_b64url, verify_file
 from .sidecar import write_sidecar
 from .taxonomy import Taxonomy
+
+if TYPE_CHECKING:
+    from .circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +118,7 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def run(
-        self, recursive: bool = True, breaker: "CircuitBreaker | None" = None
+        self, recursive: bool = True, breaker: CircuitBreaker | None = None
     ) -> PipelineStats:
         """Process all images under :attr:`source_dir`.
 
