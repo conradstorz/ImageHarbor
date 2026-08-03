@@ -125,6 +125,14 @@ Module responsibilities:
   `classifier.pick_class()` and calls `remember(catalog, primary_subject,
   class_code)` to memoize the decision in `learned_concepts`, so the next photo with
   the same normalized subject is a deterministic, network-free hit.
+- **`circuit_breaker.py`** — a pure three-state (`CLOSED`/`OPEN`/`HALF_OPEN`)
+  circuit breaker with no I/O. The `watch` command drives it: after
+  `--breaker-threshold` (default 5) consecutive AI failures it trips, the pass
+  aborts, and the watcher backs off (`--breaker-backoff` 60s → ×2 →
+  `--breaker-backoff-cap` 900s) before a half-open probe (one real image)
+  re-tests the backend. `process` reuses it for detection-only early-abort.
+  `trip_threshold=0` disables it. This is orchestration-layer only — the
+  classifier is untouched.
 - **`hashing.py`** + **`filename.py`** — content addressing. SHA-256 is encoded as
   **unpadded Base64url, always exactly 43 chars** (`SHA256_B64URL_LEN`). Filename
   format is `<pcs>-<descriptor>_<sha256>.<ext>`.
@@ -136,6 +144,11 @@ Module responsibilities:
   `aliases`, `alias_of`, `active`), backing `taxonomy.py`. A third `learned_concepts`
   table (`subject`, `class_code`, `hits`, timestamps) is the self-learning store
   behind `concept_map.py`'s `learned_concept_get`/`learned_concept_remember`.
+  A fourth `failed_files` table (`source_path`, `size`, `mtime_ns`, `fail_count`,
+  `last_error`, `quarantined`, timestamps) backs poison-file quarantine: a file
+  that fails `--poison-max-fails` (default 5) *healthy* passes is quarantined and
+  skipped thereafter (until its bytes change). Failures during a breaker-tripped
+  outage never count, so a backend outage cannot mis-quarantine good files.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
