@@ -82,3 +82,18 @@ def test_threshold_zero_disables_breaker():
     for _ in range(50):
         b.record_failure()
     assert b.state is BreakerState.CLOSED
+
+
+def test_repeated_failures_while_open_do_not_regress_backoff():
+    clock = [0.0]
+    b = _breaker(clock, backoff_base=60.0, backoff_cap=900.0)
+    for _ in range(3):
+        b.record_failure()          # OPEN, backoff 60
+    clock[0] = 60.0
+    b.begin_probe()
+    b.record_failure()              # HALF_OPEN failure -> OPEN, backoff 120
+    assert b.current_backoff == 120.0
+    for _ in range(5):
+        b.record_failure()          # further failures while OPEN: no-op
+    assert b.current_backoff == 120.0
+    assert b.state is BreakerState.OPEN

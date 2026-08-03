@@ -64,6 +64,12 @@ class CircuitBreaker:
     def record_failure(self) -> None:
         if not self.enabled:
             return
+        if self._state is BreakerState.OPEN:
+            # Already open and waiting out the backoff; further failure signals
+            # are a no-op so repeated failures never regress the grown backoff
+            # or extend the open window. Callers signal again only after
+            # begin_probe() moves us to HALF_OPEN.
+            return
         if self._state is BreakerState.HALF_OPEN:
             self._open(reopen=True)
             return
