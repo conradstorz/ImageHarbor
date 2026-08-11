@@ -1,12 +1,12 @@
-"""Integration tests for the processing pipeline."""
+"""Integration tests for the processing pipeline (the facts pass)."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
+from imageharbor import tiers
 from imageharbor.catalog import Catalog
 from imageharbor.hashing import verify_pcs_file
 from imageharbor.pipeline import Pipeline
@@ -19,6 +19,12 @@ from imageharbor.pipeline import Pipeline
 
 def _make_jpeg(path: Path, content: bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9") -> Path:
     """Write a minimal pseudo-JPEG file."""
+    path.write_bytes(content)
+    return path
+
+
+def _make_image(path: Path, content: bytes = b"fake-image-bytes") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
 
@@ -52,45 +58,8 @@ def catalog(tmp_path: Path) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# General hashing / dedup / copy / verify behavior
 # ---------------------------------------------------------------------------
-
-
-def test_pipeline_organizes_by_subject(
-    source_dir: Path, organized_dir: Path, catalog: Catalog
-) -> None:
-    # beach_photo.jpg -> subject "beach" -> concept-map class 300 -> 300-places/<code>-beach
-    Pipeline(source_dir, organized_dir, catalog).run()
-    paths = [p.as_posix() for p in organized_dir.rglob("*.jpg")]
-    assert any("/300-places/" in p and "-beach_" in p for p in paths)
-    # exactly 2 levels deep under the class (class/subject/file)
-    for p in organized_dir.rglob("*.jpg"):
-        rel = p.relative_to(organized_dir)
-        assert len(rel.parts) == 3  # class / subject / filename
-
-
-def test_pipeline_learns_class_on_miss(
-    organized_dir: Path, catalog: Catalog, tmp_path: Path
-) -> None:
-    from imageharbor.ai_classifier import AIClassifier, ContentDescription
-
-    calls = []
-
-    class MissClassifier(AIClassifier):
-        def describe(self, image_path, exif_data):
-            return ContentDescription(primary_subject="zonkle")  # not in concept-map
-
-        def pick_class(self, content, classes):
-            calls.append(content.primary_subject)
-            return "200"
-
-    src = tmp_path / "s"
-    src.mkdir()
-    _make_jpeg(src / "a.jpg")
-    _make_jpeg(src / "b.jpg", b"\xff\xd8\xff\xe0" + b"\x02" * 20 + b"\xff\xd9")
-    Pipeline(src, organized_dir, catalog, classifier=MissClassifier()).run()
-    assert calls == ["zonkle"]  # pick_class called ONCE; 2nd file was a learned hit
-    assert any("/200-animals/" in p.as_posix() for p in organized_dir.rglob("*.jpg"))
 
 
 def test_pipeline_copies_files(source_dir: Path, organized_dir: Path, catalog: Catalog) -> None:
@@ -159,25 +128,9 @@ def test_pipeline_dry_run_writes_nothing(
     # No real files written
     assert not list(organized_dir.rglob("*.jpg"))
     assert catalog.count() == 0
-    # A dry run must perform ZERO taxonomy writes: no seeding, no minting.
-    assert catalog.taxonomy_is_empty()
-    # No destination path is computed in dry-run (taxonomy/classify are skipped).
+    # No destination path is computed in dry-run.
     for result in stats.results:
         assert result.organized_path is None
-
-
-def test_pipeline_sidecar_written(
-    source_dir: Path, organized_dir: Path, catalog: Catalog
-) -> None:
-    pipeline = Pipeline(source_dir, organized_dir, catalog, write_sidecars=True)
-    pipeline.run()
-
-    sidecars = list(organized_dir.rglob("*.json"))
-    assert len(sidecars) == 2
-    for sidecar in sidecars:
-        data = json.loads(sidecar.read_text())
-        assert "sha256_b64url" in data
-        assert len(data["sha256_b64url"]) == 43
 
 
 def test_pipeline_originals_not_modified(
@@ -219,7 +172,7 @@ def test_pipeline_integrity_failure_removes_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Force the post-copy verification to fail: the pipeline must unlink the
-    # copied file and record an error (pipeline.py lines 199-203).
+    # copied file and record an error.
     monkeypatch.setattr("imageharbor.pipeline.verify_file", lambda *a, **k: False)
 
     single = source_dir / "beach_photo.jpg"
@@ -257,7 +210,7 @@ def test_pipeline_error_path_captures_message_and_continues(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Make _do_process blow up at step 1 (hashing). The run must not crash; each
-    # failure is captured as an "error" result (pipeline.py lines 137-144).
+    # failure is captured as an "error" result.
     def _boom(*_a, **_k):
         raise ValueError("hash exploded")
 
@@ -306,8 +259,8 @@ def test_pipeline_duplicates_copied_to_dir(
     Pipeline(source_dir, organized_dir, catalog).run()
 
     # Second run, this time with duplicates_dir set: every image is now a
-    # duplicate and must be copied into duplicates_dir (pipeline.py lines
-    # 156-157, 263-267) and recorded in the catalog history (mark_duplicate).
+    # duplicate and must be copied into duplicates_dir and recorded in the
+    # catalog history (mark_duplicate).
     dup_dir = tmp_path / "dups"
     dup_pipeline = Pipeline(
         source_dir, organized_dir, catalog, duplicates_dir=dup_dir
@@ -357,8 +310,6 @@ def test_pipeline_dry_run_intra_run_dedup(
     # Still nothing written and the catalog untouched.
     assert not list(organized_dir.rglob("*.jpg"))
     assert catalog.count() == 0
-    # And the taxonomy table was never written during the dry run.
-    assert catalog.taxonomy_is_empty()
 
     # A real run over the same input reports the same copied/duplicate counts.
     real_catalog = Catalog(tmp_path / "real.db")
@@ -426,7 +377,7 @@ def test_pipeline_sidecar_failure_does_not_fail_image(
     def _boom(*_a, **_k):
         raise OSError("sidecar disk full")
 
-    monkeypatch.setattr("imageharbor.pipeline.write_sidecar", _boom)
+    monkeypatch.setattr("imageharbor.pipeline.merge_sidecar", _boom)
 
     single = source_dir / "beach_photo.jpg"
     pipeline = Pipeline(source_dir, organized_dir, catalog, write_sidecars=True)
@@ -451,9 +402,107 @@ def test_pipeline_sidecar_failure_run_counts_no_errors(
     def _boom(*_a, **_k):
         raise OSError("sidecar disk full")
 
-    monkeypatch.setattr("imageharbor.pipeline.write_sidecar", _boom)
+    monkeypatch.setattr("imageharbor.pipeline.merge_sidecar", _boom)
 
     stats = Pipeline(source_dir, organized_dir, catalog, write_sidecars=True).run()
 
     assert stats.errors == 0
     assert stats.copied == 2
+
+
+# ---------------------------------------------------------------------------
+# Facts-pass specific behavior (Task 9)
+# ---------------------------------------------------------------------------
+
+
+def test_facts_pass_makes_no_ai_call(tmp_path, monkeypatch):
+    """The facts pass must not import or invoke a classifier."""
+    import imageharbor.ai_classifier as ai
+
+    def boom(*args, **kwargs):
+        raise AssertionError("the facts pass called the AI")
+
+    monkeypatch.setattr(ai.StubClassifier, "describe", boom)
+
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    _make_image(src / "Emma's graduation.jpg")
+    with Catalog(tmp_path / "c.db") as cat:
+        stats = Pipeline(src, dest, cat).run()
+    assert stats.copied == 1
+
+
+def test_human_named_undated_file_lands_in_undated(tmp_path):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    _make_image(src / "Emma's graduation.jpg")
+    with Catalog(tmp_path / "c.db") as cat:
+        stats = Pipeline(src, dest, cat).run()
+        result = stats.results[0]
+        assert result.organized_path.parent == dest / "Undated"
+        assert result.organized_path.name.startswith("emmas-graduation_")
+        assert cat.tiers_for(result.sha256_b64url) == (
+            tiers.DATE_NONE,
+            tiers.DESC_HUMAN_FILENAME,
+        )
+
+
+def test_camera_named_file_gets_no_descriptor(tmp_path):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    _make_image(src / "IMG_1234.jpg")
+    with Catalog(tmp_path / "c.db") as cat:
+        stats = Pipeline(src, dest, cat).run()
+        result = stats.results[0]
+        assert result.organized_path.stem == result.sha256_b64url
+        assert cat.tiers_for(result.sha256_b64url) == (tiers.DATE_NONE, tiers.DESC_NONE)
+
+
+def test_filename_date_places_the_file(tmp_path):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    _make_image(src / "IMG_20190704_123456.jpg")
+    with Catalog(tmp_path / "c.db") as cat:
+        stats = Pipeline(src, dest, cat).run()
+        result = stats.results[0]
+        assert result.organized_path.parent == dest / "2019" / "2019-07"
+        assert result.organized_path.name.startswith("2019-07-04_")
+
+
+def test_duplicates_record_back_pointers_and_copy_once(tmp_path):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    _make_image(src / "a" / "IMG_1234.jpg", b"same")
+    _make_image(src / "b" / "IMG_5678.jpg", b"same")
+    _make_image(src / "c" / "Emma's graduation.jpg", b"same")
+
+    with Catalog(tmp_path / "c.db") as cat:
+        stats = Pipeline(src, dest, cat).run()
+        assert stats.copied == 1
+        assert stats.duplicates == 2
+        digest = stats.results[0].sha256_b64url
+        assert len(cat.sources_for(digest)) == 3
+
+
+def test_rerunning_the_facts_pass_changes_nothing(tmp_path):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    _make_image(src / "IMG_20190704_123456.jpg")
+    with Catalog(tmp_path / "c.db") as cat:
+        first = Pipeline(src, dest, cat).run()
+        paths_after_first = sorted(p.name for p in dest.rglob("*.jpg"))
+        second = Pipeline(src, dest, cat).run()
+        paths_after_second = sorted(p.name for p in dest.rglob("*.jpg"))
+
+    assert first.copied == 1
+    assert second.copied == 0
+    assert second.duplicates == 1
+    assert paths_after_first == paths_after_second
+
+
+def test_sidecar_records_facts_and_sources(tmp_path):
+    from imageharbor.sidecar import read_sidecar
+
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    _make_image(src / "Emma's graduation.jpg")
+    with Catalog(tmp_path / "c.db") as cat:
+        stats = Pipeline(src, dest, cat, write_sidecars=True).run()
+    data = read_sidecar(stats.results[0].organized_path)
+    assert data["descriptor"]["tier"] == tiers.DESC_HUMAN_FILENAME
+    assert data["date"]["source"] == "none"
+    assert len(data["sources"]) == 1
+    assert "classification" not in data

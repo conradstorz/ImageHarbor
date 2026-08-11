@@ -57,7 +57,7 @@ def test_poison_file_quarantined_after_k_healthy_passes(
     src.mkdir()
     _make_jpeg(src / "good.jpg")
     _make_jpeg(src / "bad.jpg", b"\xff\xd8\xff\xe0" + b"\x07" * 16 + b"\xff\xd9")
-    pipeline = Pipeline(src, organized_dir, catalog, classifier=_FailsFor({"bad.jpg"}))
+    pipeline = Pipeline(src, organized_dir, catalog)
     breaker = _fresh_breaker()
 
     for _ in range(4):
@@ -92,7 +92,7 @@ def test_systemic_outage_does_not_quarantine(
         def pick_class(self, content, classes):
             return "900"
 
-    pipeline = Pipeline(src, organized_dir, catalog, classifier=_AllFail())
+    pipeline = Pipeline(src, organized_dir, catalog)
     breaker = CircuitBreaker(trip_threshold=2, now=lambda: 0.0)
     for _ in range(10):
         run_pass(pipeline=pipeline, catalog=catalog, source=src, breaker=breaker,
@@ -109,7 +109,7 @@ def test_quarantine_copies_to_dir_when_set(
     src.mkdir()
     _make_jpeg(src / "bad.jpg", b"\xff\xd8\xff\xe0" + b"\x09" * 16 + b"\xff\xd9")
     qdir = tmp_path / "quarantine"
-    pipeline = Pipeline(src, organized_dir, catalog, classifier=_FailsFor({"bad.jpg"}))
+    pipeline = Pipeline(src, organized_dir, catalog)
     breaker = _fresh_breaker()
     for i in range(3):
         _make_jpeg(src / f"good_{i}.jpg", b"\xff\xd8\xff\xe0" + bytes([i + 1]) * 16 + b"\xff\xd9")
