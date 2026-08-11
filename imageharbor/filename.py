@@ -9,7 +9,6 @@ from typing import TypedDict
 from .hashing import SHA256_B64URL_LEN, extract_digest_from_stem
 
 _DESCRIPTOR_RE = re.compile(r"[^a-z0-9]+")
-_PCS_CODE_RE = re.compile(r"^\d+(~\d+)*$")
 _MAX_DESCRIPTOR_LEN = 30
 _MAX_FILENAME_LEN = 100
 
@@ -105,41 +104,22 @@ def parse_filename(filename: str) -> ParsedFilename | None:
     Accepts both bare filenames and full paths.  The digest is located by
     counting back exactly :data:`~imageharbor.hashing.SHA256_B64URL_LEN`
     characters from the end of the stem, since base64url may contain ``_``.
-
-    Only accepts files in the legacy PCS format: ``<pcs>-<descriptor>_<digest>``.
-    Files organized under the new grammar (date-prefixed, descriptor-only, bare
-    digest) will return None.
     """
     p = Path(filename)
     stem = p.stem
     ext = p.suffix.lstrip(".").lower()
 
-    # Reuse extract_digest_from_stem to extract the digest, but only parse
-    # if the prefix is in the legacy PCS format.
+    # Reuse extract_digest_from_stem so parse and extract can never diverge in
+    # what they accept (empty descriptor, non-ASCII/'+' pcs, short stems, etc.).
     digest = extract_digest_from_stem(stem)
     if digest is None:
         return None
 
     # Recover the prefix "<pcs>-<descriptor>" (everything before "_<digest>").
     prefix = stem[: len(stem) - SHA256_B64URL_LEN - 1]
-
-    # The prefix must contain at least one dash (to separate PCS code and descriptor).
-    dash_idx = prefix.find("-")
-    if dash_idx < 0:
-        return None
-
-    pcs_str = prefix[:dash_idx]
-    descriptor = prefix[dash_idx + 1:]
-
-    # PCS code must be ASCII digits, optionally with '~N' overflow suffixes.
-    # Non-ASCII digits (e.g., Arabic-Indic) are rejected.
-    if not (pcs_str.isascii() and _PCS_CODE_RE.match(pcs_str)):
-        return None
-
-    # Descriptor must be non-empty (after '-' there must be content before '_').
-    if not descriptor:
-        return None
-
+    # Split on the FIRST "-"; both parts are guaranteed valid and non-empty
+    # because extract_digest_from_stem already validated them.
+    pcs_str, descriptor = prefix.split("-", 1)
     pcs_code = pcs_str  # keep as string; codes may contain '~'
 
     return ParsedFilename(

@@ -123,7 +123,11 @@ def test_extract_digest_from_stem_digest_contains_underscore() -> None:
 
 
 def test_extract_digest_from_stem_too_short() -> None:
-    # Length guard: stem must be at least SHA256_B64URL_LEN + 4 (= 47) chars.
+    # A bare digest must be exactly SHA256_B64URL_LEN (= 43) chars, and a
+    # prefixed stem must be at least SHA256_B64URL_LEN + 2 (= 45) chars (a
+    # one-character prefix plus the '_' separator). This 46-char stem of all
+    # 'a's is long enough to clear that minimum, but there's no '_' at the
+    # expected separator position, so it's still rejected.
     assert extract_digest_from_stem("a" * 46) is None
 
 
