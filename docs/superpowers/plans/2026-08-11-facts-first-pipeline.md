@@ -420,6 +420,25 @@ def test_build_stays_within_100_chars_and_truncates_descriptor_not_date():
     assert name.endswith(f"_{_D}.jpg")
 
 
+def test_build_disambiguates_a_date_shaped_descriptor_with_no_date():
+    """A scan named "2019.07.04.jpg" normalizes to a date-shaped descriptor.
+
+    Emitting it verbatim would produce a name identical to a genuinely dated
+    file's, asserting a date the system never established and contradicting the
+    Undated/ folder it lives in.
+    """
+    name = build_filename(None, "2019-07-04", _D, "jpg")
+    assert name == f"20190704_{_D}.jpg"
+    parsed = parse_filename(name)
+    assert parsed["date"] is None
+    assert parsed["descriptor"] == "20190704"
+
+
+def test_a_real_date_is_still_emitted_verbatim():
+    """The guard must only fire when no date was supplied."""
+    assert build_filename("2019-07-04", None, _D, "jpg") == f"2019-07-04_{_D}.jpg"
+
+
 def test_build_output_round_trips():
     name = build_filename("2019-07-04", "emmas-graduation", _D, "jpg")
     parsed = parse_filename(name)
@@ -503,6 +522,13 @@ def build_filename(
     ext = re.sub(r"[^a-z0-9]", "", extension.lower().rsplit(".", 1)[-1])
     suffix = f".{ext}" if ext else ""
     desc = normalize_descriptor(descriptor) if descriptor else ""
+
+    # A date-shaped descriptor with no date supplied would re-parse as a date
+    # the system never established, and would contradict the Undated/ folder the
+    # file lives in. Strip the hyphens so the grammar stays unambiguous.
+    # Reachable in practice: "2019.07.04.jpg" normalizes to "2019-07-04".
+    if date_str is None and _DATE_PREFIX_RE.match(desc):
+        desc = desc.replace("-", "")
 
     def assemble(d: str) -> str:
         prefix = "-".join(part for part in (date_str or "", d) if part)
@@ -898,6 +924,8 @@ def test_mtime_is_never_used(tmp_path):
         ("WhatsApp Image 2019-07-04 at 12.33.11", datetime(2019, 7, 4)),
         ("beach trip 2019-07-04", datetime(2019, 7, 4)),
         ("IMG-20190704-WA0001", datetime(2019, 7, 4)),
+        ("2019.07.04", datetime(2019, 7, 4)),
+        ("2019 07 04", datetime(2019, 7, 4)),
     ],
 )
 def test_date_from_filename_hits(stem, expected):
@@ -1014,6 +1042,11 @@ _FILENAME_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     # Date only: 2019-07-04
     re.compile(r"(?P<Y>\d{4})-(?P<M>\d{2})-(?P<D>\d{2})"),
+    # Date only, dotted or space-separated: 2019.07.04 / 2019 07 04.
+    # Without this rung such a file is Undated, and its descriptor normalizes
+    # to a date-shaped token that build_filename then has to disambiguate.
+    # Reading the date properly is the better outcome.
+    re.compile(r"(?P<Y>\d{4})[.\s](?P<M>\d{2})[.\s](?P<D>\d{2})"),
     # Date only, compact and delimited: IMG-20190704-WA0001
     re.compile(r"[-_](?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})[-_]"),
 )
