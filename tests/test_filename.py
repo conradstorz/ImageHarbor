@@ -57,6 +57,25 @@ def test_build_stays_within_100_chars_and_truncates_descriptor_not_date():
     assert name.endswith(f"_{_D}.jpg")
 
 
+def test_build_disambiguates_a_date_shaped_descriptor_with_no_date():
+    """A scan named "2019.07.04.jpg" normalizes to a date-shaped descriptor.
+
+    Emitting it verbatim would produce a name identical to a genuinely dated
+    file's, asserting a date the system never established and contradicting the
+    Undated/ folder it lives in.
+    """
+    name = build_filename(None, "2019-07-04", _D, "jpg")
+    assert name == f"20190704_{_D}.jpg"
+    parsed = parse_filename(name)
+    assert parsed["date"] is None
+    assert parsed["descriptor"] == "20190704"
+
+
+def test_a_real_date_is_still_emitted_verbatim():
+    """The guard must only fire when no date was supplied."""
+    assert build_filename("2019-07-04", None, _D, "jpg") == f"2019-07-04_{_D}.jpg"
+
+
 def test_build_output_round_trips():
     name = build_filename("2019-07-04", "emmas-graduation", _D, "jpg")
     parsed = parse_filename(name)

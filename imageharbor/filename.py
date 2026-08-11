@@ -67,6 +67,13 @@ def build_filename(
     suffix = f".{ext}" if ext else ""
     desc = normalize_descriptor(descriptor) if descriptor else ""
 
+    # A date-shaped descriptor with no date supplied would re-parse as a date
+    # the system never established, and would contradict the Undated/ folder the
+    # file lives in. Strip the hyphens so the grammar stays unambiguous.
+    # Reachable in practice: "2019.07.04.jpg" normalizes to "2019-07-04".
+    if date_str is None and _DATE_PREFIX_RE.match(desc):
+        desc = desc.replace("-", "")
+
     def assemble(d: str) -> str:
         prefix = "-".join(part for part in (date_str or "", d) if part)
         return f"{prefix}_{sha256_b64url}{suffix}" if prefix else f"{sha256_b64url}{suffix}"
