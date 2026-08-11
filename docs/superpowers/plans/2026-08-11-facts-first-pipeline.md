@@ -616,10 +616,51 @@ git commit -m "feat: date-prefixed filename grammar, replacing the PCS prefix"
 
 **Files:**
 - Create: `imageharbor/descriptor.py`
-- Test: `tests/test_descriptor.py`
+- Modify: `imageharbor/filename.py` — `normalize_descriptor` only (see Step 0)
+- Test: `tests/test_descriptor.py`, `tests/test_filename.py`
 
 **Interfaces:**
 - Consumes: `tiers.DESC_HUMAN_FILENAME`, `tiers.DESC_NONE`, `tiers.DESC_SOURCE_NAMES` (Task 1); `filename.normalize_descriptor` (Task 3).
+
+- [ ] **Step 0: Teach `normalize_descriptor` to drop apostrophes**
+
+`normalize_descriptor` replaces every non-alphanumeric run with a space, so an
+apostrophe becomes a word break: `"Emma's graduation"` → `emma-s-graduation`.
+With a 3-word cap that burns a slot on a stray `s`, and `"Dad's birthday party"`
+silently loses `party`. Apostrophes are common in exactly the human-authored
+filenames this tier exists to preserve, so delete them instead of splitting on
+them.
+
+In `imageharbor/filename.py`, inside `normalize_descriptor`, replace:
+
+```python
+    lowered = text.lower()
+```
+
+with:
+
+```python
+    # Drop apostrophes rather than splitting on them: the generic non-alphanumeric
+    # rule below would turn "Emma's graduation" into "emma-s-graduation", burning
+    # one of only three word slots on a stray "s". U+2019 is the curly apostrophe
+    # macOS and Windows insert automatically.
+    lowered = text.lower().replace("'", "").replace("’", "")
+```
+
+Add to `tests/test_filename.py`, after `test_normalize_keeps_at_most_three_words`:
+
+```python
+def test_normalize_drops_apostrophes_instead_of_splitting_on_them():
+    assert normalize_descriptor("Emma's graduation") == "emmas-graduation"
+    assert normalize_descriptor("Dad's birthday party") == "dads-birthday-party"
+
+
+def test_normalize_drops_the_curly_apostrophe_too():
+    assert normalize_descriptor("Emma’s graduation") == "emmas-graduation"
+```
+
+Run: `uv run pytest tests/test_filename.py -v`
+Expected: PASS — 23 tests.
 - Produces: `is_camera_generated(stem: str) -> bool`; `resolve_descriptor(source_path: Path) -> ResolvedDescriptor` where `ResolvedDescriptor` is a frozen dataclass with fields `value: str`, `tier: int`, `source: str`.
 
 - [ ] **Step 1: Write the failing test**
