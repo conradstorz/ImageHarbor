@@ -712,6 +712,13 @@ HUMAN_STEMS = [
     "kitchen remodel before",
     "scan0001 aunt martha",
     "Christmas",
+    # Regression cases: each of these was destroyed by an earlier, looser
+    # pattern. A false positive here discards a human's name permanently in
+    # favour of an AI guess, so they are pinned deliberately.
+    "Screenshot - grandpas last text message",
+    "WhatsApp Image of the new puppy",
+    "Sam_1",
+    "Sam_2",
 ]
 
 
@@ -806,12 +813,19 @@ CAMERA_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^pict\d+$", re.I),                            # PICT0042
     re.compile(r"^\d{3}[-_]\d{4}$", re.I),                     # 100_0042
     re.compile(r"^cimg\d+$", re.I),                            # CIMG0042 (Casio)
-    re.compile(r"^sam[-_]\d+$", re.I),                         # SAM_0042 (Samsung)
+    # Samsung's format is exactly 4 digits. Do NOT relax this to \d+ -- "sam" is
+    # also a person's name, and "Sam_1.jpg" is an ordinary way to label photos
+    # of someone. A tier-0 verdict discards that name permanently.
+    re.compile(r"^sam[-_]\d{4}$", re.I),                       # SAM_0042 (Samsung)
     re.compile(r"^gopr\d+$", re.I),                            # GOPR0042
     re.compile(r"^dji[-_]\d+$", re.I),                         # DJI_0042
-    re.compile(r"^screen[-_ ]?shot.*$", re.I),                 # Screen Shot 2019-...
-    re.compile(r"^screenshot.*$", re.I),                       # Screenshot_2019-...
-    re.compile(r"^whatsapp[ -](image|video).*$", re.I),        # WhatsApp Image 2019-...
+    # These three require a DIGIT after the auto-generated prefix, so the
+    # timestamp forms match but an appended human suffix survives:
+    # "Screenshot - grandpas last text message" stays tier 30. An open .*$ here
+    # would swallow it. One pattern covers "Screenshot" and "Screen Shot" both,
+    # since [-_ ]? already matches zero separator characters.
+    re.compile(r"^screen[-_ ]?shot[-_ ]?\d.*$", re.I),         # Screenshot_2019-...
+    re.compile(r"^whatsapp[ -](image|video)[ -]?\d.*$", re.I), # WhatsApp Image 2019-...
     re.compile(r"^signal[-_]\d{4}-\d{2}-\d{2}.*$", re.I),      # Signal-2019-07-04-...
     re.compile(r"^fb[-_]img[-_]\d+$", re.I),                   # FB_IMG_1562243591
     re.compile(r"^received[-_]\d+$", re.I),                    # received_101234567890
