@@ -42,6 +42,13 @@ HUMAN_STEMS = [
     "kitchen remodel before",
     "scan0001 aunt martha",
     "Christmas",
+    # Regression cases: each of these was destroyed by an earlier, looser
+    # pattern. A false positive here discards a human's name permanently in
+    # favour of an AI guess, so they are pinned deliberately.
+    "Screenshot - grandpas last text message",
+    "WhatsApp Image of the new puppy",
+    "Sam_1",
+    "Sam_2",
 ]
 
 
