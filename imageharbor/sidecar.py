@@ -22,6 +22,23 @@ logger = logging.getLogger(__name__)
 SIDECAR_SCHEMA_VERSION = 1
 
 
+def _json_default(o: Any) -> Any:
+    """Fallback for values ``json.dumps`` cannot serialize natively.
+
+    Real EXIF carries raw ``bytes`` (ExifVersion, SceneType, MakerNote) and
+    other exotic types. A bare ``default=str`` would not raise, but it writes
+    Python repr syntax into the file -- ``"b'0230'"`` rather than ``"0230"`` --
+    and a sidecar is meant to be a portable, human-readable projection.
+
+    This deliberately mirrors ``catalog._json_default`` rather than importing
+    it, so this module stays dependency-free apart from the standard library.
+    Keep the two in sync.
+    """
+    if isinstance(o, (bytes, bytearray)):
+        return bytes(o).decode("utf-8", "replace")
+    return str(o)
+
+
 def sidecar_path_for(organized_path: Path) -> Path:
     """Return the sidecar path for *organized_path*.
 
@@ -78,7 +95,7 @@ def merge_sidecar(organized_path: Path, updates: dict[str, Any]) -> Path:
     tmp = path.with_name(f"{path.name}.tmp")
     try:
         tmp.write_text(
-            json.dumps(merged, indent=2, ensure_ascii=False, default=str),
+            json.dumps(merged, indent=2, ensure_ascii=False, default=_json_default),
             encoding="utf-8",
         )
         os.replace(tmp, path)
