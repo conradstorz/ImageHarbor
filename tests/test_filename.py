@@ -21,6 +21,15 @@ def test_normalize_falls_back_to_photo():
     assert normalize_descriptor("!!!") == "photo"
 
 
+def test_normalize_drops_apostrophes_instead_of_splitting_on_them():
+    assert normalize_descriptor("Emma's graduation") == "emmas-graduation"
+    assert normalize_descriptor("Dad's birthday party") == "dads-birthday-party"
+
+
+def test_normalize_drops_the_curly_apostrophe_too():
+    assert normalize_descriptor("Emma’s graduation") == "emmas-graduation"
+
+
 # --- build_filename -------------------------------------------------------
 
 def test_build_with_date_and_descriptor():

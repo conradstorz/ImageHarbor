@@ -29,7 +29,11 @@ def normalize_descriptor(text: str) -> str:
     * max 30 characters total
     * must not be empty; falls back to ``photo``
     """
-    lowered = text.lower()
+    # Drop apostrophes rather than splitting on them: the generic non-alphanumeric
+    # rule below would turn "Emma's graduation" into "emma-s-graduation", burning
+    # one of only three word slots on a stray "s". U+2019 is the curly apostrophe
+    # macOS and Windows insert automatically.
+    lowered = text.lower().replace("'", "").replace("’", "")
     # Replace any run of non-alphanumeric characters with a single space
     cleaned = _DESCRIPTOR_RE.sub(" ", lowered)
     words = [w for w in cleaned.split() if w][:3]

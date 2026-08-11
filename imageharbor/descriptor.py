@@ -1,0 +1,89 @@
+"""Descriptor resolution from the original filename.
+
+An original filename is itself a fact, and often the best one available: a
+person who typed "Emma's graduation" knew something no model will recover from
+the pixels.  Camera-generated names carry no such information, so they are
+discarded and the descriptor waits for the AI enrichment pass.
+
+The pattern list below is the one empirical claim in this module.  Keep it
+adjacent to its fixture table in tests/test_descriptor.py so additions arrive
+with tests.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import tiers
+from .filename import normalize_descriptor
+
+# Matched case-insensitively against the full original stem. A match means
+# "no human information here".
+CAMERA_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^_?img[-_]?\d+$", re.I),                      # IMG_1234, _IMG0042
+    re.compile(r"^img[-_]\d{8}[-_]wa\d+$", re.I),              # IMG-20190704-WA0001
+    re.compile(r"^img[-_]\d{8}[-_]\d{6}$", re.I),              # IMG_20190704_123456
+    re.compile(r"^_?dsc[nf]?[-_]?\d+$", re.I),                 # DSC0042, DSCN, DSCF, _DSC
+    re.compile(r"^p?xl[-_]\d{8}[-_]\d+$", re.I),               # PXL_20190704_123456789
+    re.compile(r"^mvimg[-_]\d{8}[-_]\d{6}$", re.I),            # MVIMG_20190704_123456
+    re.compile(r"^p\d{7}$", re.I),                             # P1000042 (Panasonic)
+    re.compile(r"^pict\d+$", re.I),                            # PICT0042
+    re.compile(r"^\d{3}[-_]\d{4}$", re.I),                     # 100_0042
+    re.compile(r"^cimg\d+$", re.I),                            # CIMG0042 (Casio)
+    re.compile(r"^sam[-_]\d+$", re.I),                         # SAM_0042 (Samsung)
+    re.compile(r"^gopr\d+$", re.I),                            # GOPR0042
+    re.compile(r"^dji[-_]\d+$", re.I),                         # DJI_0042
+    re.compile(r"^screen[-_ ]?shot.*$", re.I),                 # Screen Shot 2019-...
+    re.compile(r"^screenshot.*$", re.I),                       # Screenshot_2019-...
+    re.compile(r"^whatsapp[ -](image|video).*$", re.I),        # WhatsApp Image 2019-...
+    re.compile(r"^signal[-_]\d{4}-\d{2}-\d{2}.*$", re.I),      # Signal-2019-07-04-...
+    re.compile(r"^fb[-_]img[-_]\d+$", re.I),                   # FB_IMG_1562243591
+    re.compile(r"^received[-_]\d+$", re.I),                    # received_101234567890
+    re.compile(r"^\d{8}[-_]\d{6}$", re.I),                     # 20190704_123456
+    re.compile(r"^\d{4}-\d{2}-\d{2}[ _]\d{2}\.\d{2}\.\d{2}$"), # 2019-07-04 12.33.11
+    re.compile(r"^\d{9,13}$"),                                 # bare epoch seconds/ms
+)
+
+
+@dataclass(frozen=True)
+class ResolvedDescriptor:
+    """A descriptor together with the provenance that justifies its tier."""
+
+    value: str
+    tier: int
+    source: str
+
+
+_NONE = ResolvedDescriptor(value="", tier=tiers.DESC_NONE, source=tiers.DESC_SOURCE_NAMES[tiers.DESC_NONE])
+
+
+def is_camera_generated(stem: str) -> bool:
+    """Return True if *stem* looks machine-generated rather than human-authored."""
+    candidate = stem.strip()
+    return any(pattern.match(candidate) for pattern in CAMERA_PATTERNS)
+
+
+def resolve_descriptor(source_path: Path) -> ResolvedDescriptor:
+    """Derive a descriptor from *source_path*'s original filename.
+
+    Returns tier ``DESC_HUMAN_FILENAME`` when the stem carries human intent,
+    and ``DESC_NONE`` when it does not -- leaving the slot open for the AI
+    enrichment pass to fill at the lower ``DESC_AI_SUBJECT`` tier.
+    """
+    stem = source_path.stem
+    if not stem or is_camera_generated(stem):
+        return _NONE
+
+    normalized = normalize_descriptor(stem)
+    # normalize_descriptor falls back to "photo" for input with no usable
+    # characters; that is not information, so treat it as absent.
+    if not normalized or normalized == "photo":
+        return _NONE
+
+    return ResolvedDescriptor(
+        value=normalized,
+        tier=tiers.DESC_HUMAN_FILENAME,
+        source=tiers.DESC_SOURCE_NAMES[tiers.DESC_HUMAN_FILENAME],
+    )
