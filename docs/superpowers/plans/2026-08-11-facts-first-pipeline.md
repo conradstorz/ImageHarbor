@@ -1285,8 +1285,8 @@ def test_iter_unenriched_is_the_work_queue(tmp_path):
     from imageharbor.catalog import Catalog
 
     with Catalog(tmp_path / "c.db") as cat:
-        cat.upsert(sha256_b64url="D1", original_path="/a.jpg")
-        cat.upsert(sha256_b64url="D2", original_path="/b.jpg")
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.upsert(sha256_b64url="D2", original_path="/b.jpg", organized_path="/lib/b.jpg")
         assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D1", "D2"}
 
         cat.mark_enriched(
@@ -1308,8 +1308,25 @@ def test_iter_unenriched_respects_limit(tmp_path):
 
     with Catalog(tmp_path / "c.db") as cat:
         for i in range(5):
-            cat.upsert(sha256_b64url=f"D{i}", original_path=f"/{i}.jpg")
+            cat.upsert(
+                sha256_b64url=f"D{i}",
+                original_path=f"/{i}.jpg",
+                organized_path=f"/lib/{i}.jpg",
+            )
         assert len(cat.iter_unenriched(limit=2)) == 2
+
+
+def test_iter_unenriched_skips_rows_with_no_organized_copy(tmp_path):
+    """The enrichment pass reads the ORGANIZED copy, not the source.
+
+    A row with no organized_path has no file for it to open, so it must never
+    reach the queue — `Path(None)` raises TypeError.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg")
+        assert cat.iter_unenriched() == []
 
 
 def test_set_placement_updates_path_and_tiers(tmp_path):
