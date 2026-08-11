@@ -147,7 +147,11 @@ Everything else follows from this single predicate:
 - **An AI subject (20) cannot displace a human filename (30).** Information is
   protected structurally, not by care at the call site.
 - **The only automatic move is `Undated/ → YYYY/YYYY-MM/`** — date tier `0 →
-  anything`. Two known dates never swap automatically; that is a human decision.
+  anything`. A move between two *known* dates happens only when the new date
+  comes from a strictly higher-ranked source — a tier-30 Takeout timestamp may
+  correct a tier-10 filename guess, but two dates of equal rank never swap.
+  This is what lets a weak filename-derived date self-correct once real
+  evidence arrives; without it a wrong guess would be permanent.
 - `--reclassify` bypasses the predicate for a deliberate re-do.
 
 ### What actually triggers a date upgrade

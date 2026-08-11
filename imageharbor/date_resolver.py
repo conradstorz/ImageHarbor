@@ -63,6 +63,15 @@ _FILENAME_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Reading the date properly is the better outcome.
     re.compile(r"(?P<Y>\d{4})[.\s](?P<M>\d{2})[.\s](?P<D>\d{2})"),
     # Date only, compact and delimited: IMG-20190704-WA0001
+    #
+    # KNOWN FALSE POSITIVE, accepted deliberately: this matches ANY 8-digit run
+    # bounded by - or _ that is calendar-valid and in range, so
+    # "Order_20230615_001" reads as 2023-06-15. Accepted because in a photo
+    # library a bounded _YYYYMMDD_ token is overwhelmingly a real date, and
+    # anchoring this to camera prefixes would stop dating legitimate files like
+    # "vacation_20190704_beach.jpg". It lands at DATE_FILENAME_PATTERN (10) --
+    # the weakest non-zero rung, below every EXIF source -- and the source is
+    # recorded, so a higher-ranked date can correct it later.
     re.compile(r"[-_](?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})[-_]"),
 )
 
