@@ -270,3 +270,139 @@ def test_clear_file_failure_removes_row(catalog: Catalog) -> None:
     catalog.clear_file_failure("/src/a.jpg")
     assert catalog.is_quarantined("/src/a.jpg", 100, 111) is False
     assert catalog.record_file_failure("/src/a.jpg", 100, 111, "boom") == 1  # fresh row
+
+
+# ---------------------------------------------------------------------------
+# sources, tiers, enrichment queue
+# ---------------------------------------------------------------------------
+
+
+def test_record_source_accumulates_back_pointers(tmp_path):
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a/one.jpg")
+        cat.record_source("D1", "/a/one.jpg", 100, 111)
+        cat.record_source("D1", "/b/two.jpg", 100, 222)
+        cat.record_source("D1", "/c/three.jpg", 100, 333)
+        rows = cat.sources_for("D1")
+        assert {r["source_path"] for r in rows} == {"/a/one.jpg", "/b/two.jpg", "/c/three.jpg"}
+
+
+def test_record_source_is_idempotent_and_updates_last_seen(tmp_path):
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a/one.jpg")
+        cat.record_source("D1", "/a/one.jpg", 100, 111)
+        first = cat.sources_for("D1")[0]["first_seen_at"]
+        cat.record_source("D1", "/a/one.jpg", 100, 111)
+        rows = cat.sources_for("D1")
+        assert len(rows) == 1
+        assert rows[0]["first_seen_at"] == first
+
+
+def test_upsert_stores_tiers(tmp_path):
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(
+            sha256_b64url="D1",
+            original_path="/a/one.jpg",
+            date_value="2019-07-04",
+            date_tier=40,
+            date_source="exif_original",
+            descriptor_value="emmas-graduation",
+            descriptor_tier=30,
+            descriptor_source="human_filename",
+        )
+        assert cat.tiers_for("D1") == (40, 30)
+        row = cat.get_by_sha256("D1")
+        assert row["date_value"] == "2019-07-04"
+        assert row["descriptor_source"] == "human_filename"
+
+
+def test_tiers_for_unknown_digest_is_zero(tmp_path):
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        assert cat.tiers_for("nope") == (0, 0)
+
+
+def test_iter_unenriched_is_the_work_queue(tmp_path):
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg")
+        cat.upsert(sha256_b64url="D2", original_path="/b.jpg")
+        assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D1", "D2"}
+
+        cat.mark_enriched(
+            "D1",
+            pcs_primary="330",
+            pcs_name="beach",
+            secondary_tags=["sand"],
+            ai_caption="a beach",
+            objects=["sand"],
+            ocr_text="",
+            model_version="stub-1",
+            scene="outdoor",
+        )
+        assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D2"}
+
+
+def test_iter_unenriched_respects_limit(tmp_path):
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        for i in range(5):
+            cat.upsert(sha256_b64url=f"D{i}", original_path=f"/{i}.jpg")
+        assert len(cat.iter_unenriched(limit=2)) == 2
+
+
+def test_set_placement_updates_path_and_tiers(tmp_path):
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/Undated/x.jpg")
+        cat.set_placement(
+            "D1",
+            organized_path="/lib/2019/2019-07/2019-07-04-beach_x.jpg",
+            date_value="2019-07-04",
+            date_tier=40,
+            date_source="exif_original",
+            descriptor_value="beach",
+            descriptor_tier=20,
+            descriptor_source="ai_subject",
+        )
+        row = cat.get_by_sha256("D1")
+        assert row["organized_path"] == "/lib/2019/2019-07/2019-07-04-beach_x.jpg"
+        assert cat.tiers_for("D1") == (40, 20)
+
+
+def test_existing_catalog_gains_new_columns(tmp_path):
+    """An older DB must open and upgrade without losing rows."""
+    import sqlite3
+    from imageharbor.catalog import Catalog
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE photos (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "sha256_b64url TEXT NOT NULL UNIQUE, original_path TEXT NOT NULL, "
+        "organized_path TEXT, pcs_version TEXT NOT NULL DEFAULT '1', "
+        "pcs_primary TEXT NOT NULL DEFAULT '900', pcs_name TEXT NOT NULL DEFAULT 'miscellaneous', "
+        "secondary_tags TEXT NOT NULL DEFAULT '[]', ai_caption TEXT NOT NULL DEFAULT '', "
+        "objects TEXT NOT NULL DEFAULT '[]', ocr_text TEXT NOT NULL DEFAULT '', "
+        "exif TEXT NOT NULL DEFAULT '{}', model_version TEXT NOT NULL DEFAULT 'unknown', "
+        "processing_history TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, processed_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO photos (sha256_b64url, original_path, created_at) VALUES ('OLD', '/x.jpg', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    with Catalog(db) as cat:
+        assert cat.get_by_sha256("OLD") is not None
+        assert cat.tiers_for("OLD") == (0, 0)

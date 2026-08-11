@@ -73,7 +73,31 @@ CREATE TABLE IF NOT EXISTS failed_files (
     last_failed_at  TEXT    NOT NULL,
     quarantined     INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS sources (
+    sha256_b64url TEXT    NOT NULL,
+    source_path   TEXT    NOT NULL,
+    size          INTEGER,
+    mtime_ns      INTEGER,
+    first_seen_at TEXT    NOT NULL,
+    last_seen_at  TEXT    NOT NULL,
+    PRIMARY KEY (sha256_b64url, source_path)
+);
+CREATE INDEX IF NOT EXISTS idx_sources_digest ON sources(sha256_b64url);
 """
+
+# Columns added to `photos` after the original schema shipped. Applied
+# additively on open so an existing catalog upgrades in place.
+_ADDED_PHOTO_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("date_value", "TEXT"),
+    ("date_tier", "INTEGER NOT NULL DEFAULT 0"),
+    ("date_source", "TEXT NOT NULL DEFAULT 'none'"),
+    ("descriptor_value", "TEXT NOT NULL DEFAULT ''"),
+    ("descriptor_tier", "INTEGER NOT NULL DEFAULT 0"),
+    ("descriptor_source", "TEXT NOT NULL DEFAULT 'none'"),
+    ("scene", "TEXT NOT NULL DEFAULT ''"),
+    ("enriched_at", "TEXT"),
+)
 
 
 def _now_iso() -> str:
@@ -115,8 +139,19 @@ class Catalog:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.executescript(_SCHEMA)
+        self._ensure_photo_columns()
         self._conn.commit()
         logger.debug("Catalog opened at %s", db_path)
+
+    def _ensure_photo_columns(self) -> None:
+        """Add post-1.0 columns to `photos` if this DB predates them."""
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(photos)")
+        }
+        for name, ddl in _ADDED_PHOTO_COLUMNS:
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE photos ADD COLUMN {name} {ddl}")
+                logger.debug("Catalog upgraded: added photos.%s", name)
 
     # ------------------------------------------------------------------
     # Write
@@ -138,6 +173,12 @@ class Catalog:
         exif: dict[str, Any] | None = None,
         model_version: str = "unknown",
         processing_history: list[dict] | None = None,
+        date_value: str | None = None,
+        date_tier: int = 0,
+        date_source: str = "none",
+        descriptor_value: str = "",
+        descriptor_tier: int = 0,
+        descriptor_source: str = "none",
     ) -> int:
         """Insert or update a photo record. Returns the row id."""
         now = _now_iso()
@@ -169,6 +210,12 @@ class Catalog:
             _json(exif or {}),
             model_version,
             _json(history),
+            date_value,
+            date_tier,
+            date_source,
+            descriptor_value,
+            descriptor_tier,
+            descriptor_source,
             now,  # created_at (preserved on UPDATE: not in the ON CONFLICT SET list)
             now,  # processed_at
         )
@@ -179,8 +226,11 @@ class Catalog:
                 sha256_b64url, original_path, organized_path,
                 pcs_version, pcs_primary, pcs_name,
                 secondary_tags, ai_caption, objects, ocr_text, exif,
-                model_version, processing_history, created_at, processed_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                model_version, processing_history,
+                date_value, date_tier, date_source,
+                descriptor_value, descriptor_tier, descriptor_source,
+                created_at, processed_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(sha256_b64url) DO UPDATE SET
                 organized_path    = excluded.organized_path,
                 pcs_version       = excluded.pcs_version,
@@ -193,6 +243,12 @@ class Catalog:
                 exif              = excluded.exif,
                 model_version     = excluded.model_version,
                 processing_history = excluded.processing_history,
+                date_value        = excluded.date_value,
+                date_tier         = excluded.date_tier,
+                date_source       = excluded.date_source,
+                descriptor_value  = excluded.descriptor_value,
+                descriptor_tier   = excluded.descriptor_tier,
+                descriptor_source = excluded.descriptor_source,
                 processed_at      = excluded.processed_at
             """,
             params,
@@ -240,6 +296,117 @@ class Catalog:
                 seen_at       = excluded.seen_at
             """,
             (source_path, size, mtime_ns, sha256_b64url, _now_iso()),
+        )
+        self._conn.commit()
+
+    def record_source(
+        self, sha256_b64url: str, source_path: str, size: int, mtime_ns: int
+    ) -> None:
+        """Record that *source_path* holds the bytes identified by the digest.
+
+        One row per distinct source path: this is the many-to-one back-pointer
+        set that replaces a single `original_path`. `first_seen_at` is written
+        once and never updated.
+        """
+        now = _now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO sources (
+                sha256_b64url, source_path, size, mtime_ns, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sha256_b64url, source_path) DO UPDATE SET
+                size = excluded.size,
+                mtime_ns = excluded.mtime_ns,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (sha256_b64url, source_path, size, mtime_ns, now, now),
+        )
+        self._conn.commit()
+
+    def sources_for(self, sha256_b64url: str) -> list[sqlite3.Row]:
+        """All known source paths for a digest, oldest first."""
+        return list(
+            self._conn.execute(
+                "SELECT * FROM sources WHERE sha256_b64url = ? ORDER BY first_seen_at",
+                (sha256_b64url,),
+            )
+        )
+
+    def tiers_for(self, sha256_b64url: str) -> tuple[int, int]:
+        """Return ``(date_tier, descriptor_tier)``; ``(0, 0)`` if unknown."""
+        row = self._conn.execute(
+            "SELECT date_tier, descriptor_tier FROM photos WHERE sha256_b64url = ?",
+            (sha256_b64url,),
+        ).fetchone()
+        if row is None:
+            return (0, 0)
+        return (row["date_tier"] or 0, row["descriptor_tier"] or 0)
+
+    def set_placement(
+        self,
+        sha256_b64url: str,
+        *,
+        organized_path: str,
+        date_value: str | None,
+        date_tier: int,
+        date_source: str,
+        descriptor_value: str,
+        descriptor_tier: int,
+        descriptor_source: str,
+    ) -> None:
+        """Record a new organized path and the tiers that justified it."""
+        self._conn.execute(
+            """
+            UPDATE photos SET
+                organized_path = ?, date_value = ?, date_tier = ?, date_source = ?,
+                descriptor_value = ?, descriptor_tier = ?, descriptor_source = ?,
+                processed_at = ?
+            WHERE sha256_b64url = ?
+            """,
+            (
+                organized_path, date_value, date_tier, date_source,
+                descriptor_value, descriptor_tier, descriptor_source,
+                _now_iso(), sha256_b64url,
+            ),
+        )
+        self._conn.commit()
+
+    def iter_unenriched(self, limit: int | None = None) -> list[sqlite3.Row]:
+        """Rows the AI enrichment pass has not yet processed."""
+        sql = "SELECT * FROM photos WHERE enriched_at IS NULL ORDER BY id"
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        return list(self._conn.execute(sql, params))
+
+    def mark_enriched(
+        self,
+        sha256_b64url: str,
+        *,
+        pcs_primary: str,
+        pcs_name: str,
+        secondary_tags: list[str],
+        ai_caption: str,
+        objects: list[str],
+        ocr_text: str,
+        model_version: str,
+        scene: str = "",
+    ) -> None:
+        """Store the AI's perception and stamp the row as enriched."""
+        self._conn.execute(
+            """
+            UPDATE photos SET
+                pcs_primary = ?, pcs_name = ?, secondary_tags = ?, ai_caption = ?,
+                objects = ?, ocr_text = ?, model_version = ?, scene = ?,
+                enriched_at = ?
+            WHERE sha256_b64url = ?
+            """,
+            (
+                pcs_primary, pcs_name, _json(secondary_tags), ai_caption,
+                _json(objects), ocr_text, model_version, scene,
+                _now_iso(), sha256_b64url,
+            ),
         )
         self._conn.commit()
 
