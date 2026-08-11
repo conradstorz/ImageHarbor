@@ -327,8 +327,15 @@ Update the `verify_pcs_file` docstring to say "an organized file" rather than "a
 Run: `uv run pytest tests/test_hashing.py -v`
 Expected: PASS — all tests including the pre-existing ones.
 
-Then confirm nothing else regressed: `uv run pytest -q`
-Expected: PASS (241 pre-existing tests plus the new ones).
+Then check the rest of the suite: `uv run pytest -q`
+Expected: **5 failures in `tests/test_filename.py`, and nothing else.**
+
+This is a known, intentional red window. `filename.parse_filename` currently
+leans on `extract_digest_from_stem` to pre-validate the PCS prefix, so relaxing
+the extractor drops that guard until Task 3 rewrites `parse_filename` to own it.
+Confirm the failures are confined to `test_filename.py`; **do not** edit
+`imageharbor/filename.py` to make them pass — that file belongs to Task 3, which
+replaces `parse_filename` and `ParsedFilename` wholesale.
 
 - [ ] **Step 5: Commit**
 
