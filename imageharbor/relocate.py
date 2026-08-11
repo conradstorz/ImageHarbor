@@ -9,14 +9,13 @@ by digest and repair the row.
 
 from __future__ import annotations
 
-import filecmp
 import logging
 import os
 from pathlib import Path
 
 from .date_resolver import ResolvedDate
 from .filename import build_filename
-from .hashing import extract_digest_from_stem
+from .hashing import extract_digest_from_stem, verify_file
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +36,8 @@ def apply_relocation(old_path: Path, new_path: Path) -> None:
     """Move *old_path* to *new_path*.
 
     A destination that already holds byte-identical content is accepted (this
-    is the state left by a crash between the rename and the catalog update,
-    when the file has already landed at *new_path* but the catalog still
-    points at *old_path*); a destination holding *different* content raises
-    rather than clobbering.
+    is the state left by a crash between the rename and the catalog update);
+    a destination holding *different* content raises rather than clobbering.
     """
     if old_path == new_path:
         return
@@ -48,10 +45,9 @@ def apply_relocation(old_path: Path, new_path: Path) -> None:
     new_path.parent.mkdir(parents=True, exist_ok=True)
 
     if new_path.exists():
-        if filecmp.cmp(old_path, new_path, shallow=False):
-            logger.debug(
-                "Destination already present with identical content: %s", new_path
-            )
+        digest = extract_digest_from_stem(new_path.stem)
+        if digest and verify_file(new_path, digest):
+            logger.debug("Destination already present and verified: %s", new_path)
             old_path.unlink(missing_ok=True)
             return
         raise FileExistsError(

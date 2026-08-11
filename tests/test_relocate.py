@@ -1,10 +1,12 @@
 """Tests for target-path computation, safe renames, and self-healing."""
 
+import hashlib
 from datetime import datetime
 
 import pytest
 
 from imageharbor.date_resolver import ResolvedDate
+from imageharbor.hashing import encode_base64url
 from imageharbor.relocate import (
     apply_relocation,
     find_by_digest,
@@ -13,6 +15,14 @@ from imageharbor.relocate import (
 )
 
 _D = "qfQ8jnnXIdtn-juMY-1JDqyBLPF6j2MJlbh8sZOIfcI"
+
+# A REAL content/digest pair. apply_relocation's "already done" branch verifies
+# the destination against the digest embedded in its own filename, which is the
+# project's core invariant. A fixture pairing arbitrary bytes with a placeholder
+# digest would not exercise that branch honestly -- in a real organized tree a
+# file's embedded digest always IS its actual hash.
+_CONTENT = b"content"
+_CONTENT_DIGEST = encode_base64url(hashlib.sha256(_CONTENT).digest())
 
 
 def _dated():
@@ -58,9 +68,10 @@ def test_apply_relocation_is_a_no_op_when_paths_match(tmp_path):
 
 
 def test_apply_relocation_refuses_to_clobber_different_content(tmp_path):
-    old = tmp_path / f"a_{_D}.jpg"
-    old.write_bytes(b"content")
-    new = tmp_path / f"b_{_D}.jpg"
+    """The destination's bytes do not match the digest in its own name."""
+    old = tmp_path / f"a_{_CONTENT_DIGEST}.jpg"
+    old.write_bytes(_CONTENT)
+    new = tmp_path / f"b_{_CONTENT_DIGEST}.jpg"
     new.write_bytes(b"different")
 
     with pytest.raises(FileExistsError):
@@ -71,16 +82,38 @@ def test_apply_relocation_refuses_to_clobber_different_content(tmp_path):
 
 
 def test_apply_relocation_tolerates_an_identical_destination(tmp_path):
-    """A crash after rename but before the catalog update leaves this state."""
-    old = tmp_path / f"a_{_D}.jpg"
-    old.write_bytes(b"content")
-    new = tmp_path / f"b_{_D}.jpg"
-    new.write_bytes(b"content")
+    """A crash after rename but before the catalog update leaves this state.
+
+    Both files carry the same digest in their names because they hold the same
+    bytes -- content addressing guarantees it -- so the destination verifies
+    against its own name and the relocation is treated as already done.
+    """
+    old = tmp_path / f"a_{_CONTENT_DIGEST}.jpg"
+    old.write_bytes(_CONTENT)
+    new = tmp_path / f"b_{_CONTENT_DIGEST}.jpg"
+    new.write_bytes(_CONTENT)
 
     apply_relocation(old, new)
 
     assert not old.exists()
-    assert new.read_bytes() == b"content"
+    assert new.read_bytes() == _CONTENT
+
+
+def test_apply_relocation_rejects_a_destination_that_fails_its_own_digest(tmp_path):
+    """A corrupted destination must never be accepted as "already done".
+
+    This is what byte-comparing old against new would miss: two files can be
+    identical to each other while neither matches the identity its name claims.
+    """
+    old = tmp_path / f"a_{_CONTENT_DIGEST}.jpg"
+    old.write_bytes(b"corrupt")
+    new = tmp_path / f"b_{_CONTENT_DIGEST}.jpg"
+    new.write_bytes(b"corrupt")
+
+    with pytest.raises(FileExistsError):
+        apply_relocation(old, new)
+
+    assert old.exists()
 
 
 def test_find_by_digest_locates_a_moved_file(tmp_path):
