@@ -373,7 +373,10 @@ class Catalog:
 
     def iter_unenriched(self, limit: int | None = None) -> list[sqlite3.Row]:
         """Rows the AI enrichment pass has not yet processed."""
-        sql = "SELECT * FROM photos WHERE enriched_at IS NULL ORDER BY id"
+        sql = (
+            "SELECT * FROM photos WHERE enriched_at IS NULL "
+            "AND organized_path IS NOT NULL ORDER BY id"
+        )
         params: tuple[Any, ...] = ()
         if limit is not None:
             sql += " LIMIT ?"
