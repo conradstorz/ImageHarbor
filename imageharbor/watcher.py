@@ -185,12 +185,15 @@ def _failed_buffer_from_digests(
 ) -> list[tuple[str, int, int, str]]:
     """Map enrichment-failed digests back to (source_path, size, mtime_ns, error).
 
-    `EnrichStats.failed` carries digests (enrichment reads the organized copy,
-    not the original), but poison-quarantine bookkeeping (`failed_files`) is
-    keyed by the ORIGINAL source path -- so each digest is resolved back to
-    every known source it was seen at via `catalog.sources_for`. A digest with
-    no recorded source (should not happen) is skipped rather than crashing the
-    pass.
+    `EnrichStats.ai_failed` carries digests (enrichment reads the organized
+    copy, not the original), but poison-quarantine bookkeeping
+    (`failed_files`) is keyed by the ORIGINAL source path -- so each digest is
+    resolved back to every known source it was seen at via
+    `catalog.sources_for`. A digest with no recorded source (should not
+    happen) is skipped rather than crashing the pass. Callers MUST pass only
+    `ai_failed`, never `io_failed` -- an I/O failure (a missing organized
+    file, a local catalog/filesystem error) is not AI-perception evidence
+    about the original source file.
     """
     buffer: list[tuple[str, int, int, str]] = []
     for digest in digests:
@@ -237,8 +240,12 @@ def run_once(
     the enrichment phase is skipped while the breaker is OPEN.
 
     Poison-file quarantine is driven entirely by the enrichment phase's
-    per-digest failures (`EnrichStats.failed`); the facts phase can no longer
-    produce an AI-caused failure, so it never feeds quarantine.
+    per-digest AI-perception failures (`EnrichStats.ai_failed`); the facts
+    phase can no longer produce an AI-caused failure, so it never feeds
+    quarantine, and neither does `EnrichStats.io_failed` (a missing organized
+    file, a local catalog/filesystem error after perception already
+    succeeded) -- only a `classifier.describe()` failure is evidence about
+    the AI backend or the original source file.
 
     *offset* is forwarded to `enrich_library`/`catalog.iter_unenriched`
     unchanged. `watch` owns the actual probe-offset bookkeeping (advance on
@@ -271,7 +278,7 @@ def run_once(
                 offset=offset,
             )
             failed_buffer = _failed_buffer_from_digests(
-                catalog, enrich_stats.failed, "enrichment failed"
+                catalog, enrich_stats.ai_failed, "enrichment failed"
             )
             _reconcile_poison(
                 catalog=catalog,

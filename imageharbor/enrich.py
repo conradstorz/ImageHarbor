@@ -42,10 +42,15 @@ class EnrichStats:
     renamed: int = 0
     errors: int = 0
     aborted: bool = False
-    # Digests that failed this pass. The watcher feeds these to poison-file
-    # reconciliation: with no AI in the facts pass, this is now the ONLY source
-    # of the per-file failure signal quarantine depends on.
-    failed: list[str] = field(default_factory=list)
+    # Digests that failed this pass, split by WHY they failed -- only a
+    # classifier.describe() failure is AI-perception evidence. `errors`
+    # counts both; poison-file quarantine (fed by the watcher) must consume
+    # only `ai_failed` -- an I/O failure (a missing organized file, a local
+    # catalog/filesystem error after perception already succeeded) says
+    # nothing about the AI backend or the ORIGINAL source file, and must
+    # never count toward quarantining that original.
+    ai_failed: list[str] = field(default_factory=list)
+    io_failed: list[str] = field(default_factory=list)
 
 
 def enrich_library(
@@ -100,7 +105,7 @@ def enrich_library(
         if actual is None:
             logger.error("Organized file missing for %s (%s)", digest, recorded)
             stats.errors += 1
-            stats.failed.append(digest)
+            stats.io_failed.append(digest)
             continue
 
         try:
@@ -108,7 +113,7 @@ def enrich_library(
         except Exception as exc:
             logger.warning("Enrichment failed for %s: %s", actual.name, exc)
             stats.errors += 1
-            stats.failed.append(digest)
+            stats.ai_failed.append(digest)
             if breaker is not None:
                 breaker.record_failure()
                 if breaker.is_open():
@@ -125,14 +130,16 @@ def enrich_library(
             breaker.record_success()
 
         # Everything below is LOCAL work -- taxonomy, catalog, filesystem --
-        # not a backend call, so it must never feed the breaker. It is also
+        # not a backend call, so it must never feed the breaker, and any
+        # failure here is I/O evidence, not AI evidence, so it goes to
+        # stats.io_failed (never ai_failed / quarantine). It is also
         # isolated per row: the queue is ordered by id, and a row that raises
         # here is marked neither enriched nor failed, so an escaping
         # exception would crash on the same row every subsequent pass and
         # permanently block every row behind it (mirrors
         # Pipeline._process_one, which wraps its whole per-file body for the
-        # same reason). An escape would also bypass stats.failed entirely,
-        # silently disabling the poison-file quarantine that consumes it.
+        # same reason). An escape would also bypass stats.io_failed entirely,
+        # silently dropping this row from the pass's failure accounting.
         try:
             # Organization: our code picks the class; the AI is only a fallback.
             cls = concept_map.class_for(
@@ -254,7 +261,7 @@ def enrich_library(
                 "Post-perception enrichment failed for %s: %s", actual.name, exc
             )
             stats.errors += 1
-            stats.failed.append(digest)
+            stats.io_failed.append(digest)
             continue
 
     return stats

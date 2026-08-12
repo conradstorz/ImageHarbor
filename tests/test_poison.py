@@ -122,6 +122,47 @@ def test_systemic_outage_does_not_quarantine(
     assert catalog.is_quarantined(str(a), a.stat().st_size, a.stat().st_mtime_ns) is False
 
 
+def test_missing_organized_file_does_not_quarantine_the_original(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """An I/O fault (someone deleted the organized copy) is not AI-perception
+    evidence and must never quarantine the ORIGINAL source file.
+
+    Regression test: `enrich_library`'s missing-organized-file branch used to
+    feed the same `EnrichStats.failed` list the describe()-failure branch
+    does, so deleting one file from the organized tree would get its
+    original quarantined after `poison_max_fails` healthy passes even though
+    the AI backend never saw (and never failed on) that file. The fix splits
+    `failed` into `ai_failed` (only a describe() failure) and `io_failed`
+    (this branch); the watcher feeds only `ai_failed` to quarantine.
+    """
+    from imageharbor.ai_classifier import StubClassifier
+
+    src = tmp_path / "src"
+    src.mkdir()
+    target = _make_jpeg(src / "target.jpg", b"\xff\xd8\xff\xe0" + b"\x09" * 16 + b"\xff\xd9")
+
+    # Facts-organize `target` WITHOUT enriching it, then delete its organized
+    # copy -- this is exactly "iter_unenriched still queues this row, but its
+    # file is gone", which is what the missing-organized-file branch handles.
+    Pipeline(src, organized_dir, catalog).run()
+    row = catalog.get_by_original_path(str(target))
+    Path(row["organized_path"]).unlink()
+
+    breaker = _fresh_breaker()
+    for i in range(6):
+        # Fresh unseen success each pass proves the backend is up (healthy-pass
+        # gate) -- same pattern as the healthy-quarantine test above -- so
+        # this exercises the "healthy pass, still never quarantined" path,
+        # not just "no success -> discard".
+        _make_jpeg(src / f"good_{i}.jpg", b"\xff\xd8\xff\xe0" + bytes([i + 1]) * 16 + b"\xff\xd9")
+        run_once(src, organized_dir, catalog, classifier=StubClassifier(), breaker=breaker,
+                  poison_max_fails=5)
+        assert catalog.is_quarantined(
+            str(target), target.stat().st_size, target.stat().st_mtime_ns
+        ) is False
+
+
 def test_poison_at_the_head_does_not_halt_enrichment(
     tmp_path: Path, organized_dir: Path, catalog: Catalog
 ) -> None:

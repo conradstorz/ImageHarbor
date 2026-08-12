@@ -195,6 +195,9 @@ def test_a_local_failure_does_not_wedge_the_pass(tmp_path):
 
     The queue is ordered by id and a row that raises is never marked enriched
     or failed, so an escaping exception would crash on the same row forever.
+    This is a POST-perception (local/catalog) failure, not an AI-perception
+    one, so it must land in io_failed, not ai_failed -- it says nothing about
+    the AI backend and must never feed poison-file quarantine.
     """
     src = _make(tmp_path, "IMG_1.jpg", b"one")
     (src / "IMG_2.jpg").write_bytes(b"two")
@@ -218,7 +221,8 @@ def test_a_local_failure_does_not_wedge_the_pass(tmp_path):
     assert stats.total == 2
     assert stats.errors == 1
     assert stats.enriched == 1
-    assert len(stats.failed) == 1  # the failure is visible to quarantine
+    assert len(stats.io_failed) == 1  # counted, but not AI-perception evidence
+    assert stats.ai_failed == []  # must never feed poison-file quarantine
     cat.close()
 
 
