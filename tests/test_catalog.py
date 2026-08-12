@@ -398,6 +398,30 @@ def test_iter_unenriched_excludes_content_quarantined_via_any_source(tmp_path):
         assert cat.iter_unenriched() == []
 
 
+def test_new_content_at_a_quarantined_path_re_enters_the_queue(tmp_path):
+    """Quarantine is scoped to the exact bytes that failed.
+
+    CLAUDE.md: a quarantined file is skipped thereafter "until its bytes
+    change". Replacing a poison photo with a fixed one under the same filename
+    must lift the exclusion for the new content -- and nothing else can, since
+    record_file_failure's stale-stat reset only runs if the file is attempted.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")
+        cat.quarantine_file("/a.jpg")
+        assert cat.iter_unenriched() == []
+
+        # Same path, new bytes: new digest, new size and mtime.
+        cat.upsert(sha256_b64url="D2", original_path="/a.jpg", organized_path="/lib/b.jpg")
+        cat.record_source("D2", "/a.jpg", 20, 222)
+
+        assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D2"}
+
+
 def test_a_merely_failing_file_stays_in_the_queue(tmp_path):
     """Only QUARANTINED content leaves; a file still accruing failures retries."""
     from imageharbor.catalog import Catalog

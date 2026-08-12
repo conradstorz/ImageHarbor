@@ -384,6 +384,22 @@ class Catalog:
         several paths is quarantined if ANY of them is: identical bytes fail
         identically, so one quarantined path condemns the content.
 
+        The join also requires `(size, mtime_ns)` to match between
+        `failed_files` and `sources` -- the same triple `is_quarantined()`
+        already uses -- rather than matching on `source_path` alone.
+        `sources` is keyed by `(digest, source_path)`, so editing the file at
+        a quarantined path in place (replacing a poison photo with a fixed
+        one under the same filename) inserts a NEW `sources` row for the new
+        digest at that path. Without the stat correlation that new row would
+        still join to the OLD `failed_files` record purely on path and stay
+        excluded forever -- and nothing would ever lift it, because
+        `record_file_failure`'s stale-stat reset only runs when the file is
+        actually attempted, which the exclusion itself prevents. Per
+        CLAUDE.md, a quarantined file must be skipped "until its bytes
+        change"; the stat correlation is what makes that recovery path work:
+        new bytes at the same path produce different size/mtime, so the join
+        no longer matches and the new content re-enters the queue.
+
         `--reclassify` deliberately bypasses this (it walks `iter_all`): asking
         again is the whole point of an explicit re-do.
         """
@@ -393,6 +409,7 @@ class Catalog:
             "AND NOT EXISTS ("
             "  SELECT 1 FROM sources s"
             "  JOIN failed_files f ON f.source_path = s.source_path"
+            "   AND f.size = s.size AND f.mtime_ns = s.mtime_ns"
             "  WHERE s.sha256_b64url = p.sha256_b64url AND f.quarantined = 1"
             ") ORDER BY p.id"
         )
