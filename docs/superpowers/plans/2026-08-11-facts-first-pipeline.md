@@ -3692,9 +3692,16 @@ def test_an_outage_between_good_runs_loses_nothing(tmp_path):
         enrich_library(cat, dest, Fixed("beach"), write_sidecars=True)
         healthy = _snapshot(dest)
 
-        enrich_library(cat, dest, Broken(), write_sidecars=True)
+        # reclassify=True is REQUIRED, not incidental. After the healthy pass
+        # every row has enriched_at set, so the default query finds nothing and
+        # Broken() would never be called -- the test would pass without the
+        # outage ever happening. Assert it genuinely failed, too.
+        broken = enrich_library(cat, dest, Broken(), write_sidecars=True, reclassify=True)
+        assert broken.errors > 0
+        assert broken.enriched == 0
+
         Pipeline(src, dest, cat, write_sidecars=True).run()
-        enrich_library(cat, dest, Broken(), write_sidecars=True)
+        enrich_library(cat, dest, Broken(), write_sidecars=True, reclassify=True)
 
         assert _snapshot(dest) == healthy
 
