@@ -194,6 +194,7 @@ def run_once(
     enrich_enabled: bool = True,
     poison_max_fails: int = 5,
     quarantine_dir: Optional[Path] = None,
+    offset: int = 0,
 ) -> tuple[WatchStats, Optional[EnrichStats]]:
     """One full sweep: the facts phase, then the enrichment phase.
 
@@ -211,6 +212,13 @@ def run_once(
     Poison-file quarantine is driven entirely by the enrichment phase's
     per-digest failures (`EnrichStats.failed`); the facts phase can no longer
     produce an AI-caused failure, so it never feeds quarantine.
+
+    *offset* is forwarded to `enrich_library`/`catalog.iter_unenriched`
+    unchanged. `watch` owns the actual probe-offset bookkeeping (advance on
+    abort, reset on a clean or empty pass) across repeated calls to this
+    function; a caller driving `run_once` directly (as the poison tests do)
+    is responsible for its own offset if it wants the same rotating-probe
+    behaviour.
 
     If *pipeline* is not supplied, one is constructed from *source*/*dest*
     (and *duplicates_dir*/*write_sidecars*) for this call.
@@ -233,6 +241,7 @@ def run_once(
                 catalog, dest, classifier,
                 write_sidecars=write_sidecars,
                 breaker=breaker,
+                offset=offset,
             )
             failed_buffer = _failed_buffer_from_digests(
                 catalog, enrich_stats.failed, "enrichment failed"
@@ -274,11 +283,31 @@ def watch(
     Each pass is a full facts-then-enrichment sweep (`run_once`): the facts
     phase always runs; the enrichment phase (and therefore the breaker) is
     skipped while the breaker is OPEN.
+
+    This loop owns a rotating probe *offset* into `iter_unenriched`'s
+    (fixed `ORDER BY p.id`) queue. Without it, a cluster of files that
+    always fail AI perception can settle at the head of the queue and
+    livelock enrichment forever: every pass immediately re-hits the same
+    cluster, trips the breaker, aborts, and `_reconcile_poison` discards the
+    whole pass's failures (a tripped pass never counts toward
+    poison-quarantine) -- so `fail_count` never climbs to the quarantine
+    threshold and no other file is ever reached either. Advancing the
+    offset after an abort makes the next half-open probe skip past a whole
+    cluster (`max(1, breaker.trip_threshold)` rows) instead of re-probing
+    the same head row, so it can eventually land on a working file
+    elsewhere in the queue, close the breaker, and let the pass proceed far
+    enough that later poison files fail during a HEALTHY pass -- the only
+    condition under which quarantine can fire. The offset resets to 0
+    whenever a pass completes without aborting (including the `total == 0`
+    case, where an offset that has run past the end of the current queue
+    would otherwise leave the breaker half-open forever with nothing left
+    to probe).
     """
     stop_event = stop_event or threading.Event()
     if sleep is None:
         sleep = stop_event.wait  # interruptible sleep
     wstats = WatchStats()
+    probe_offset = 0
     while not stop_event.is_set():
         if breaker is not None and breaker.is_open():
             wait = breaker.seconds_until_probe()
@@ -298,7 +327,20 @@ def watch(
             enrich_enabled=enrich_enabled,
             poison_max_fails=poison_max_fails,
             quarantine_dir=quarantine_dir,
+            offset=probe_offset,
         )
+        if enrich_stats is not None:
+            if enrich_stats.aborted:
+                # Skip past a whole cluster rather than crawling it one row
+                # at a time -- see the offset explanation in this
+                # function's docstring.
+                step = max(1, breaker.trip_threshold) if breaker is not None else 1
+                probe_offset += step
+            else:
+                # Covers both a clean completion AND total == 0 (an
+                # offset that outran the queue): either way there is
+                # nothing gained by staying non-zero.
+                probe_offset = 0
         wstats.passes += 1
         wstats.processed += facts.processed
         wstats.skipped_unchanged += facts.skipped_unchanged

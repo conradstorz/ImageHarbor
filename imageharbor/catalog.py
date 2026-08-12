@@ -378,8 +378,19 @@ class Catalog:
         )
         self._conn.commit()
 
-    def iter_unenriched(self, limit: int | None = None) -> list[sqlite3.Row]:
+    def iter_unenriched(
+        self, limit: int | None = None, offset: int = 0
+    ) -> list[sqlite3.Row]:
         """Rows the AI enrichment pass has not yet processed.
+
+        *offset* skips the first *offset* rows of the (fixed `ORDER BY p.id`)
+        result. It exists so the watcher's half-open probe can rotate past a
+        cluster of permanently-failing rows at the head of the queue instead
+        of re-trying the same head cluster (and re-tripping the breaker) on
+        every pass -- see `watcher.watch`'s probe-offset tracking. SQLite
+        requires `LIMIT` before `OFFSET`, and `OFFSET` alone is not valid
+        SQL, so when *limit* is `None` this uses the SQLite idiom `LIMIT -1
+        OFFSET ?` (a negative `LIMIT` means "no limit").
 
         Excludes quarantined content. Quarantine means "stop asking the model
         about this one", so a quarantined file must leave the queue entirely --
@@ -420,11 +431,14 @@ class Catalog:
             "  WHERE s.sha256_b64url = p.sha256_b64url AND f.quarantined = 1"
             ") ORDER BY p.id"
         )
-        params: tuple[Any, ...] = ()
-        if limit is not None:
+        params: list[Any] = []
+        if limit is not None or offset:
             sql += " LIMIT ?"
-            params = (limit,)
-        return list(self._conn.execute(sql, params))
+            params.append(limit if limit is not None else -1)
+            if offset:
+                sql += " OFFSET ?"
+                params.append(offset)
+        return list(self._conn.execute(sql, tuple(params)))
 
     def mark_enriched(
         self,

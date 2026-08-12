@@ -8,6 +8,7 @@ organized, verified, and catalogued by the facts phase.
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,8 @@ import pytest
 from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.hashing import compute_sha256_b64url, verify_file
-from imageharbor.watcher import run_once
+from imageharbor.pipeline import Pipeline
+from imageharbor.watcher import run_once, watch
 
 
 def _make_jpeg(path: Path, content: bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9") -> Path:
@@ -118,6 +120,128 @@ def test_systemic_outage_does_not_quarantine(
     # failures are discarded outright) or, once OPEN, run_once skips the
     # enrichment phase entirely -- either way NOTHING is ever quarantined.
     assert catalog.is_quarantined(str(a), a.stat().st_size, a.stat().st_mtime_ns) is False
+
+
+def test_poison_at_the_head_does_not_halt_enrichment(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The mirror image of test_systemic_outage_does_not_quarantine: this is
+    NOT a systemic outage (most content is describable), but a cluster of
+    genuinely-undescribable files that happens to sort to the very head of
+    `iter_unenriched`'s fixed `ORDER BY p.id` queue.
+
+    Pre-fix, this is a livelock: every enrichment pass re-hits the same head
+    cluster first, trips the breaker, aborts, and `_reconcile_poison`
+    discards the whole pass's failures unconditionally on `tripped` -- so
+    nothing behind the cluster (good or poison) is EVER reached, and
+    `fail_count` never climbs to the quarantine threshold either. The fix is
+    a rotating probe offset (owned by `watch`) that skips a whole cluster
+    after an abort, so a half-open probe eventually lands on a working file
+    elsewhere in the queue, closes the breaker, and lets the pass proceed.
+
+    Layout (alphabetical == id order, all present before the first pass):
+      a0/a1 trigger  -- two always-failing files, exactly `trip_threshold`
+                        long, contiguous at the head. These cause the very
+                        first trip; a pass that touches both together is
+                        always discarded, and a half-open probe landing on
+                        either alone reopens on that single failure -- so
+                        this pair can never itself be quarantined, and the
+                        test does not assert on it.
+      b0 good, b1 target, b2 good, b3 target, b4 good, b5 target, b6 good
+                     -- alternating tail: every target poison file has a
+                        good neighbour on both sides, so once a probe's
+                        offset clears the trigger pair and lands on b0, the
+                        pass proceeds through the whole tail without
+                        re-tripping (no two failures ever land back to
+                        back) -- and every target file in it fails during
+                        that one HEALTHY pass, which is exactly the
+                        condition `_reconcile_poison` requires to count a
+                        failure toward quarantine.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+
+    trigger_contents = [
+        b"\xff\xd8\xff\xe0" + bytes([0xA0 + i]) * 16 + b"\xff\xd9" for i in range(2)
+    ]
+    for i, content in enumerate(trigger_contents):
+        _make_jpeg(src / f"a{i}_trigger.jpg", content)
+
+    target_contents = [
+        b"\xff\xd8\xff\xe0" + bytes([0xB0 + i]) * 16 + b"\xff\xd9" for i in range(3)
+    ]
+    good_paths: list[Path] = []
+    for i, content in enumerate(target_contents):
+        good_path = _make_jpeg(
+            src / f"b{2 * i}_good.jpg",
+            b"\xff\xd8\xff\xe0" + bytes([0xC0 + i]) * 16 + b"\xff\xd9",
+        )
+        good_paths.append(good_path)
+        _make_jpeg(src / f"b{2 * i + 1}_target.jpg", content)
+    final_good = _make_jpeg(
+        src / "b6_good.jpg", b"\xff\xd8\xff\xe0" + b"\xcf" * 16 + b"\xff\xd9"
+    )
+    good_paths.append(final_good)
+
+    classifier = _FailsForContent(set(trigger_contents) | set(target_contents))
+    # backoff_base=0.0 means the breaker's probe wait is always 0, so the
+    # test does not need to fake real elapsed time to reach a half-open
+    # probe -- only `sleep`/`stop_event` need faking, to bound the loop.
+    breaker = CircuitBreaker(trip_threshold=2, backoff_base=0.0, now=lambda: 0.0)
+    pipeline = Pipeline(src, organized_dir, catalog)
+
+    stop_event = threading.Event()
+    passes = {"n": 0}
+
+    def fake_sleep(_seconds: float) -> bool:
+        passes["n"] += 1
+        if passes["n"] >= 10:
+            stop_event.set()
+        return False
+
+    # Pre-fix, this scenario is a genuine infinite loop: with the offset
+    # stuck at 0, every half-open probe re-hits the trigger pair's first
+    # file, reopens on that single failure, and `continue`s straight back
+    # to the top without ever calling `sleep` -- so `fake_sleep`'s own
+    # pass-count cap is never reached either. A wall-clock watchdog is the
+    # only thing that can end that loop, which is exactly why this
+    # regression matters: nothing internal to the loop bounds it.
+    watchdog = threading.Timer(5.0, stop_event.set)
+    watchdog.start()
+    try:
+        watch(
+            pipeline=pipeline,
+            catalog=catalog,
+            source=src,
+            interval=0.0,
+            stop_event=stop_event,
+            sleep=fake_sleep,
+            classifier=classifier,
+            breaker=breaker,
+            poison_max_fails=1,
+        )
+    finally:
+        watchdog.cancel()
+
+    # The good files were never poison and must not be held hostage by the
+    # trigger cluster ahead of them in id order.
+    for good_path in good_paths:
+        digest = compute_sha256_b64url(good_path)
+        row = catalog.get_by_sha256(digest)
+        assert row is not None
+        assert row["enriched_at"] is not None, (
+            f"{good_path.name} should have been enriched"
+        )
+
+    # The target poison files -- distinct from the un-quarantinable trigger
+    # pair -- must eventually reach quarantine: they can only do so by
+    # failing during a pass that also has a success, which requires
+    # enrichment to make it past the head cluster at all.
+    for i in range(3):
+        target = src / f"b{2 * i + 1}_target.jpg"
+        assert catalog.is_quarantined(
+            str(target), target.stat().st_size, target.stat().st_mtime_ns
+        ), f"{target.name} should have been quarantined"
 
 
 def test_quarantine_copies_to_dir_when_set(

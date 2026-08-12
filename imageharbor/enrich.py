@@ -56,12 +56,16 @@ def enrich_library(
     write_sidecars: bool = False,
     breaker: CircuitBreaker | None = None,
     limit: int | None = None,
+    offset: int = 0,
     reclassify: bool = False,
 ) -> EnrichStats:
     """Describe and classify organized images that have not been enriched yet.
 
     When a *breaker* is supplied, a systemic run of failures trips it and
-    aborts the pass -- continuing would only churn a dead backend.
+    aborts the pass -- continuing would only churn a dead backend. *offset*
+    is passed straight through to `catalog.iter_unenriched`; the watcher uses
+    it to rotate a half-open probe past a stuck head cluster (see
+    `watcher.watch`).
     """
     stats = EnrichStats()
     taxonomy = Taxonomy(catalog)
@@ -72,11 +76,18 @@ def enrich_library(
         # guard exists precisely because Path(None) raises TypeError. --reclassify
         # walks the WHOLE catalog, so it must re-apply that guard itself rather
         # than rely on today's single insert path always populating the column.
+        #
+        # offset is deliberately ignored here: it exists only to let the
+        # watcher's half-open probe skip past a poison cluster stuck at the
+        # head of iter_unenriched's queue. --reclassify walks the whole
+        # catalog on an explicit, one-off user request rather than a
+        # recurring probe, so there is no stuck-cluster/livelock condition
+        # for an offset to route around.
         rows = [r for r in catalog.iter_all() if r["organized_path"]]
         if limit is not None:
             rows = rows[:limit]
     else:
-        rows = catalog.iter_unenriched(limit)
+        rows = catalog.iter_unenriched(limit, offset)
 
     classes = [(n.code, n.label) for n in taxonomy.children(None)]
 
