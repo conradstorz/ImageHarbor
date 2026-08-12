@@ -307,6 +307,15 @@ class Catalog:
         One row per distinct source path: this is the many-to-one back-pointer
         set that replaces a single `original_path`. `first_seen_at` is written
         once and never updated.
+
+        `size` and `mtime_ns` are likewise written once. The row is keyed by
+        digest, so its content is fixed by definition -- size is a function of
+        that content and cannot change, and an mtime that moves without the
+        bytes moving is metadata noise (a touch, a backup tool, a CIFS
+        remount). Overwriting the stats on re-observation would let that noise
+        silently lift a quarantine, because `iter_unenriched` correlates the
+        exclusion on exactly this `(path, size, mtime_ns)` triple. Only
+        `last_seen_at` moves.
         """
         now = _now_iso()
         self._conn.execute(
@@ -315,8 +324,6 @@ class Catalog:
                 sha256_b64url, source_path, size, mtime_ns, first_seen_at, last_seen_at
             ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(sha256_b64url, source_path) DO UPDATE SET
-                size = excluded.size,
-                mtime_ns = excluded.mtime_ns,
                 last_seen_at = excluded.last_seen_at
             """,
             (sha256_b64url, source_path, size, mtime_ns, now, now),

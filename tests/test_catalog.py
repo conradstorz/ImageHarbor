@@ -398,6 +398,45 @@ def test_iter_unenriched_excludes_content_quarantined_via_any_source(tmp_path):
         assert cat.iter_unenriched() == []
 
 
+def test_quarantine_survives_a_metadata_only_mtime_change(tmp_path):
+    """A touch must not lift a quarantine whose bytes never changed.
+
+    iter_unenriched correlates the exclusion on (path, size, mtime_ns). If
+    record_source overwrote those stats on re-observation, a backup tool or a
+    CIFS remount touching the file would silently re-admit known-poison content
+    to the AI queue.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")
+        cat.quarantine_file("/a.jpg")
+        assert cat.iter_unenriched() == []
+
+        # Same bytes, same digest, only the mtime moved.
+        cat.record_source("D1", "/a.jpg", 10, 999)
+
+        assert cat.iter_unenriched() == []
+
+
+def test_record_source_freezes_stats_for_unchanged_content(tmp_path):
+    """The row is keyed by digest, so its stats describe fixed content."""
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        first = cat.sources_for("D1")[0]["last_seen_at"]
+        cat.record_source("D1", "/a.jpg", 10, 999)
+
+        row = cat.sources_for("D1")[0]
+        assert row["mtime_ns"] == 111
+        assert row["size"] == 10
+        assert row["last_seen_at"] >= first
+
+
 def test_new_content_at_a_quarantined_path_re_enters_the_queue(tmp_path):
     """Quarantine is scoped to the exact bytes that failed.
 
