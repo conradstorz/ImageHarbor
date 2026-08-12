@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS photos (
     original_path    TEXT    NOT NULL,
     organized_path   TEXT,
     pcs_version      TEXT    NOT NULL DEFAULT '1',
-    pcs_primary      TEXT    NOT NULL DEFAULT '900',
-    pcs_name         TEXT    NOT NULL DEFAULT 'miscellaneous',
+    pcs_primary      TEXT,
+    pcs_name         TEXT,
     secondary_tags   TEXT    NOT NULL DEFAULT '[]',
     ai_caption       TEXT    NOT NULL DEFAULT '',
     objects          TEXT    NOT NULL DEFAULT '[]',
@@ -235,8 +235,13 @@ class Catalog:
         original_path: str,
         organized_path: str | None = None,
         pcs_version: str = "1",
-        pcs_primary: str = "900",
-        pcs_name: str = "miscellaneous",
+        # NULL (not "900"/"miscellaneous") until the enrichment pass actually
+        # classifies this row -- an unenriched row must not assert a
+        # classification that was never made. `catalog list` renders these
+        # as "—" for rows where enriched_at IS NULL. `mark_enriched`
+        # always supplies real values once classification happens.
+        pcs_primary: str | None = None,
+        pcs_name: str | None = None,
         secondary_tags: list[str] | None = None,
         ai_caption: str = "",
         objects: list[str] | None = None,

@@ -42,6 +42,19 @@ def test_upsert_and_retrieve(catalog: Catalog) -> None:
     assert row["original_path"] == "/photos/beach.jpg"
 
 
+def test_upsert_defaults_pcs_fields_to_null(catalog: Catalog) -> None:
+    """A facts-pass-only row (no pcs_primary/pcs_name given) must not assert
+    a classification that was never made -- an unenriched row's classification
+    columns must be NULL, not the old '900'/'miscellaneous' sentinel."""
+    digest = _fake_digest(2)
+    catalog.upsert(sha256_b64url=digest, original_path="/photos/beach.jpg")
+    row = catalog.get_by_sha256(digest)
+    assert row is not None
+    assert row["pcs_primary"] is None
+    assert row["pcs_name"] is None
+    assert row["enriched_at"] is None
+
+
 def test_upsert_serializes_bytes_in_exif(catalog: Catalog) -> None:
     # Real EXIF tags (e.g. ExifVersion, SceneType, MakerNote) are raw bytes,
     # which are not JSON-serializable. upsert must not crash on them — a single

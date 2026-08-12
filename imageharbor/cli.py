@@ -631,7 +631,11 @@ def catalog_list(catalog_path: Path, limit: int) -> None:
         click.echo("(empty catalog)")
         return
     for row in rows:
-        click.echo(f"{row['sha256_b64url'][:12]}…  {str(row['pcs_primary']):>5}  {row['organized_path']}")
+        # An unenriched row was never classified -- pcs_primary is NULL, and
+        # showing it as a bare "None"/"900" would assert a classification
+        # that was never made. Render "—" for exactly that case.
+        pcs_display = "—" if row["enriched_at"] is None else str(row["pcs_primary"])
+        click.echo(f"{row['sha256_b64url'][:12]}…  {pcs_display:>5}  {row['organized_path']}")
 
 
 @catalog_cmd.command(name="get")

@@ -417,6 +417,42 @@ def test_catalog_list_populated(runner: CliRunner, tmp_path: Path) -> None:
     assert len(lines) == 2
 
 
+def test_catalog_list_shows_dash_for_unenriched_rows(runner: CliRunner, tmp_path: Path) -> None:
+    """A facts-pass-only row was never classified; `catalog list` must not
+    assert a fake "900" classification for it."""
+    src = _source_with_two_jpegs(tmp_path)
+    dest = tmp_path / "organized"
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
+    db = dest / "catalog.db"
+
+    result = runner.invoke(main, ["catalog", "list", "--catalog", str(db)])
+    assert result.exit_code == 0, result.output
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    assert all("—" in ln for ln in lines)
+    assert not any("900" in ln for ln in lines)
+
+
+def test_catalog_list_shows_real_class_for_enriched_rows(runner: CliRunner, tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
+    dest = tmp_path / "organized"
+
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
+    db = dest / "catalog.db"
+    en = runner.invoke(main, ["enrich", "--dest", str(dest), "--catalog", str(db), "--ai", "stub"])
+    assert en.exit_code == 0, en.output
+
+    result = runner.invoke(main, ["catalog", "list", "--catalog", str(db)])
+    assert result.exit_code == 0, result.output
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert "—" not in lines[0]
+
+
 def test_catalog_list_limit(runner: CliRunner, tmp_path: Path) -> None:
     src = _source_with_two_jpegs(tmp_path)
     dest = tmp_path / "organized"
