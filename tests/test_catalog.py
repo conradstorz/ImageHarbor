@@ -364,6 +364,52 @@ def test_iter_unenriched_respects_limit(tmp_path):
         assert len(cat.iter_unenriched(limit=2)) == 2
 
 
+def test_iter_unenriched_excludes_quarantined_content(tmp_path):
+    """Quarantine means "stop asking the model", so the row leaves the queue.
+
+    failed_files is keyed by source path and photos by digest, so this only
+    works if the exclusion joins through the sources table.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D1"}
+
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")
+        cat.quarantine_file("/a.jpg")
+
+        assert cat.iter_unenriched() == []
+
+
+def test_iter_unenriched_excludes_content_quarantined_via_any_source(tmp_path):
+    """Identical bytes fail identically, so one quarantined path condemns them."""
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        cat.record_source("D1", "/b.jpg", 10, 222)
+
+        cat.record_file_failure("/b.jpg", 10, 222, "boom")
+        cat.quarantine_file("/b.jpg")
+
+        assert cat.iter_unenriched() == []
+
+
+def test_a_merely_failing_file_stays_in_the_queue(tmp_path):
+    """Only QUARANTINED content leaves; a file still accruing failures retries."""
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")  # not yet quarantined
+
+        assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D1"}
+
+
 def test_iter_unenriched_skips_rows_with_no_organized_copy(tmp_path):
     """The enrichment pass reads the ORGANIZED copy, not the source.
 

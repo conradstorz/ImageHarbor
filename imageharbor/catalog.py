@@ -372,10 +372,29 @@ class Catalog:
         self._conn.commit()
 
     def iter_unenriched(self, limit: int | None = None) -> list[sqlite3.Row]:
-        """Rows the AI enrichment pass has not yet processed."""
+        """Rows the AI enrichment pass has not yet processed.
+
+        Excludes quarantined content. Quarantine means "stop asking the model
+        about this one", so a quarantined file must leave the queue entirely --
+        otherwise the poison file is re-described on every pass forever, which
+        is the exact cost quarantine exists to eliminate.
+
+        `failed_files` is keyed by source path while `photos` is keyed by
+        digest, so the exclusion joins through `sources`. Content reachable from
+        several paths is quarantined if ANY of them is: identical bytes fail
+        identically, so one quarantined path condemns the content.
+
+        `--reclassify` deliberately bypasses this (it walks `iter_all`): asking
+        again is the whole point of an explicit re-do.
+        """
         sql = (
-            "SELECT * FROM photos WHERE enriched_at IS NULL "
-            "AND organized_path IS NOT NULL ORDER BY id"
+            "SELECT * FROM photos p WHERE p.enriched_at IS NULL "
+            "AND p.organized_path IS NOT NULL "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM sources s"
+            "  JOIN failed_files f ON f.source_path = s.source_path"
+            "  WHERE s.sha256_b64url = p.sha256_b64url AND f.quarantined = 1"
+            ") ORDER BY p.id"
         )
         params: tuple[Any, ...] = ()
         if limit is not None:

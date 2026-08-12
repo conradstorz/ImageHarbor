@@ -165,3 +165,49 @@ def test_quarantined_file_remains_organized_and_verifiable(
     organized_path = Path(row["organized_path"])
     assert organized_path.exists(), "quarantine must not remove the organized copy"
     assert verify_file(organized_path, digest), "organized copy must still verify"
+
+
+def test_a_quarantined_file_is_never_described_again(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """Quarantine means "stop asking the model about this one".
+
+    The bookkeeping (`failed_files.quarantined = 1`) can look right while the
+    model is still being hit every pass -- that is the entire failure mode
+    this test exists to catch, so it asserts on the AI-call count, never on a
+    status/flag.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    bad_bytes = b"\xff\xd8\xff\xe0" + b"\x42" * 16 + b"\xff\xd9"
+    bad = _make_jpeg(src / "bad.jpg", bad_bytes)
+    breaker = _fresh_breaker()
+
+    calls: list[str] = []
+
+    class Counting(_FailsForContent):
+        """Wraps _FailsForContent to record a call only when it is actually
+        asked about the poison content -- new good files introduced on the
+        final pass must not be able to pollute the count."""
+        def describe(self, image_path, exif_data=None):
+            if image_path.read_bytes() in self._bad:
+                calls.append(image_path.name)
+            return super().describe(image_path, exif_data)
+
+    classifier = Counting({bad_bytes})
+
+    # Drive passes until bad.jpg is quarantined (poison_max_fails=3).
+    for i in range(3):
+        _make_jpeg(src / f"good_{i}.jpg", b"\xff\xd8\xff\xe0" + bytes([i + 1]) * 16 + b"\xff\xd9")
+        run_once(src, organized_dir, catalog, classifier=classifier, breaker=breaker,
+                  poison_max_fails=3)
+    assert catalog.is_quarantined(str(bad), bad.stat().st_size, bad.stat().st_mtime_ns)
+    # Sanity: it really was being described (and failing) on every pass so far,
+    # so a flat "still zero" count below wouldn't just mean the double is unused.
+    assert len(calls) == 3
+
+    before = len(calls)
+    _make_jpeg(src / "good_extra.jpg", b"\xff\xd8\xff\xe0" + b"\x99" * 16 + b"\xff\xd9")
+    run_once(src, organized_dir, catalog, classifier=classifier, breaker=breaker,
+              poison_max_fails=3)
+    assert len(calls) == before  # not one further AI call for the quarantined file
