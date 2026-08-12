@@ -3201,12 +3201,13 @@ def run_once(
     The facts phase never consults the breaker -- it makes no AI calls, so a
     dead backend has no bearing on whether the library can be organized.
     """
-    pipeline = Pipeline(
-        source, dest, catalog,
-        duplicates_dir=duplicates_dir,
-        write_sidecars=write_sidecars,
-    )
-    facts = pipeline.run(recursive=recursive)
+    # The facts leg MUST go through run_pass, not Pipeline.run(). run_pass
+    # consults catalog.source_is_unchanged (a cheap os.stat) and only calls
+    # process_file for new or changed files. Pipeline.run() re-hashes every file
+    # it walks -- a full read of the whole library on every pass. Over the CIFS
+    # NAS mount this watcher exists to serve, that is the exact cost the module
+    # was written to avoid.
+    facts = run_pass(pipeline, catalog, source, recursive=recursive)
 
     enrich_stats = None
     if enrich_enabled and classifier is not None:
@@ -3222,6 +3223,16 @@ def run_once(
 ```
 
 Rewire the existing `watch` loop to call `run_once` per pass, keep the existing backoff/half-open logic driving the breaker between passes, and update the stop-summary to report facts and enrichment counts separately. Update the `Pipeline(...)` construction anywhere else in the file to drop the `classifier=` argument.
+
+**`run_pass` must stop feeding the circuit breaker.** It currently calls
+`breaker.record_success()` / `record_failure()` from per-file results. That
+wiring existed because the only failures were AI failures. The facts pass has no
+AI, so every error it can now return is an I/O error — a permissions problem, an
+unreadable file, a full disk. Feeding those to the AI breaker would let a
+filesystem fault masquerade as a backend outage and back the watcher off for
+fifteen minutes waiting for a backend that was never sick. Remove the breaker
+calls from `run_pass` entirely; the breaker is now driven solely by
+`enrich_library`.
 
 **Poison quarantine moves to the enrichment phase.** The existing reconciliation
 counted a file toward quarantine when `pipeline.process_file()` returned
