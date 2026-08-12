@@ -1985,6 +1985,22 @@ def test_find_by_digest_locates_a_moved_file(tmp_path):
     assert find_by_digest(tmp_path, _D) == target
 
 
+def test_find_by_digest_ignores_a_sidecar_carrying_the_same_digest(tmp_path):
+    """A sidecar's stem is its image's stem, so it carries the same digest.
+
+    If self-healing returned the sidecar, the catalog would record a .json as
+    the image's organized_path.
+    """
+    img = tmp_path / "2019" / "2019-07" / f"2019-07-04-beach_{_D}.jpg"
+    img.parent.mkdir(parents=True)
+    img.write_bytes(b"content")
+    # Sorts BEFORE the image, so a naive glob would hit it first.
+    sidecar = img.with_name(f"2019-07-04-beach_{_D}.json")
+    sidecar.write_text("{}", encoding="utf-8")
+
+    assert find_by_digest(tmp_path, _D) == img
+
+
 def test_find_by_digest_returns_none_when_absent(tmp_path):
     assert find_by_digest(tmp_path, _D) is None
 
@@ -2036,6 +2052,7 @@ import os
 from pathlib import Path
 
 from .date_resolver import ResolvedDate
+from .discovery import SUPPORTED_EXTENSIONS
 from .filename import build_filename
 from .hashing import extract_digest_from_stem, verify_file
 
@@ -2081,12 +2098,22 @@ def apply_relocation(old_path: Path, new_path: Path) -> None:
 
 
 def find_by_digest(organized_dir: Path, sha256_b64url: str) -> Path | None:
-    """Locate a file anywhere under *organized_dir* by its embedded digest.
+    """Locate an IMAGE anywhere under *organized_dir* by its embedded digest.
 
     This is the self-healing path: content addressing means a file that moved
     is never actually lost.
+
+    Restricted to supported image extensions deliberately. A JSON sidecar's
+    name is its image's stem with ``.json`` substituted, so the sidecar's stem
+    carries the SAME digest. Without this filter, an image that moved while its
+    sidecar stayed behind yields two glob matches, and a stale sidecar can be
+    returned as though it were the organized copy -- after which the catalog
+    records a ``.json`` as the image's path. Results are sorted so the choice is
+    deterministic rather than filesystem-order dependent.
     """
-    for candidate in organized_dir.rglob(f"*{sha256_b64url}.*"):
+    for candidate in sorted(organized_dir.rglob(f"*{sha256_b64url}.*")):
+        if candidate.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
         if candidate.is_file() and extract_digest_from_stem(candidate.stem) == sha256_b64url:
             return candidate
     return None
