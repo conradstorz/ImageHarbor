@@ -110,6 +110,37 @@ def test_mark_duplicate_appends_history(catalog: Catalog) -> None:
     assert any(e.get("event") == "duplicate_detected" for e in history)
 
 
+def test_mark_duplicate_is_a_noop_for_a_repeated_identical_path(catalog: Catalog) -> None:
+    """Re-running `process` against an unchanged source must not grow
+    processing_history without bound: a repeat of the SAME duplicate path
+    right after itself is skipped rather than appended again."""
+    import json
+
+    digest = _fake_digest(21)
+    catalog.upsert(sha256_b64url=digest, original_path="/orig.jpg")
+    catalog.mark_duplicate(digest, "/dup.jpg")
+    catalog.mark_duplicate(digest, "/dup.jpg")
+    catalog.mark_duplicate(digest, "/dup.jpg")
+    row = catalog.get_by_sha256(digest)
+    history = json.loads(row["processing_history"])
+    assert sum(1 for e in history if e.get("event") == "duplicate_detected") == 1
+
+
+def test_mark_duplicate_still_appends_for_a_different_path(catalog: Catalog) -> None:
+    """A genuinely NEW duplicate path must still be recorded even when the
+    most recent entry was also a duplicate_detected event."""
+    import json
+
+    digest = _fake_digest(22)
+    catalog.upsert(sha256_b64url=digest, original_path="/orig.jpg")
+    catalog.mark_duplicate(digest, "/dup1.jpg")
+    catalog.mark_duplicate(digest, "/dup2.jpg")
+    row = catalog.get_by_sha256(digest)
+    history = json.loads(row["processing_history"])
+    dup_paths = [e.get("duplicate_path") for e in history if e.get("event") == "duplicate_detected"]
+    assert dup_paths == ["/dup1.jpg", "/dup2.jpg"]
+
+
 def test_get_by_original_path(catalog: Catalog) -> None:
     digest = _fake_digest(30)
     catalog.upsert(sha256_b64url=digest, original_path="/specific.jpg")

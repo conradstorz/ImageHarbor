@@ -328,13 +328,29 @@ class Catalog:
         return cursor.lastrowid  # type: ignore[return-value]
 
     def mark_duplicate(self, sha256_b64url: str, duplicate_path: str) -> None:
-        """Append a duplicate-detection event to the processing history."""
+        """Append a duplicate-detection event to the processing history.
+
+        A no-op if the most recent entry already records this exact path as
+        a duplicate. `process` is advertised as cheap to re-run, but the
+        pipeline calls `mark_duplicate` on every re-encounter of a known
+        digest -- without this guard, re-running `process` against an
+        unchanged source tree would append an identical entry (only the
+        timestamp differs) and rewrite the whole JSON blob on every single
+        pass, forever, growing `processing_history` without bound.
+        """
         row = self.get_by_sha256(sha256_b64url)
         if row is None:
             return
         history = _from_json(row["processing_history"])
         if not isinstance(history, list):
             history = []
+        if (
+            history
+            and isinstance(history[-1], dict)
+            and history[-1].get("event") == "duplicate_detected"
+            and history[-1].get("duplicate_path") == duplicate_path
+        ):
+            return
         history.append(
             {
                 "event": "duplicate_detected",
