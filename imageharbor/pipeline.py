@@ -1,4 +1,11 @@
-"""Main photo-organization processing pipeline."""
+"""Main photo-organization processing pipeline.
+
+This is the **facts pass**: it hashes, dedups, reads EXIF, resolves a date and
+descriptor from facts alone (never from AI perception), copies, verifies, and
+catalogs. It makes NO AI calls at all -- a run with the AI backend
+permanently offline is a finished run, not a degraded one. A separate
+enrichment pass adds AI descriptions later.
+"""
 
 from __future__ import annotations
 
@@ -8,18 +15,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import concept_map
-from .ai_classifier import AIClassifier, ContentDescription, StubClassifier
+from . import tiers
 from .catalog import Catalog
+from .date_resolver import date_from_row, resolve_date
+from .descriptor import resolve_descriptor
 from .discovery import discover_images
 from .exif_reader import read_exif
-from .filename import generate_filename, normalize_descriptor
 from .hashing import compute_sha256_b64url, verify_file
-from .sidecar import write_sidecar
-from .taxonomy import Taxonomy
+from .relocate import apply_relocation, resolve_organized_path, target_path
+from .sidecar import merge_sidecar, sidecar_path_for
 
 if TYPE_CHECKING:
-    from .circuit_breaker import CircuitBreaker
+    from .date_resolver import ResolvedDate
+    from .descriptor import ResolvedDescriptor
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +78,7 @@ class PipelineStats:
 
 
 class Pipeline:
-    """Deterministic, resumable photo-organization pipeline.
+    """Deterministic, resumable photo-organization pipeline -- the facts pass.
 
     Parameters
     ----------
@@ -80,15 +88,16 @@ class Pipeline:
         Root of the organized library tree.
     catalog:
         Open :class:`~imageharbor.catalog.Catalog` instance.
-    classifier:
-        :class:`~imageharbor.ai_classifier.AIClassifier` implementation.
-        Defaults to :class:`~imageharbor.ai_classifier.StubClassifier`.
     duplicates_dir:
         Where to copy duplicate images. If None, duplicates are skipped.
     write_sidecars:
         Whether to write a JSON sidecar alongside each organized image.
     dry_run:
         When True, no files are written and the catalog is not updated.
+
+    This pass makes no AI calls: it decides placement (date) and naming
+    (descriptor) purely from EXIF and the original filename. A separate
+    enrichment pass adds AI-derived descriptions later.
     """
 
     def __init__(
@@ -96,7 +105,6 @@ class Pipeline:
         source_dir: Path,
         organized_dir: Path,
         catalog: Catalog,
-        classifier: AIClassifier | None = None,
         duplicates_dir: Path | None = None,
         write_sidecars: bool = False,
         dry_run: bool = False,
@@ -104,8 +112,6 @@ class Pipeline:
         self.source_dir = source_dir
         self.organized_dir = organized_dir
         self.catalog = catalog
-        self.classifier: AIClassifier = classifier or StubClassifier()
-        self.taxonomy = Taxonomy(catalog)
         self.duplicates_dir = duplicates_dir
         self.write_sidecars = write_sidecars
         self.dry_run = dry_run
@@ -117,44 +123,22 @@ class Pipeline:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(
-        self, recursive: bool = True, breaker: CircuitBreaker | None = None
-    ) -> PipelineStats:
+    def run(self, recursive: bool = True) -> PipelineStats:
         """Process all images under :attr:`source_dir`.
 
-        When a *breaker* is supplied, each result feeds it; if it trips (a
-        systemic run of AI failures) the run aborts early — the one-shot command
-        has no backoff/retry loop, so continuing would just churn a dead backend.
-        Returns a :class:`PipelineStats` summary.
+        This pass never calls an AI backend, so there is no breaker to feed and
+        no systemic-outage abort: it runs at disk speed and completes.
         """
         stats = PipelineStats()
         self._dry_run_seen.clear()
-        # A dry run must perform ZERO taxonomy writes: skip seeding entirely.
-        if not self.dry_run:
-            self.taxonomy.ensure_seeded()
         for image_path in discover_images(self.source_dir, recursive=recursive):
             result = self._process_one(image_path)
             stats.record(result)
             _log_result(result)
-            if breaker is not None:
-                if result.status == "error":
-                    breaker.record_failure()
-                elif result.status in ("copied", "duplicate"):
-                    breaker.record_success()
-                if breaker.is_open():
-                    logger.error(
-                        "AI backend appears down — aborted after %d consecutive "
-                        "failures (%d processed)",
-                        breaker.trip_threshold,
-                        stats.copied + stats.duplicates,
-                    )
-                    break
         return stats
 
     def process_file(self, image_path: Path) -> ProcessResult:
         """Process a single image file and return its result."""
-        if not self.dry_run:
-            self.taxonomy.ensure_seeded()
         result = self._process_one(image_path)
         _log_result(result)
         return result
@@ -178,17 +162,20 @@ class Pipeline:
     def _do_process(self, source_path: Path) -> ProcessResult:
         # Step 1: hash original
         sha256_b64url = compute_sha256_b64url(source_path)
+        stat = source_path.stat()
 
-        # Step 2: duplicate detection. During a dry run the catalog is never
-        # written, so also treat a digest already seen earlier in this same dry
-        # run as a duplicate (intra-run dedup).
+        # Step 2: duplicate detection. A duplicate still records a back-pointer
+        # -- the same bytes reachable from another path is information, not
+        # noise, and a better-named path can upgrade the file on a later pass.
         if self.catalog.is_known(sha256_b64url) or (
             self.dry_run and sha256_b64url in self._dry_run_seen
         ):
-            existing = self.catalog.get_by_sha256(sha256_b64url)
-            logger.info("Duplicate detected: %s (matches %s)", source_path, existing["organized_path"] if existing else "?")
             if not self.dry_run:
                 self.catalog.mark_duplicate(sha256_b64url, str(source_path))
+                self.catalog.record_source(
+                    sha256_b64url, str(source_path), stat.st_size, stat.st_mtime_ns
+                )
+                self._maybe_upgrade_from_duplicate(source_path, sha256_b64url)
                 if self.duplicates_dir:
                     self._copy_to_duplicates(source_path, sha256_b64url)
             return ProcessResult(
@@ -197,11 +184,6 @@ class Pipeline:
                 status="duplicate",
             )
 
-        # Dry-run short-circuit: report the file as "copied" WITHOUT touching the
-        # taxonomy or invoking the AI classifier. This must happen before EXIF/
-        # classify/resolve so a dry run performs zero taxonomy writes and zero AI
-        # calls. Record the digest for intra-run dedup (a later identical-content
-        # file in the same dry run is reported as a duplicate, not "copied").
         if self.dry_run:
             self._dry_run_seen.add(sha256_b64url)
             return ProcessResult(
@@ -211,48 +193,22 @@ class Pipeline:
                 organized_path=None,
             )
 
-        # Step 3: EXIF
+        # Step 3: EXIF (best effort; returns {} rather than raising)
         exif_data = read_exif(source_path)
 
-        # Step 4: Perception — the AI only describes the image.
-        content = self.classifier.describe(source_path, exif_data)
+        # Step 4: facts -- date decides the folder, descriptor decides the name.
+        date = resolve_date(source_path, exif_data)
+        descriptor = resolve_descriptor(source_path)
 
-        # Step 5: Organization — our code decides the class (concept-map first,
-        # AI fallback). A learned/seed hit is deterministic and network-free; a
-        # genuine miss asks the AI to pick a class and memoizes the answer so the
-        # next identical subject is a deterministic hit.
-        cls = concept_map.class_for(
-            content.primary_subject, content.objects, content.scene, self.catalog
-        )
-        if cls is None:
-            cls = self.classifier.pick_class(content, self._classes())
-            concept_map.remember(self.catalog, content.primary_subject, cls)
-
-        # Step 6: resolve class -> code; primary_subject is the level-2 label
-        # (dedup + optional AI adjudication).
-        pcs_code = self.taxonomy.resolve_or_create(
-            cls, content.primary_subject, adjudicator=self.classifier.adjudicate
-        )
-        node = self.taxonomy.get(pcs_code)
-        pcs_name = node.label if node else content.primary_subject
-
-        # Step 7: generate filename (pcs_code is a string, e.g. "330" or "540~1")
-        descriptor = normalize_descriptor(content.primary_subject)
+        # Step 5: destination
         extension = source_path.suffix.lstrip(".").lower()
-        filename = generate_filename(pcs_code, descriptor, sha256_b64url, extension)
-
-        # Step 8: determine output path from the taxonomy folder tree
-        organized_path = (
-            self.organized_dir / self.taxonomy.folder_path(pcs_code) / filename
+        organized_path = target_path(
+            self.organized_dir, date, descriptor.value, sha256_b64url, extension
         )
 
-        # Step 8: copy
+        # Step 6: copy
         organized_path.parent.mkdir(parents=True, exist_ok=True)
         if organized_path.exists() and verify_file(organized_path, sha256_b64url):
-            # Resumed/idempotent run: the destination already exists and its
-            # bytes verify against the digest. Skip the copy and re-verify and
-            # proceed straight to cataloging. This closes the crash-after-copy-
-            # before-catalog resume gap and avoids blindly overwriting.
             logger.debug(
                 "Destination already present and verified, skipping copy: %s",
                 organized_path,
@@ -260,30 +216,45 @@ class Pipeline:
         else:
             shutil.copy2(str(source_path), str(organized_path))
 
-            # Step 9: verify
+            # Step 7: verify before anything is recorded
             if not verify_file(organized_path, sha256_b64url):
                 organized_path.unlink(missing_ok=True)
                 raise RuntimeError(
                     f"Integrity check failed after copying {source_path} -> {organized_path}"
                 )
 
-        # Step 10: catalog
-        self._update_catalog(
-            source_path=source_path,
-            organized_path=organized_path,
+        # Step 8: catalog
+        self.catalog.upsert(
             sha256_b64url=sha256_b64url,
-            content=content,
-            pcs_code=pcs_code,
-            pcs_name=pcs_name,
-            exif_data=exif_data,
+            original_path=str(source_path),
+            organized_path=str(organized_path),
+            exif=exif_data,
+            date_value=date.date_str,
+            date_tier=date.tier,
+            date_source=date.source,
+            descriptor_value=descriptor.value,
+            descriptor_tier=descriptor.tier,
+            descriptor_source=descriptor.source,
+            processing_history=[
+                {
+                    "event": "facts",
+                    "source": str(source_path),
+                    "destination": str(organized_path),
+                }
+            ],
+        )
+        self.catalog.record_source(
+            sha256_b64url, str(source_path), stat.st_size, stat.st_mtime_ns
         )
 
-        # Step 11: optional sidecar. A sidecar-write failure must NOT fail an
-        # image that is already copied, verified, and catalogued; log and move
-        # on so the result stays "copied".
+        # Step 9: optional sidecar. A sidecar failure must never fail an image
+        # that is already copied, verified, and catalogued.
         if self.write_sidecars:
             try:
-                self._write_sidecar(organized_path, source_path, sha256_b64url, pcs_code, descriptor, content, exif_data)
+                self._write_sidecar(
+                    organized_path, sha256_b64url, stat.st_size, extension,
+                    date, descriptor, exif_data,
+                )
             except Exception:
                 logger.warning(
                     "Failed to write sidecar for %s; image is organized and catalogued",
@@ -298,41 +269,126 @@ class Pipeline:
             organized_path=organized_path,
         )
 
-    def _classes(self) -> list[tuple[str, str]]:
-        """The 9 fixed top-level classes, as (code, label) pairs."""
-        return [(n.code, n.label) for n in self.taxonomy.children(None)]
-
-    def _update_catalog(
-        self,
-        *,
-        source_path: Path,
-        organized_path: Path,
-        sha256_b64url: str,
-        content: ContentDescription,
-        pcs_code: str,
-        pcs_name: str,
-        exif_data: dict[str, Any],
+    def _maybe_upgrade_from_duplicate(
+        self, source_path: Path, sha256_b64url: str
     ) -> None:
-        self.catalog.upsert(
-            sha256_b64url=sha256_b64url,
-            original_path=str(source_path),
-            organized_path=str(organized_path),
-            pcs_primary=pcs_code,
-            pcs_name=pcs_name,
-            secondary_tags=content.tags,
-            ai_caption=content.caption,
-            objects=content.objects,
-            ocr_text=content.ocr_text,
-            exif=exif_data,
-            model_version=content.model_version,
-            processing_history=[
-                {
-                    "event": "processed",
-                    "source": str(source_path),
-                    "destination": str(organized_path),
-                }
-            ],
+        """Re-evaluate a known file's tiers against a newly-seen source path.
+
+        Identical bytes mean identical EXIF, but not identical filenames: the
+        same photo found at a better-named path can supply a date or a
+        descriptor the first copy lacked.
+        """
+        row = self.catalog.get_by_sha256(sha256_b64url)
+        if row is None or not row["organized_path"]:
+            return
+
+        date = resolve_date(source_path, {})
+        descriptor = resolve_descriptor(source_path)
+        old = (row["date_tier"] or 0, row["descriptor_tier"] or 0)
+        new = (max(old[0], date.tier), max(old[1], descriptor.tier))
+        if not tiers.is_upgrade(old, new):
+            return
+
+        recorded = Path(row["organized_path"])
+        actual = resolve_organized_path(self.organized_dir, recorded, sha256_b64url)
+        if actual is None:
+            logger.warning("Cannot upgrade %s: organized file missing", sha256_b64url)
+            return
+
+        # Strict '>' here: is_upgrade fires when EITHER dimension improves, so
+        # the OTHER dimension may merely tie -- and a tie must keep the value
+        # already on record, not be silently overwritten by whatever the new
+        # source path happens to resolve to.
+        best_date = date if date.tier > old[0] else date_from_row(row)
+        best_descriptor = (
+            descriptor.value if descriptor.tier > old[1] else (row["descriptor_value"] or "")
         )
+        proposed = target_path(
+            self.organized_dir, best_date, best_descriptor, sha256_b64url,
+            actual.suffix.lstrip(".").lower(),
+        )
+        try:
+            apply_relocation(actual, proposed)
+        except OSError as exc:
+            logger.warning("Upgrade rename failed for %s: %s", actual.name, exc)
+            return
+
+        # The file has already moved at this point. A failure carrying the
+        # sidecar or updating the catalog must be logged and swallowed here,
+        # not allowed to propagate and turn a correct "duplicate" result into
+        # an "error" while leaving the catalog pointing at a path that no
+        # longer exists (mirrors enrich.py's separation of these steps).
+        try:
+            old_sidecar = sidecar_path_for(actual)
+            if old_sidecar.exists():
+                old_sidecar.replace(sidecar_path_for(proposed))
+        except OSError as exc:
+            logger.warning("Sidecar carry failed for %s: %s", proposed.name, exc)
+
+        try:
+            self.catalog.set_placement(
+                sha256_b64url,
+                organized_path=str(proposed),
+                date_value=best_date.date_str,
+                date_tier=best_date.tier,
+                date_source=best_date.source,
+                descriptor_value=best_descriptor,
+                descriptor_tier=new[1],
+                descriptor_source=(
+                    descriptor.source if descriptor.tier > old[1]
+                    else (row["descriptor_source"] or "none")
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Catalog update failed after upgrading %s: %s", proposed.name, exc,
+                exc_info=True,
+            )
+            return
+        logger.info("Upgraded %s from a better-named duplicate", proposed.name)
+
+        # The sidecar (if any) was carried to the new path above, but merely
+        # renaming it leaves its date/descriptor/sources blocks holding the
+        # PRE-upgrade values -- enrich.py re-merges after a tier-gated
+        # relocation for the same reason; this is that same step for the
+        # duplicate-upgrade path. A failure here must not undo the rename or
+        # catalog update already committed, so it is logged and swallowed.
+        if self.write_sidecars:
+            try:
+                sources = [
+                    {
+                        "path": r["source_path"],
+                        "first_seen": r["first_seen_at"],
+                        "last_seen": r["last_seen_at"],
+                    }
+                    for r in self.catalog.sources_for(sha256_b64url)
+                ]
+                merge_sidecar(
+                    proposed,
+                    {
+                        "sources": sources,
+                        "date": {
+                            "value": best_date.value.isoformat() if best_date.value else None,
+                            "tier": best_date.tier,
+                            "source": best_date.source,
+                        },
+                        "descriptor": {
+                            "value": best_descriptor,
+                            "tier": new[1],
+                            "source": (
+                                descriptor.source if descriptor.tier > old[1]
+                                else (row["descriptor_source"] or "none")
+                            ),
+                        },
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to update sidecar after upgrading %s; file and "
+                    "catalog are already updated",
+                    proposed.name,
+                    exc_info=True,
+                )
 
     def _copy_to_duplicates(self, source_path: Path, sha256_b64url: str) -> None:
         assert self.duplicates_dir is not None
@@ -346,31 +402,43 @@ class Pipeline:
     def _write_sidecar(
         self,
         organized_path: Path,
-        source_path: Path,
         sha256_b64url: str,
-        pcs_code: str,
-        descriptor: str,
-        content: ContentDescription,
+        size: int,
+        extension: str,
+        date: "ResolvedDate",
+        descriptor: "ResolvedDescriptor",
         exif_data: dict[str, Any],
     ) -> None:
-        from .filename import parse_filename
-
-        parsed = parse_filename(organized_path.name)
-        metadata: dict[str, Any] = {
-            "sha256_b64url": sha256_b64url,
-            "original_path": str(source_path),
-            "organized_path": str(organized_path),
-            "pcs_code": parsed["pcs_code"] if parsed else pcs_code,
-            "descriptor": parsed["descriptor"] if parsed else descriptor,
-            "caption": content.caption,
-            "scene": content.scene,
-            "objects": content.objects,
-            "secondary_tags": content.tags,
-            "ocr_text": content.ocr_text,
-            "model_version": content.model_version,
-            "exif": exif_data,
-        }
-        write_sidecar(organized_path, metadata)
+        sources = [
+            {
+                "path": row["source_path"],
+                "first_seen": row["first_seen_at"],
+                "last_seen": row["last_seen_at"],
+            }
+            for row in self.catalog.sources_for(sha256_b64url)
+        ]
+        merge_sidecar(
+            organized_path,
+            {
+                "identity": {
+                    "sha256_b64url": sha256_b64url,
+                    "size": size,
+                    "ext": extension,
+                },
+                "sources": sources,
+                "date": {
+                    "value": date.value.isoformat() if date.value else None,
+                    "tier": date.tier,
+                    "source": date.source,
+                },
+                "descriptor": {
+                    "value": descriptor.value,
+                    "tier": descriptor.tier,
+                    "source": descriptor.source,
+                },
+                "exif": exif_data,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

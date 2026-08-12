@@ -10,6 +10,7 @@ import click
 
 from . import __version__
 from .catalog import Catalog
+from .enrich import enrich_library
 from .hashing import extract_digest_from_stem, verify_pcs_file
 from .pipeline import Pipeline
 
@@ -73,6 +74,28 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     )
 
 
+def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
+    """Refuse to run with --dest nested inside --source.
+
+    `enrich` and the duplicate-upgrade path (`pipeline._maybe_upgrade_from_
+    duplicate`) RENAME files under --dest. If --dest is a subdirectory of
+    --source, those renames would write into the source tree -- directly
+    violating "originals are read-only", the invariant the whole project is
+    built on. Only meaningful when --source is a directory; a single source
+    FILE cannot contain a --dest directory.
+    """
+    if not source.is_dir():
+        return
+    source_resolved = source.resolve()
+    dest_resolved = dest.resolve()
+    if dest_resolved == source_resolved or source_resolved in dest_resolved.parents:
+        raise click.ClickException(
+            f"--dest ({dest}) is inside --source ({source}). Renames performed "
+            "by enrich/watch would then write into the read-only source tree. "
+            "Choose a --dest that is not nested inside --source."
+        )
+
+
 # ---------------------------------------------------------------------------
 # process
 # ---------------------------------------------------------------------------
@@ -118,8 +141,94 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     help="Plan operations without writing any files.",
 )
 @click.option(
+    "--no-recursive",
+    is_flag=True,
+    default=False,
+    help="Do not recurse into sub-directories.",
+)
+def process(
+    source: Path,
+    dest: Path,
+    catalog_path: Path | None,
+    duplicates_dir: Path | None,
+    sidecar: bool,
+    dry_run: bool,
+    no_recursive: bool,
+) -> None:
+    """Discover, hash, copy and catalog photos from SOURCE to DEST.
+
+    This is the facts pass: it makes no AI calls and requires no AI backend
+    to be configured. Run `enrich` afterwards to describe and classify the
+    organized copies.
+    """
+    _guard_dest_not_inside_source(source, dest)
+
+    if catalog_path is None:
+        catalog_path = dest / "catalog.db"
+
+    # In dry-run mode nothing may touch the disk: skip creating the dest
+    # directory and use an in-memory catalog (sqlite3 ":memory:" creates no
+    # file).  The pipeline performs no upserts in dry-run, so it stays empty.
+    if not dry_run:
+        dest.mkdir(parents=True, exist_ok=True)
+
+    catalog_target = Path(":memory:") if dry_run else catalog_path
+
+    with Catalog(catalog_target) as catalog:
+        pipeline = Pipeline(
+            source_dir=source,
+            organized_dir=dest,
+            catalog=catalog,
+            duplicates_dir=duplicates_dir,
+            write_sidecars=sidecar,
+            dry_run=dry_run,
+        )
+        stats = pipeline.run(recursive=not no_recursive)
+
+    # Summary
+    if dry_run:
+        click.echo("[DRY-RUN] No files were written.")
+    click.echo(
+        f"Done. Total={stats.total}  Copied={stats.copied}  "
+        f"Duplicates={stats.duplicates}  Errors={stats.errors}"
+    )
+
+    if stats.errors:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# enrich
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option(
+    "--dest",
+    envvar="IMAGEHARBOR_DEST",
+    required=True,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+@click.option(
+    "--sidecar/--no-sidecar",
+    envvar="IMAGEHARBOR_SIDECAR",
+    default=False,
+    show_default=True,
+    help="Write/update a JSON sidecar alongside each organized image.",
+)
+@click.option(
     "--ai",
     "ai_backend",
+    envvar="IMAGEHARBOR_AI",
     default="stub",
     show_default=True,
     type=click.Choice(["stub", "openai"], case_sensitive=False),
@@ -154,12 +263,6 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     help="API key (or set IMAGEHARBOR_AI_API_KEY / OPENAI_API_KEY).",
 )
 @click.option(
-    "--no-recursive",
-    is_flag=True,
-    default=False,
-    help="Do not recurse into sub-directories.",
-)
-@click.option(
     "--breaker-threshold",
     envvar="IMAGEHARBOR_BREAKER_THRESHOLD",
     default=5,
@@ -167,60 +270,63 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     type=int,
     help="Consecutive AI failures before aborting (0 disables).",
 )
-def process(
-    source: Path,
+@click.option(
+    "--limit",
+    default=None,
+    type=int,
+    help="Enrich at most this many images.",
+)
+@click.option(
+    "--reclassify",
+    is_flag=True,
+    default=False,
+    help="Re-run classification on already-enriched images.",
+)
+def enrich(
     dest: Path,
     catalog_path: Path | None,
-    duplicates_dir: Path | None,
     sidecar: bool,
-    dry_run: bool,
     ai_backend: str,
     ai_base_url: str | None,
     ai_model: str,
     ai_timeout: float,
     openai_key: str | None,
-    no_recursive: bool,
     breaker_threshold: int,
+    limit: int | None,
+    reclassify: bool,
 ) -> None:
-    """Discover, classify, copy and catalog photos from SOURCE to DEST."""
+    """Describe and classify already-organized images in DEST.
+
+    Reads the organized copies, so the original source volume need not be
+    mounted. Safe to interrupt and re-run: a file is only ever renamed when
+    the result is strictly better.
+    """
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
 
     classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
+    breaker = _build_breaker(breaker_threshold, 60.0, 900.0)
 
-    # In dry-run mode nothing may touch the disk: skip creating the dest
-    # directory and use an in-memory catalog (sqlite3 ":memory:" creates no
-    # file).  The pipeline performs no upserts in dry-run, so it stays empty.
-    if not dry_run:
-        dest.mkdir(parents=True, exist_ok=True)
-
-    catalog_target = Path(":memory:") if dry_run else catalog_path
-
-    with Catalog(catalog_target) as catalog:
-        pipeline = Pipeline(
-            source_dir=source,
-            organized_dir=dest,
-            catalog=catalog,
-            classifier=classifier,
-            duplicates_dir=duplicates_dir,
+    with Catalog(catalog_path) as catalog:
+        stats = enrich_library(
+            catalog,
+            dest,
+            classifier,
             write_sidecars=sidecar,
-            dry_run=dry_run,
+            breaker=breaker,
+            limit=limit,
+            reclassify=reclassify,
         )
-        breaker = _build_breaker(breaker_threshold, 60.0, 900.0)
-        stats = pipeline.run(recursive=not no_recursive, breaker=breaker)
 
-    # Summary
-    if dry_run:
-        click.echo("[DRY-RUN] No files were written.")
     click.echo(
-        f"Done. Total={stats.total}  Copied={stats.copied}  "
-        f"Duplicates={stats.duplicates}  Errors={stats.errors}"
+        f"Enriched={stats.enriched}  Renamed={stats.renamed}  "
+        f"Errors={stats.errors}  Total={stats.total}"
     )
 
-    if breaker.is_open():
+    if stats.aborted:
         click.echo(
             f"AI backend appears down — aborted after {breaker.trip_threshold} "
-            f"consecutive failures ({stats.copied + stats.duplicates} processed).",
+            "consecutive failures.",
             err=True,
         )
         sys.exit(1)
@@ -388,6 +494,8 @@ def watch(
 
     from . import watcher as _watcher
 
+    _guard_dest_not_inside_source(source, dest)
+
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
 
@@ -408,7 +516,6 @@ def watch(
             source_dir=source,
             organized_dir=dest,
             catalog=catalog,
-            classifier=classifier,
             duplicates_dir=duplicates_dir,
             write_sidecars=sidecar,
         )
@@ -417,10 +524,10 @@ def watch(
         stats = _watcher.watch(
             pipeline=pipeline,
             catalog=catalog,
-            source=source,
             interval=interval,
             recursive=not no_recursive,
             stop_event=stop_event,
+            classifier=classifier,
             breaker=breaker,
             poison_max_fails=poison_max_fails,
             quarantine_dir=quarantine_dir,
@@ -428,8 +535,11 @@ def watch(
 
     click.echo(
         f"Stopped after {stats.passes} pass(es). "
-        f"Processed={stats.processed} Skipped={stats.skipped_unchanged} "
-        f"Errors={stats.errors} Quarantined={stats.quarantined}"
+        f"Facts[Processed={stats.processed} Skipped={stats.skipped_unchanged} "
+        f"Errors={stats.errors}] "
+        f"Enrich[Enriched={stats.enriched} Renamed={stats.renamed} "
+        f"Errors={stats.enrich_errors}] "
+        f"Quarantined={stats.quarantined}"
     )
 
 
@@ -444,7 +554,12 @@ def watch(
     type=click.Path(exists=True, path_type=Path),
 )
 def verify(path: Path) -> None:
-    """Verify PCS filename integrity for PATH (file or directory)."""
+    """Verify organized-file integrity for PATH (file or directory).
+
+    Every organized file embeds its SHA-256 digest in its filename (the last
+    43 characters of the stem, Base64url-encoded); this re-hashes each file's
+    content and confirms it still matches the digest embedded in its name.
+    """
     from .discovery import SUPPORTED_EXTENSIONS
 
     targets: list[Path]
@@ -463,7 +578,7 @@ def verify(path: Path) -> None:
             continue
         digest = extract_digest_from_stem(target.stem)
         if digest is None:
-            # Not a PCS-named file; skip silently
+            # No embedded digest in this filename; skip silently
             skip_count += 1
             continue
         if verify_pcs_file(target):
@@ -474,11 +589,11 @@ def verify(path: Path) -> None:
             click.echo(f"FAIL {target}", err=True)
 
     click.echo(
-        f"\nVerified {ok_count + fail_count} PCS image(s) "
-        f"({skip_count} non-image/non-PCS skipped): {ok_count} OK, {fail_count} FAILED"
+        f"\nVerified {ok_count + fail_count} organized image(s) "
+        f"({skip_count} non-image/no-digest skipped): {ok_count} OK, {fail_count} FAILED"
     )
     if ok_count + fail_count == 0:
-        click.echo("No PCS-format image files found to verify.", err=True)
+        click.echo("No organized image files (with an embedded digest) found to verify.", err=True)
         sys.exit(1)
     if fail_count:
         sys.exit(1)
@@ -515,7 +630,11 @@ def catalog_list(catalog_path: Path, limit: int) -> None:
         click.echo("(empty catalog)")
         return
     for row in rows:
-        click.echo(f"{row['sha256_b64url'][:12]}…  {str(row['pcs_primary']):>5}  {row['organized_path']}")
+        # An unenriched row was never classified -- pcs_primary is NULL, and
+        # showing it as a bare "None"/"900" would assert a classification
+        # that was never made. Render "—" for exactly that case.
+        pcs_display = "—" if row["enriched_at"] is None else str(row["pcs_primary"])
+        click.echo(f"{row['sha256_b64url'][:12]}…  {pcs_display:>5}  {row['organized_path']}")
 
 
 @catalog_cmd.command(name="get")

@@ -154,8 +154,8 @@ def test_process_sidecar_written(runner: CliRunner, tmp_path: Path) -> None:
     assert len(sidecars) == 2
     for s in sidecars:
         data = json.loads(s.read_text(encoding="utf-8"))
-        assert "sha256_b64url" in data
-        assert len(data["sha256_b64url"]) == 43
+        assert "sha256_b64url" in data["identity"]
+        assert len(data["identity"]["sha256_b64url"]) == 43
 
 
 def test_process_no_sidecar_default(runner: CliRunner, tmp_path: Path) -> None:
@@ -213,6 +213,128 @@ def test_process_missing_source_errors(runner: CliRunner, tmp_path: Path) -> Non
     assert result.exit_code != 0
 
 
+def test_process_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -> None:
+    """enrich/watch rename files under --dest; a --dest nested inside
+    --source would put those renames into the read-only source tree."""
+    src = tmp_path / "source"
+    src.mkdir()
+    dest = src / "organized"  # nested inside source
+
+    result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+
+    assert result.exit_code != 0
+    assert "--dest" in result.output and "--source" in result.output
+    assert not dest.exists()  # must fail before writing anything
+
+
+def test_process_rejects_dest_equal_to_source(runner: CliRunner, tmp_path: Path) -> None:
+    src = tmp_path / "source"
+    src.mkdir()
+
+    result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(src)])
+
+    assert result.exit_code != 0
+
+
+def test_process_rejects_dest_inside_source_across_relative_and_absolute(
+    runner: CliRunner, tmp_path: Path, monkeypatch
+) -> None:
+    """The guard must compare resolved paths, not the strings as typed.
+
+    A relative --source and an absolute --dest can name the same tree while
+    sharing no textual prefix, which is exactly the shape a naive string
+    comparison misses.
+    """
+    src = tmp_path / "source"
+    src.mkdir()
+    dest = src / "organized"
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(main, ["process", "--source", "source", "--dest", str(dest)])
+
+    assert result.exit_code != 0
+    assert "--dest" in result.output and "--source" in result.output
+    assert not dest.exists()
+
+
+def test_process_allows_sibling_dest(runner: CliRunner, tmp_path: Path) -> None:
+    """A --dest that merely shares a parent with --source (not nested inside
+    it) must be unaffected by the new guard."""
+    src = _source_with_two_jpegs(tmp_path)
+    dest = tmp_path / "organized"  # sibling of source, not nested inside it
+
+    result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_watch_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -> None:
+    src = tmp_path / "source"
+    src.mkdir()
+    dest = src / "organized"
+
+    # No --stop-after-passes/etc exists, but the guard must fire before the
+    # watch loop is ever entered, so this invocation must return promptly.
+    result = runner.invoke(main, ["watch", "--source", str(src), "--dest", str(dest)])
+
+    assert result.exit_code != 0
+    assert "--dest" in result.output and "--source" in result.output
+    assert not dest.exists()
+
+
+def test_process_no_longer_accepts_ai_flags(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    result = CliRunner().invoke(
+        main, ["process", "--source", str(src), "--dest", str(tmp_path / "d"), "--ai", "stub"]
+    )
+    assert result.exit_code != 0
+    assert "no such option" in result.output.lower()
+
+
+def test_process_organizes_without_any_ai(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
+    dest = tmp_path / "dest"
+
+    result = CliRunner().invoke(
+        main, ["process", "--source", str(src), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    assert (dest / "2019" / "2019-07").exists()
+
+
+# ---------------------------------------------------------------------------
+# enrich
+# ---------------------------------------------------------------------------
+
+
+def test_enrich_command_exists_and_reports(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
+    dest = tmp_path / "dest"
+
+    runner = CliRunner()
+    runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    result = runner.invoke(
+        main, ["enrich", "--dest", str(dest), "--ai", "stub"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "enriched" in result.output.lower()
+
+
+def test_enrich_accepts_limit_and_reclassify(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    result = CliRunner().invoke(
+        main,
+        ["enrich", "--dest", str(dest), "--ai", "stub", "--limit", "1", "--reclassify"],
+    )
+    assert result.exit_code == 0, result.output
+
+
 # ---------------------------------------------------------------------------
 # verify
 # ---------------------------------------------------------------------------
@@ -262,7 +384,7 @@ def test_verify_non_pcs_file_skipped(runner: CliRunner, tmp_path: Path) -> None:
     # No per-file FAIL line (the summary word "FAILED" does not count).
     assert not any(ln.startswith("FAIL ") for ln in result.output.splitlines())
     assert "0 OK, 0 FAILED" in result.output
-    assert "No PCS-format image files found to verify." in result.output
+    assert "No organized image files (with an embedded digest) found to verify." in result.output
 
 
 def test_verify_directory_mixes_ok_and_skip(runner: CliRunner, tmp_path: Path) -> None:
@@ -314,6 +436,42 @@ def test_catalog_list_populated(runner: CliRunner, tmp_path: Path) -> None:
     # Two rows -> two non-empty content lines.
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
     assert len(lines) == 2
+
+
+def test_catalog_list_shows_dash_for_unenriched_rows(runner: CliRunner, tmp_path: Path) -> None:
+    """A facts-pass-only row was never classified; `catalog list` must not
+    assert a fake "900" classification for it."""
+    src = _source_with_two_jpegs(tmp_path)
+    dest = tmp_path / "organized"
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
+    db = dest / "catalog.db"
+
+    result = runner.invoke(main, ["catalog", "list", "--catalog", str(db)])
+    assert result.exit_code == 0, result.output
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    assert all("—" in ln for ln in lines)
+    assert not any("900" in ln for ln in lines)
+
+
+def test_catalog_list_shows_real_class_for_enriched_rows(runner: CliRunner, tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
+    dest = tmp_path / "organized"
+
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
+    db = dest / "catalog.db"
+    en = runner.invoke(main, ["enrich", "--dest", str(dest), "--catalog", str(db), "--ai", "stub"])
+    assert en.exit_code == 0, en.output
+
+    result = runner.invoke(main, ["catalog", "list", "--catalog", str(db)])
+    assert result.exit_code == 0, result.output
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert "—" not in lines[0]
 
 
 def test_catalog_list_limit(runner: CliRunner, tmp_path: Path) -> None:
@@ -383,26 +541,24 @@ def test_catalog_get_missing(runner: CliRunner, tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# process --ai openai (no openai package required)
+# enrich --ai openai (no openai package required)
 # ---------------------------------------------------------------------------
 
 
-def test_process_ai_openai_without_package_fails_gracefully(
+def test_enrich_ai_openai_without_package_fails_gracefully(
     runner: CliRunner, tmp_path: Path
 ) -> None:
     """With --ai openai, if the openai backend can't be constructed (e.g. the
     optional package is unavailable or no key), the run must fail, not crash
     silently.  We only assert a non-zero exit and that no crash produced a
     successful summary."""
-    src = _source_with_two_jpegs(tmp_path)
     dest = tmp_path / "organized"
+    dest.mkdir()
 
     result = runner.invoke(
         main,
         [
-            "process",
-            "--source",
-            str(src),
+            "enrich",
             "--dest",
             str(dest),
             "--ai",
@@ -458,7 +614,10 @@ def test_cli_watch_wires_args(monkeypatch, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert captured["interval"] == 5.0
-    assert captured["source"] == src
+    # `watch` takes no `source` kwarg: the tree to walk is derived from the
+    # pipeline, so that discovery and the pipeline can never disagree.
+    assert "source" not in captured
+    assert captured["pipeline"].source_dir == src
 
 
 # ---------------------------------------------------------------------------
@@ -466,33 +625,16 @@ def test_cli_watch_wires_args(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_run_aborts_on_breaker_trip(tmp_path):
-    from imageharbor.catalog import Catalog
-    from imageharbor.circuit_breaker import CircuitBreaker
-    from imageharbor.pipeline import Pipeline
-
-    src = tmp_path / "src"
-    src.mkdir()
-    for i in range(5):
-        (src / f"img_{i}.jpg").write_bytes(b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
-
-    class _AllFail:
-        def describe(self, image_path, exif_data):
-            raise RuntimeError("down")
-        def adjudicate(self, label, candidates):
-            return None
-        def pick_class(self, content, classes):
-            return "900"
-
-    with Catalog(tmp_path / "cat.db") as cat:
-        pipeline = Pipeline(src, tmp_path / "org", cat, classifier=_AllFail())
-        breaker = CircuitBreaker(trip_threshold=2, now=lambda: 0.0)
-        stats = pipeline.run(breaker=breaker)
-    assert breaker.is_open()
-    assert stats.errors == 2          # aborted after the trip, 3 files untried
+# NOTE: `Pipeline` (the facts pass) no longer accepts a `classifier` and
+# `Pipeline.run()` no longer accepts a `breaker` -- the facts pass makes no
+# AI calls at all now (see imageharbor/pipeline.py). Breaker-trip-aborts-the-
+# pass behavior lives in the enrichment pass and is covered directly by
+# tests/test_enrich.py::test_a_tripped_breaker_aborts_the_pass. What remains
+# here is CLI-level: `enrich` must report and exit non-zero when the breaker
+# trips.
 
 
-def test_process_command_aborts_and_reports_when_backend_down(tmp_path, monkeypatch):
+def test_enrich_command_aborts_and_reports_when_backend_down(tmp_path, monkeypatch):
     from click.testing import CliRunner
 
     from imageharbor.cli import main
@@ -501,6 +643,11 @@ def test_process_command_aborts_and_reports_when_backend_down(tmp_path, monkeypa
     src.mkdir()
     for i in range(4):
         (src / f"img_{i}.jpg").write_bytes(b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
+    dest = tmp_path / "org"
+
+    runner = CliRunner()
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
 
     # Force the stub classifier to fail so the breaker trips.
     from imageharbor.ai_classifier import StubClassifier
@@ -510,11 +657,9 @@ def test_process_command_aborts_and_reports_when_backend_down(tmp_path, monkeypa
 
     monkeypatch.setattr(StubClassifier, "describe", _boom)
 
-    runner = CliRunner()
     result = runner.invoke(
         main,
-        ["process", "--source", str(src), "--dest", str(tmp_path / "org"),
-         "--breaker-threshold", "2"],
+        ["enrich", "--dest", str(dest), "--breaker-threshold", "2"],
     )
     assert result.exit_code == 1
     assert "backend appears down" in result.output.lower()

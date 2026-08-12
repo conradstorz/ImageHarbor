@@ -10,10 +10,11 @@ from pathlib import Path
 # SHA-256 produces 32 bytes → 43 unpadded Base64url characters (always).
 SHA256_B64URL_LEN = 43
 
-# PCS codes are plain integers ("330") or, on taxonomy overflow, a base code
-# with a "~N" suffix ("540~1"). '~' is filesystem-safe and NOT in the
-# base64url alphabet, so the 43-char digest counting-back logic is unaffected.
-_PCS_CODE_RE = re.compile(r"^\d+(~\d+)*$")
+# The digest is unpadded Base64url: exactly 43 characters from the RFC 4648 §5
+# alphabet. Validating the character class is what lets the *prefix* be
+# unconstrained -- the filename grammar allows a bare digest, a date, a
+# descriptor, both, or (for legacy files) a PCS code.
+_B64URL_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
 # ---------------------------------------------------------------------------
@@ -68,38 +69,40 @@ def verify_file(path: Path, expected_b64url: str) -> bool:
 
 
 def extract_digest_from_stem(stem: str) -> str | None:
-    """Extract the Base64url digest from a PCS filename stem.
+    """Extract the Base64url digest from an organized filename stem.
 
-    The stem format is ``<pcs>-<descriptor>_<digest>``.  Because base64url
-    itself may contain ``_`` characters, we locate the separator by counting
-    back exactly :data:`SHA256_B64URL_LEN` characters from the end rather than
-    splitting on the last underscore.
+    The grammar is ``[<date>][-<descriptor>]_<digest>``, where both prefix
+    components are optional -- so a stem may be nothing but the digest itself.
+    Because base64url may contain ``_``, the separator is located by counting
+    back exactly :data:`SHA256_B64URL_LEN` characters from the end of the stem
+    rather than splitting on the last underscore.
 
-    Returns the digest portion (43 chars) or None if the stem does not match.
+    Legacy ``<pcs>-<descriptor>_<digest>`` stems parse unchanged, so files
+    organized by the previous scheme remain verifiable.
+
+    Returns the 43-character digest, or None if the stem does not match.
     """
-    # Minimum viable stem: "<pcs>-<d>_" (at least 4 chars) + 43-char digest.
-    if len(stem) < SHA256_B64URL_LEN + 4:
+    # A stem that is nothing but the digest: Undated/<digest>.jpg
+    if len(stem) == SHA256_B64URL_LEN:
+        return stem if _B64URL_RE.match(stem) else None
+
+    # Otherwise we need at least a one-character prefix plus the separator.
+    if len(stem) < SHA256_B64URL_LEN + 2:
         return None
     sep_idx = len(stem) - SHA256_B64URL_LEN - 1
     if stem[sep_idx] != "_":
         return None
-    prefix = stem[:sep_idx]
-    dash_idx = prefix.find("-")
-    if dash_idx < 0:
+    if not stem[:sep_idx]:
         return None
-    # The part before '-' must be a valid PCS code (ASCII digits, optionally
-    # with '~N' overflow suffixes); after '-' must be a non-empty descriptor.
-    pcs_part = prefix[:dash_idx]
-    if not (pcs_part.isascii() and _PCS_CODE_RE.match(pcs_part)) or not prefix[dash_idx + 1:]:
-        return None
-    return stem[sep_idx + 1 :]
+    digest = stem[sep_idx + 1 :]
+    return digest if _B64URL_RE.match(digest) else None
 
 
 def verify_pcs_file(path: Path) -> bool:
-    """Verify a PCS-named file by extracting its embedded digest.
+    """Verify an organized file by extracting its embedded digest.
 
     Returns True if the file's SHA-256 matches the digest encoded in its name.
-    Returns False if verification fails or the filename is not in PCS format.
+    Returns False if verification fails or the filename is not in organized format.
     """
     digest = extract_digest_from_stem(path.stem)
     if not digest:

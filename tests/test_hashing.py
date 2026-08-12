@@ -123,14 +123,18 @@ def test_extract_digest_from_stem_digest_contains_underscore() -> None:
 
 
 def test_extract_digest_from_stem_too_short() -> None:
-    # Length guard: stem must be at least SHA256_B64URL_LEN + 4 (= 47) chars.
+    # A bare digest must be exactly SHA256_B64URL_LEN (= 43) chars, and a
+    # prefixed stem must be at least SHA256_B64URL_LEN + 2 (= 45) chars (a
+    # one-character prefix plus the '_' separator). This 46-char stem of all
+    # 'a's is long enough to clear that minimum, but there's no '_' at the
+    # expected separator position, so it's still rejected.
     assert extract_digest_from_stem("a" * 46) is None
 
 
 def test_extract_digest_from_stem_prefix_without_dash() -> None:
-    # Separator '_' is present at position -(43+1), but the prefix has no '-'.
+    # With relaxed grammar, a prefix without '-' is now accepted.
     stem = f"nodash_{'A' * 43}"
-    assert extract_digest_from_stem(stem) is None
+    assert extract_digest_from_stem(stem) == "A" * 43
 
 
 def test_extract_digest_from_stem_separator_not_underscore() -> None:
@@ -140,22 +144,21 @@ def test_extract_digest_from_stem_separator_not_underscore() -> None:
 
 
 def test_extract_digest_from_stem_non_numeric_pcs() -> None:
-    # Prefix present, but the part before '-' is not a numeric PCS code.
+    # With relaxed grammar, prefix validation is removed; only digest is validated.
     stem = f"abc-desc_{'A' * 43}"
-    assert extract_digest_from_stem(stem) is None
+    assert extract_digest_from_stem(stem) == "A" * 43
 
 
 def test_extract_digest_from_stem_empty_descriptor() -> None:
-    # Prefix has a numeric PCS code but nothing follows the '-' before '_'.
+    # With relaxed grammar, any non-empty prefix is accepted.
     stem = f"330-_{'A' * 43}"
-    assert extract_digest_from_stem(stem) is None
+    assert extract_digest_from_stem(stem) == "A" * 43
 
 
 def test_extract_digest_from_stem_non_ascii_pcs() -> None:
-    # Arabic-Indic digits satisfy str.isdigit() but are NOT ASCII digits, so
-    # they must be rejected as a PCS code.
+    # With relaxed grammar, any prefix (including non-ASCII) is accepted.
     stem = f"٣٣٠-beach_{'A' * 43}"  # "٣٣٠" == 330 in Arabic-Indic
-    assert extract_digest_from_stem(stem) is None
+    assert extract_digest_from_stem(stem) == "A" * 43
 
 
 def test_extract_digest_accepts_tilde_code() -> None:
@@ -164,8 +167,9 @@ def test_extract_digest_accepts_tilde_code() -> None:
 
 
 def test_extract_digest_rejects_dotted_code() -> None:
+    # With relaxed grammar, dotted codes in prefix are accepted (prefix is unconstrained).
     digest = "A" * 43
-    assert extract_digest_from_stem(f"540.1-holiday_{digest}") is None
+    assert extract_digest_from_stem(f"540.1-holiday_{digest}") == digest
 
 
 # ---------------------------------------------------------------------------
@@ -193,3 +197,50 @@ def test_verify_pcs_file_no_underscore(tmp_path: Path) -> None:
     p = tmp_path / "notavalidname.jpg"
     p.write_bytes(b"data")
     assert verify_pcs_file(p) is False
+
+
+# ---------------------------------------------------------------------------
+# New tests for relaxed digest extraction grammar
+# ---------------------------------------------------------------------------
+
+_D = "qfQ8jnnXIdtn-juMY-1JDqyBLPF6j2MJlbh8sZOIfcI"  # 43 chars, valid base64url
+
+
+def test_extract_accepts_bare_digest_stem():
+    """Undated/<digest>.jpg has no prefix at all."""
+    assert extract_digest_from_stem(_D) == _D
+
+
+def test_extract_accepts_date_and_descriptor():
+    assert extract_digest_from_stem(f"2019-07-04-emmas-graduation_{_D}") == _D
+
+
+def test_extract_accepts_date_only():
+    assert extract_digest_from_stem(f"2019-07-04_{_D}") == _D
+
+
+def test_extract_accepts_descriptor_only():
+    """Undated file that still has a human name."""
+    assert extract_digest_from_stem(f"beach-trip-scan_{_D}") == _D
+
+
+def test_extract_still_accepts_legacy_pcs_names():
+    """Files organized by the old scheme must remain verifiable."""
+    assert extract_digest_from_stem(f"330-beach_{_D}") == _D
+
+
+def test_extract_rejects_non_base64url_tail():
+    bad = "!" * 43
+    assert extract_digest_from_stem(f"2019-07-04_{bad}") is None
+
+
+def test_extract_rejects_empty_prefix():
+    assert extract_digest_from_stem(f"_{_D}") is None
+
+
+def test_extract_rejects_short_stem():
+    assert extract_digest_from_stem("abc") is None
+
+
+def test_extract_rejects_missing_separator():
+    assert extract_digest_from_stem(f"2019-07-04x{_D}") is None

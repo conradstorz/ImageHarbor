@@ -1,5 +1,12 @@
 # Jetson Photo Workflow Roadmap (Rev. 2)
 
+> **Historical document.** The PCS folder tree and PCS-prefixed filenames
+> described below were superseded on 2026-08-11 by the date-derived tree and
+> the `[<date>][-<descriptor>]_<digest>` filename grammar. See
+> `docs/superpowers/specs/2026-08-11-facts-first-pipeline-design.md`. The
+> integrity, immutability, and resumability requirements are unchanged and
+> still authoritative.
+
 ## Vision
 
 Build a deterministic, resumable photo organization system that reads

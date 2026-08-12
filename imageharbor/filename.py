@@ -1,4 +1,4 @@
-"""Deterministic PCS filename generation and parsing."""
+"""Deterministic organized filename generation and parsing."""
 
 from __future__ import annotations
 
@@ -29,7 +29,11 @@ def normalize_descriptor(text: str) -> str:
     * max 30 characters total
     * must not be empty; falls back to ``photo``
     """
-    lowered = text.lower()
+    # Drop apostrophes rather than splitting on them: the generic non-alphanumeric
+    # rule below would turn "Emma's graduation" into "emma-s-graduation", burning
+    # one of only three word slots on a stray "s". U+2019 is the curly apostrophe
+    # macOS and Windows insert automatically.
+    lowered = text.lower().replace("'", "").replace("’", "")
     # Replace any run of non-alphanumeric characters with a single space
     cleaned = _DESCRIPTOR_RE.sub(" ", lowered)
     words = [w for w in cleaned.split() if w][:3]
@@ -42,46 +46,53 @@ def normalize_descriptor(text: str) -> str:
 # Filename generation
 # ---------------------------------------------------------------------------
 
+# A date prefix is exactly YYYY-MM-DD. Anchored so a descriptor that merely
+# starts with digits (e.g. "2019-summer") is not misread as a date.
+_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-(.+))?$")
 
-def generate_filename(
-    pcs_code: str,
-    descriptor: str,
+
+def build_filename(
+    date_str: str | None,
+    descriptor: str | None,
     sha256_b64url: str,
     extension: str,
 ) -> str:
-    """Return a deterministic PCS filename.
+    """Return an organized filename.
 
-    Format: ``<pcs>-<descriptor>_<sha256_b64url>.<ext>``
+    Format: ``[<date>][-<descriptor>]_<digest>.<ext>``.  Both prefix
+    components are optional; with neither, the stem is the bare digest.
 
-    The total length is guaranteed ≤ 100 characters for ALL inputs.  If the
-    descriptor causes the filename to exceed the limit it is silently truncated;
-    if a pathologically long extension still overflows after the descriptor has
-    been shrunk to a single character, the extension itself is truncated.
+    The total length is guaranteed <= 100 characters.  The descriptor is
+    truncated first (the date is never sacrificed, since it must agree with the
+    folder the file lives in); a pathologically long extension is truncated
+    last.
     """
-    # Derive a single, safe extension component: take the part after the last
-    # dot, lowercase it, and keep only [a-z0-9] characters. This sanitises
-    # invalid Windows characters, path separators, and collapses multi-dot
-    # extensions (e.g. "tar.gz" -> "gz").
     ext = re.sub(r"[^a-z0-9]", "", extension.lower().rsplit(".", 1)[-1])
     suffix = f".{ext}" if ext else ""
-    desc = normalize_descriptor(descriptor)
-    name = f"{pcs_code}-{desc}_{sha256_b64url}{suffix}"
+    desc = normalize_descriptor(descriptor) if descriptor else ""
 
-    if len(name) > _MAX_FILENAME_LEN:
-        # Calculate how many characters the descriptor may use
-        overhead = len(f"{pcs_code}-_{sha256_b64url}{suffix}")
-        max_desc = _MAX_FILENAME_LEN - overhead
-        desc = desc[: max(1, max_desc)].rstrip("-") or desc[:1]
-        name = f"{pcs_code}-{desc}_{sha256_b64url}{suffix}"
+    # A date-shaped descriptor with no date supplied would re-parse as a date
+    # the system never established, and would contradict the Undated/ folder the
+    # file lives in. Strip the hyphens so the grammar stays unambiguous.
+    # Reachable in practice: "2019.07.04.jpg" normalizes to "2019-07-04".
+    if date_str is None and _DATE_PREFIX_RE.match(desc):
+        desc = desc.replace("-", "")
+
+    def assemble(d: str) -> str:
+        prefix = "-".join(part for part in (date_str or "", d) if part)
+        return f"{prefix}_{sha256_b64url}{suffix}" if prefix else f"{sha256_b64url}{suffix}"
+
+    name = assemble(desc)
+    if len(name) > _MAX_FILENAME_LEN and desc:
+        overflow = len(name) - _MAX_FILENAME_LEN
+        desc = desc[: max(0, len(desc) - overflow)].rstrip("-")
+        name = assemble(desc)
 
     if len(name) > _MAX_FILENAME_LEN and ext:
-        # Descriptor is already at its minimum (>=1 char) but the extension is
-        # still pushing us over the limit: truncate the extension itself by the
-        # overflow amount and rebuild.
         overflow = len(name) - _MAX_FILENAME_LEN
         ext = ext[: max(0, len(ext) - overflow)]
         suffix = f".{ext}" if ext else ""
-        name = f"{pcs_code}-{desc}_{sha256_b64url}{suffix}"
+        name = assemble(desc)
 
     return name
 
@@ -92,38 +103,41 @@ def generate_filename(
 
 
 class ParsedFilename(TypedDict):
-    pcs_code: str
+    date: str | None
     descriptor: str
     sha256_b64url: str
     extension: str
 
 
 def parse_filename(filename: str) -> ParsedFilename | None:
-    """Parse a PCS filename and return its components, or None on failure.
+    """Parse an organized filename, or return None if it is not one.
 
-    Accepts both bare filenames and full paths.  The digest is located by
-    counting back exactly :data:`~imageharbor.hashing.SHA256_B64URL_LEN`
-    characters from the end of the stem, since base64url may contain ``_``.
+    Accepts bare filenames and full paths.  The digest is located by counting
+    back from the end of the stem (see
+    :func:`~imageharbor.hashing.extract_digest_from_stem`); everything before
+    the separator is split into an optional ``YYYY-MM-DD`` date and an optional
+    descriptor.
     """
     p = Path(filename)
     stem = p.stem
     ext = p.suffix.lstrip(".").lower()
 
-    # Reuse extract_digest_from_stem so parse and extract can never diverge in
-    # what they accept (empty descriptor, non-ASCII/'+' pcs, short stems, etc.).
     digest = extract_digest_from_stem(stem)
     if digest is None:
         return None
 
-    # Recover the prefix "<pcs>-<descriptor>" (everything before "_<digest>").
-    prefix = stem[: len(stem) - SHA256_B64URL_LEN - 1]
-    # Split on the FIRST "-"; both parts are guaranteed valid and non-empty
-    # because extract_digest_from_stem already validated them.
-    pcs_str, descriptor = prefix.split("-", 1)
-    pcs_code = pcs_str  # keep as string; codes may contain '~'
+    # Recover the prefix: everything before "_<digest>", or "" for a bare digest.
+    prefix = "" if len(stem) == SHA256_B64URL_LEN else stem[: len(stem) - SHA256_B64URL_LEN - 1]
+
+    date: str | None = None
+    descriptor = prefix
+    match = _DATE_PREFIX_RE.match(prefix)
+    if match:
+        date = match.group(1)
+        descriptor = match.group(2) or ""
 
     return ParsedFilename(
-        pcs_code=pcs_code,
+        date=date,
         descriptor=descriptor,
         sha256_b64url=digest,
         extension=ext,
