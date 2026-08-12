@@ -213,6 +213,54 @@ def test_process_missing_source_errors(runner: CliRunner, tmp_path: Path) -> Non
     assert result.exit_code != 0
 
 
+def test_process_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -> None:
+    """enrich/watch rename files under --dest; a --dest nested inside
+    --source would put those renames into the read-only source tree."""
+    src = tmp_path / "source"
+    src.mkdir()
+    dest = src / "organized"  # nested inside source
+
+    result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+
+    assert result.exit_code != 0
+    assert "--dest" in result.output and "--source" in result.output
+    assert not dest.exists()  # must fail before writing anything
+
+
+def test_process_rejects_dest_equal_to_source(runner: CliRunner, tmp_path: Path) -> None:
+    src = tmp_path / "source"
+    src.mkdir()
+
+    result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(src)])
+
+    assert result.exit_code != 0
+
+
+def test_process_allows_sibling_dest(runner: CliRunner, tmp_path: Path) -> None:
+    """A --dest that merely shares a parent with --source (not nested inside
+    it) must be unaffected by the new guard."""
+    src = _source_with_two_jpegs(tmp_path)
+    dest = tmp_path / "organized"  # sibling of source, not nested inside it
+
+    result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_watch_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -> None:
+    src = tmp_path / "source"
+    src.mkdir()
+    dest = src / "organized"
+
+    # No --stop-after-passes/etc exists, but the guard must fire before the
+    # watch loop is ever entered, so this invocation must return promptly.
+    result = runner.invoke(main, ["watch", "--source", str(src), "--dest", str(dest)])
+
+    assert result.exit_code != 0
+    assert "--dest" in result.output and "--source" in result.output
+    assert not dest.exists()
+
+
 def test_process_no_longer_accepts_ai_flags(tmp_path):
     src = tmp_path / "src"
     src.mkdir()

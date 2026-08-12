@@ -74,6 +74,28 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     )
 
 
+def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
+    """Refuse to run with --dest nested inside --source.
+
+    `enrich` and the duplicate-upgrade path (`pipeline._maybe_upgrade_from_
+    duplicate`) RENAME files under --dest. If --dest is a subdirectory of
+    --source, those renames would write into the source tree -- directly
+    violating "originals are read-only", the invariant the whole project is
+    built on. Only meaningful when --source is a directory; a single source
+    FILE cannot contain a --dest directory.
+    """
+    if not source.is_dir():
+        return
+    source_resolved = source.resolve()
+    dest_resolved = dest.resolve()
+    if dest_resolved == source_resolved or source_resolved in dest_resolved.parents:
+        raise click.ClickException(
+            f"--dest ({dest}) is inside --source ({source}). Renames performed "
+            "by enrich/watch would then write into the read-only source tree. "
+            "Choose a --dest that is not nested inside --source."
+        )
+
+
 # ---------------------------------------------------------------------------
 # process
 # ---------------------------------------------------------------------------
@@ -139,6 +161,8 @@ def process(
     to be configured. Run `enrich` afterwards to describe and classify the
     organized copies.
     """
+    _guard_dest_not_inside_source(source, dest)
+
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
 
@@ -469,6 +493,8 @@ def watch(
     import threading
 
     from . import watcher as _watcher
+
+    _guard_dest_not_inside_source(source, dest)
 
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
