@@ -176,46 +176,17 @@ def _src_with(tmp_path: Path, n: int) -> Path:
     return src
 
 
-def test_run_pass_aborts_remaining_files_when_breaker_trips(
-    tmp_path: Path, organized_dir: Path, catalog: Catalog
-) -> None:
-    src = _src_with(tmp_path, 5)
-    pipeline = Pipeline(src, organized_dir, catalog, classifier=_AlwaysFails())
-    breaker = CircuitBreaker(trip_threshold=2, now=lambda: 0.0)
-    stats = run_pass(pipeline=pipeline, catalog=catalog, source=src, breaker=breaker)
-    # 2 failures trip the breaker; the pass aborts before the other 3 files.
-    assert stats.errors == 2
-    assert breaker.is_open()
-
-
-def test_run_pass_half_open_failure_tries_only_one_file(
-    tmp_path: Path, organized_dir: Path, catalog: Catalog
-) -> None:
-    src = _src_with(tmp_path, 5)
-    pipeline = Pipeline(src, organized_dir, catalog, classifier=_AlwaysFails())
-    clock = [0.0]
-    breaker = CircuitBreaker(trip_threshold=2, backoff_base=60.0, now=lambda: clock[0])
-    breaker.record_failure(); breaker.record_failure()   # OPEN
-    clock[0] = 60.0
-    breaker.begin_probe()                                  # HALF_OPEN
-    stats = run_pass(pipeline=pipeline, catalog=catalog, source=src, breaker=breaker)
-    assert stats.errors == 1          # only the probe file was tried
-    assert breaker.is_open()          # probe failed -> reopened
-
-
-def test_run_pass_half_open_success_resumes_full_pass(
-    tmp_path: Path, organized_dir: Path, catalog: Catalog
-) -> None:
-    src = _src_with(tmp_path, 3)
-    pipeline = Pipeline(src, organized_dir, catalog)   # StubClassifier: all succeed
-    clock = [0.0]
-    breaker = CircuitBreaker(trip_threshold=2, backoff_base=60.0, now=lambda: clock[0])
-    breaker.record_failure(); breaker.record_failure()
-    clock[0] = 60.0
-    breaker.begin_probe()                               # HALF_OPEN
-    stats = run_pass(pipeline=pipeline, catalog=catalog, source=src, breaker=breaker)
-    assert stats.processed == 3                         # probe closed it, rest ran
-    assert breaker.state.name == "CLOSED"
+# NOTE: run_pass no longer takes a breaker at all (the facts phase makes no
+# AI calls, so there is nothing for it to feed the breaker), so the three
+# tests that used to exercise breaker-tripping/half-open behavior *during the
+# facts pass* (via Pipeline(classifier=_AlwaysFails())) are obsolete -- that
+# mechanism doesn't exist anymore. The equivalent properties now live at the
+# run_once/watch level:
+#   - test_facts_phase_runs_even_when_the_breaker_is_open (below) covers "the
+#     facts phase runs regardless of breaker state".
+#   - test_watch_probe_uses_backoff_not_interval_after_midpass_trip (below,
+#     rewritten) covers "a mid-pass trip still yields a backoff wait, not the
+#     full interval" -- now tripped by the enrichment phase.
 
 
 def test_watch_sleeps_breaker_backoff_when_open(
@@ -244,9 +215,11 @@ def test_watch_probe_uses_backoff_not_interval_after_midpass_trip(
 ) -> None:
     # A pass that trips the breaker mid-run must NOT then sleep the full poll
     # interval; the next wait should be the (short) backoff so the recovery
-    # probe fires promptly.
+    # probe fires promptly. The trip now comes from the ENRICHMENT phase (the
+    # facts phase has no AI to fail), fed via watch()'s classifier= param
+    # rather than through Pipeline (which no longer accepts a classifier).
     src = _src_with(tmp_path, 3)
-    pipeline = Pipeline(src, organized_dir, catalog, classifier=_AlwaysFails())
+    pipeline = Pipeline(src, organized_dir, catalog)
     clock = [1000.0]
     breaker = CircuitBreaker(trip_threshold=2, backoff_base=60.0, now=lambda: clock[0])
     stop = threading.Event()
@@ -259,7 +232,66 @@ def test_watch_probe_uses_backoff_not_interval_after_midpass_trip(
         return True
 
     watch(pipeline=pipeline, catalog=catalog, source=src, interval=300.0,
-          stop_event=stop, sleep=_sleep, breaker=breaker, poison_max_fails=5)
-    # First pass trips (2 fails). The observed wait must be the ~60s backoff,
-    # not the 300s interval.
+          stop_event=stop, sleep=_sleep, classifier=_AlwaysFails(), breaker=breaker,
+          poison_max_fails=5)
+    # Facts organizes all 3 files; enrichment then trips (2 fails) on them.
+    # The observed wait must be the ~60s backoff, not the 300s interval.
     assert slept and abs(slept[0] - 60.0) < 1.0
+
+
+def test_facts_phase_runs_even_when_the_breaker_is_open(tmp_path, monkeypatch):
+    """A dead AI backend must not stop the library being organized."""
+    from imageharbor.catalog import Catalog
+    from imageharbor.circuit_breaker import CircuitBreaker
+    from imageharbor import watcher
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
+    dest = tmp_path / "dest"
+
+    breaker = CircuitBreaker(trip_threshold=1, backoff_base=1.0, backoff_cap=1.0)
+    breaker.record_failure()
+    assert breaker.is_open()
+
+    calls = {"enrich": 0}
+
+    def fake_enrich(*args, **kwargs):
+        calls["enrich"] += 1
+        from imageharbor.enrich import EnrichStats
+
+        return EnrichStats()
+
+    monkeypatch.setattr(watcher, "enrich_library", fake_enrich)
+
+    with Catalog(tmp_path / "c.db") as cat:
+        watcher.run_once(src, dest, cat, classifier=None, breaker=breaker)
+
+    assert (dest / "2019" / "2019-07").exists()
+    assert calls["enrich"] == 0  # breaker open -> enrichment skipped
+
+
+def test_enrich_phase_runs_after_the_facts_phase(tmp_path, monkeypatch):
+    from imageharbor.catalog import Catalog
+    from imageharbor.ai_classifier import StubClassifier
+    from imageharbor import watcher
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
+    dest = tmp_path / "dest"
+
+    order = []
+    real_enrich = watcher.enrich_library
+
+    def tracking_enrich(*args, **kwargs):
+        order.append("enrich")
+        return real_enrich(*args, **kwargs)
+
+    monkeypatch.setattr(watcher, "enrich_library", tracking_enrich)
+
+    with Catalog(tmp_path / "c.db") as cat:
+        watcher.run_once(src, dest, cat, classifier=StubClassifier(), breaker=None)
+
+    assert order == ["enrich"]
+    assert (dest / "2019" / "2019-07").exists()
