@@ -74,6 +74,35 @@ copied wholesale into a fresh catalog before the new `process` run even starts.
 This means enrichment on the rebuilt library reuses prior AI decisions instead of
 re-asking the model for photos it has already classified before.
 
+**Where the catalog actually lives on hpz440.** The commands below write
+`catalog.db` inside the destination directory, which is the right shape for a
+local one-off rebuild. The live hpz440 deployment does **not** do this: its
+catalog is a Docker named volume (`imageharbor-catalog*` → `/data/catalog`)
+precisely because SQLite over a CIFS mount corrupts, and `--dest` is a CIFS
+share. On that host, substitute the volume for every `<dest>/catalog.db` path
+below and pass `--catalog` explicitly (`process` has no `IMAGEHARBOR_CATALOG`
+envvar — only `enrich` and `watch` do). Build the *new* catalog in a **new**
+volume so the pre-redesign one survives as the rollback point.
+
+Two ownership traps when working through containers, both of which surface as a
+bare `unable to open database file` or `Permission denied`:
+
+- A freshly created Docker volume is owned by `root`, but the image runs as
+  `harbor` (uid 1000). `chown -R 1000:1000` the volume before first use.
+- The host account and the container user are different uids (on hpz440,
+  `claude` is 1005 vs `harbor` 1000), and the dest share is mounted
+  `uid=1000,forceuid`. Files the container writes therefore **cannot be deleted
+  from an ssh shell** — run `rm` inside a container that mounts the share
+  instead. This applies to step 7's cleanup as much as to any scratch directory.
+
+**Copy the tables before the first `enrich` run.** A fresh catalog's `taxonomy`
+table is *empty*: seeding happens in `Taxonomy.ensure_seeded`, which `enrich.py`
+calls at the start of an enrichment pass, not when the catalog is opened. That is
+what makes the plain `INSERT` below safe — it would raise a UNIQUE constraint
+error against a pre-seeded table. It also means the copied rows win permanently:
+`ensure_seeded` early-returns once the table is non-empty, so the old (grown)
+taxonomy is preserved rather than overwritten by the 9-class seed.
+
 Create the new destination directory first (an empty `catalog.db` there is fine —
 `Catalog.__init__` creates the schema on open):
 
@@ -125,6 +154,18 @@ Point `process` at the same NAS source used by the old deployment, but the
 **new** destination directory (never overwrite the old one — that is what keeps
 this reversible):
 
+**Choosing the new destination when the dest is a share.** hpz440's dest is the
+whole `Photos-Organized` share, so there is no sibling directory to hold a
+`-v2`. Reusing the share root is safe and is what the 2026-08-12 rebuild did:
+the new date folders (`2001/`…`Undated/`) cannot collide with the old PCS
+folders (`100-people`…`900-miscellaneous`), so both trees coexist as siblings
+and cutover needs no path change. The trade-off is that step 6's `verify` walks
+the old tree too (harmless — legacy names still parse and still verify), and
+step 7 deletes the nine PCS directories rather than one parent. The alternative
+— a `v2/` subdirectory — keeps verify cleanly scoped but bakes `v2` into every
+recorded path permanently, since moving the tree later would strand every
+`organized_path` in the catalog.
+
 ```bash
 uv run imageharbor process \
   --source /mnt/nas/photos \
@@ -153,6 +194,22 @@ Spot-check a handful of files with known dates land in the right `YYYY/YYYY-MM/`
 folder, and that a few deliberately-undated or camera-named files (e.g.
 `IMG_1234.jpg` with no EXIF) land in `Undated/` rather than being guessed into a
 year.
+
+**Expect `Undated/` to be larger than intuition suggests.** A source tree
+organized into year folders does *not* transfer those years: the parent
+directory name is not date evidence, only EXIF and then a date pattern in the
+original filename are (see the date ladder in `date_resolver.py`). A
+`2001/P1010009.JPG` with no EXIF date and no date in its stem lands in
+`Undated/`, by design — asserting a date the file cannot support is the quiet
+corruption the ladder exists to prevent.
+
+Do not extrapolate the rate from one folder. In the 2026-08-12 rebuild the first
+sampled folder ran 27-undated-of-66 (41%), but the full 3,832-file result was
+**420 undated, 11.0%** — EXIF `DateTimeOriginal` covered 2,574 and other EXIF
+date fields another 837. If the real proportion ever is uncomfortable, the fix is
+a new, explicitly-ranked rung in the ladder (below EXIF and filename), not a
+change to placement — and it needs its own spec, because a folder name is weaker
+evidence than either existing rung.
 
 ## 5. Run the enrichment pass
 
@@ -202,6 +259,30 @@ and its catalog:
 ```bash
 rm -rf /mnt/nas/photos-organized   # the OLD tree, not photos-organized-v2
 ```
+
+On hpz440 this must run **inside a container**, because the organized files are
+owned by the container's uid and an ssh shell cannot unlink them (see the
+ownership traps in step 2). With the rebuild sharing the share root, the targets
+are the nine PCS directories, not the share itself:
+
+Dry-run the glob first and read the list before deleting anything:
+
+```bash
+docker run --rm -v /mnt/nas/organized:/data/dest --entrypoint sh imageharbor:latest -c 'for d in /data/dest/[1-9]00-*; do echo "$d"; done'
+```
+
+That must list exactly the nine PCS directories. `[1-9]00-*` cannot match a year
+directory (`2001` has no `00-`), `Undated`, or `#recycle` -- verified against the
+live tree on 2026-08-12. Once the list looks right:
+
+```bash
+docker run --rm -v /mnt/nas/organized:/data/dest --entrypoint sh imageharbor:latest -c 'rm -rf /data/dest/[1-9]00-*'
+```
+
+Leave `#recycle` (the NAS's own trash directory) alone. Verify the date-derived
+tree is still intact afterwards before considering the old catalog volume
+disposable — and keep that volume even then, since it is the only pre-redesign
+record of what was classified.
 
 There is no rush on this step. Disk space is the only cost of leaving the old
 tree in place, and every step above reads the untouched source, so keeping the
