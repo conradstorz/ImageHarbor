@@ -1325,6 +1325,52 @@ def test_iter_unenriched_respects_limit(tmp_path):
         assert len(cat.iter_unenriched(limit=2)) == 2
 
 
+def test_iter_unenriched_excludes_quarantined_content(tmp_path):
+    """Quarantine means "stop asking the model", so the row leaves the queue.
+
+    failed_files is keyed by source path and photos by digest, so this only
+    works if the exclusion joins through the sources table.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D1"}
+
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")
+        cat.quarantine_file("/a.jpg")
+
+        assert cat.iter_unenriched() == []
+
+
+def test_iter_unenriched_excludes_content_quarantined_via_any_source(tmp_path):
+    """Identical bytes fail identically, so one quarantined path condemns them."""
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        cat.record_source("D1", "/b.jpg", 10, 222)
+
+        cat.record_file_failure("/b.jpg", 10, 222, "boom")
+        cat.quarantine_file("/b.jpg")
+
+        assert cat.iter_unenriched() == []
+
+
+def test_a_merely_failing_file_stays_in_the_queue(tmp_path):
+    """Only QUARANTINED content leaves; a file still accruing failures retries."""
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")  # not yet quarantined
+
+        assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D1"}
+
+
 def test_iter_unenriched_skips_rows_with_no_organized_copy(tmp_path):
     """The enrichment pass reads the ORGANIZED copy, not the source.
 
@@ -1534,10 +1580,29 @@ Add these methods after `record_source_seen`:
         self._conn.commit()
 
     def iter_unenriched(self, limit: int | None = None) -> list[sqlite3.Row]:
-        """Rows the AI enrichment pass has not yet processed."""
+        """Rows the AI enrichment pass has not yet processed.
+
+        Excludes quarantined content. Quarantine means "stop asking the model
+        about this one", so a quarantined file must leave the queue entirely --
+        otherwise the poison file is re-described on every pass forever, which
+        is the exact cost quarantine exists to eliminate.
+
+        `failed_files` is keyed by source path while `photos` is keyed by
+        digest, so the exclusion joins through `sources`. Content reachable from
+        several paths is quarantined if ANY of them is: identical bytes fail
+        identically, so one quarantined path condemns the content.
+
+        `--reclassify` deliberately bypasses this (it walks `iter_all`): asking
+        again is the whole point of an explicit re-do.
+        """
         sql = (
-            "SELECT * FROM photos WHERE enriched_at IS NULL "
-            "AND organized_path IS NOT NULL ORDER BY id"
+            "SELECT * FROM photos p WHERE p.enriched_at IS NULL "
+            "AND p.organized_path IS NOT NULL "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM sources s"
+            "  JOIN failed_files f ON f.source_path = s.source_path"
+            "  WHERE s.sha256_b64url = p.sha256_b64url AND f.quarantined = 1"
+            ") ORDER BY p.id"
         )
         params: tuple[Any, ...] = ()
         if limit is not None:
@@ -3269,6 +3334,28 @@ outage never count toward quarantine; that property is unchanged and is the
 reason the reconciliation exists. Add one test asserting a quarantined file is
 still present and verifiable in the organized tree — quarantine must not remove
 or relocate it.
+
+Add one more, asserting quarantine actually **stops the asking**: after a file
+is quarantined, a further pass must make zero `describe()` calls for it. Count
+the calls rather than asserting a status — the bookkeeping can look right while
+the model is still being hit every pass, which is the whole cost quarantine
+exists to eliminate.
+
+```python
+def test_a_quarantined_file_is_never_described_again(tmp_path):
+    """Quarantine means "stop asking the model about this one"."""
+    calls: list[str] = []
+
+    class Counting(_FailsForContent):
+        def describe(self, image_path, exif_data=None):
+            calls.append(image_path.name)
+            return super().describe(image_path, exif_data)
+
+    # ... drive passes until the file is quarantined, then:
+    before = len(calls)
+    watcher.run_once(src, dest, cat, classifier=Counting(...), breaker=breaker)
+    assert len(calls) == before  # not one further AI call
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
