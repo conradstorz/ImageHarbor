@@ -42,8 +42,13 @@ def _json_default(o: Any) -> Any:
 def sidecar_path_for(organized_path: Path) -> Path:
     """Return the sidecar path for *organized_path*.
 
-    Appends ``.json`` to the stem rather than using ``with_suffix``, which
-    would truncate a stem containing dots.
+    Built explicitly from ``.stem`` + ``".json"`` rather than
+    ``with_suffix(".json")``. The two are equivalent in current CPython
+    (``.stem``/``with_suffix`` both operate on only the final suffix, so
+    neither truncates a stem containing dots) -- this form is preferred
+    simply because it states outright what's being built (the sidecar's
+    name), rather than relying on a reader recalling ``with_suffix``'s
+    exact single-suffix semantics.
     """
     return organized_path.with_name(f"{organized_path.stem}.json")
 

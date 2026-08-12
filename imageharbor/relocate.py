@@ -39,6 +39,16 @@ def apply_relocation(old_path: Path, new_path: Path) -> None:
     A destination that already holds byte-identical content is accepted (this
     is the state left by a crash between the rename and the catalog update);
     a destination holding *different* content raises rather than clobbering.
+
+    There is an inherent TOCTOU window between the `new_path.exists()` check
+    above and `os.replace` below: a second writer could create *new_path*
+    in between, and `os.replace` would then silently overwrite it (POSIX
+    `rename(2)`/Windows `MoveFileEx` semantics -- unlike this function's own
+    exists-check branch, the OS call itself does not detect or refuse a
+    conflicting destination). This is accepted, not fixed, for the same
+    reason the project runs single-writer-per-catalog generally: see
+    `docs/deploy-docker.md`'s "Keep only one watcher instance per catalog"
+    note. Under that deployment constraint there is no second writer to race.
     """
     if old_path == new_path:
         return
