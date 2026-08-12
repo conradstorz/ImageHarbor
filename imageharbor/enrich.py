@@ -15,14 +15,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import concept_map, tiers
 from .ai_classifier import AIClassifier
 from .catalog import Catalog
-from .date_resolver import ResolvedDate
+from .date_resolver import date_from_row
 from .filename import normalize_descriptor
 from .relocate import apply_relocation, resolve_organized_path, target_path
 from .sidecar import merge_sidecar, sidecar_path_for
@@ -47,23 +46,6 @@ class EnrichStats:
     # reconciliation: with no AI in the facts pass, this is now the ONLY source
     # of the per-file failure signal quarantine depends on.
     failed: list[str] = field(default_factory=list)
-
-
-def _date_from_row(row) -> ResolvedDate:
-    """Rebuild a ResolvedDate from stored catalog columns."""
-    raw = row["date_value"]
-    value = None
-    if raw:
-        try:
-            value = datetime.strptime(raw, "%Y-%m-%d")
-        except ValueError:
-            logger.warning("Unparseable stored date %r; treating as undated", raw)
-    tier = row["date_tier"] or tiers.DATE_NONE
-    return ResolvedDate(
-        value=value,
-        tier=tier,
-        source=row["date_source"] or tiers.DATE_SOURCE_NAMES[tiers.DATE_NONE],
-    )
 
 
 def enrich_library(
@@ -169,7 +151,7 @@ def enrich_library(
             stats.enriched += 1
 
             # Naming: only if strictly better.
-            date = _date_from_row(row)
+            date = date_from_row(row)
             old = (date.tier, row["descriptor_tier"] or tiers.DESC_NONE)
             new = (date.tier, tiers.DESC_AI_SUBJECT)
             final_path = actual

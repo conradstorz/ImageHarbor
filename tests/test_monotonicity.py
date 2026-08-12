@@ -6,7 +6,12 @@ from imageharbor.ai_classifier import AIClassifier, ContentDescription, StubClas
 from imageharbor.catalog import Catalog
 from imageharbor.enrich import enrich_library
 from imageharbor.pipeline import Pipeline
-from imageharbor.tiers import DESC_HUMAN_FILENAME, DESC_NONE
+from imageharbor.tiers import (
+    DATE_FILENAME_PATTERN,
+    DATE_NONE,
+    DESC_HUMAN_FILENAME,
+    DESC_NONE,
+)
 
 
 class Fixed(StubClassifier):
@@ -45,16 +50,34 @@ def test_facts_then_enrich_reaches_a_fixed_point(tmp_path):
         enrich_library(cat, dest, Fixed("beach"), write_sidecars=True)
         after_first_cycle = _snapshot(dest)
 
-        # Capture the actual file identities (not just the count of names) so
-        # this test would fail if a later cycle silently swapped one file's
-        # content for another's while preserving the set of relative paths.
-        digests_after_first_cycle = {
-            p: p.read_bytes() for p in dest.rglob("*") if p.is_file()
+        # Capture the actual IMAGE bytes at each path (not just the count of
+        # names) so this test would fail if a later cycle silently swapped
+        # one file's content for another's while preserving the set of
+        # relative paths. Sidecars are deliberately excluded here: per
+        # enrich.py, classification is written to the sidecar UNCONDITIONALLY
+        # on every pass (only the filename/catalog rename is gated by
+        # is_upgrade), so a sidecar legitimately records the latest AI
+        # perception (e.g. primary_subject "beach" -> "mountain") even when
+        # nothing about the organized file's placement or name changes.
+        image_bytes_after_first_cycle = {
+            p: p.read_bytes()
+            for p in dest.rglob("*")
+            if p.is_file() and p.suffix != ".json"
         }
 
         for _ in range(3):
             Pipeline(src, dest, cat, write_sidecars=True).run()
-            enrich_library(cat, dest, Fixed("mountain"), write_sidecars=True)
+            # reclassify=True forces every row back through Fixed("mountain")
+            # even though all three are already enriched -- otherwise
+            # iter_unenriched finds nothing to do, Fixed("mountain") is never
+            # called, and this loop would prove only that the facts pass is
+            # idempotent, not that the enrich half converges under a
+            # changing AI answer (the guarantee this test claims to pin).
+            again = enrich_library(
+                cat, dest, Fixed("mountain"), write_sidecars=True, reclassify=True
+            )
+            assert again.total == 3    # the pass genuinely ran on every file
+            assert again.renamed == 0  # and changed nothing: equal tier is a no-op
 
         assert _snapshot(dest) == after_first_cycle
         # The classifier changed subject ("beach" -> "mountain") between
@@ -62,7 +85,7 @@ def test_facts_then_enrich_reaches_a_fixed_point(tmp_path):
         # replace a tier already recorded, and a repeated run at an equal
         # tier is defined to be a no-op -- so file bytes at each path must be
         # byte-for-byte identical to the first cycle, not merely present.
-        for path, content in digests_after_first_cycle.items():
+        for path, content in image_bytes_after_first_cycle.items():
             assert path.read_bytes() == content, f"{path} changed after re-runs"
 
 
@@ -171,3 +194,51 @@ def test_a_better_named_duplicate_upgrades_the_descriptor(tmp_path):
         assert not original_path.exists()
         assert upgraded_path.exists()
         assert upgraded_path.name == f"emmas-graduation_{digest}.jpg"
+
+
+def test_a_tied_descriptor_survives_while_only_the_date_upgrades(tmp_path):
+    """Tie-break regression (Fix Round 1, Critical 2).
+
+    `tiers.is_upgrade` fires when EITHER dimension improves; the OTHER
+    dimension may merely tie. A duplicate that supplies a better date but a
+    descriptor at the SAME tier as the one already on record must adopt the
+    new date while leaving the original descriptor untouched -- a tie is not
+    an upgrade for that dimension. The reviewer reproduced a live bug where a
+    `>=` tie-break let the later, unrelated human filename ("bobs-party-2019")
+    silently replace the correct, already-chosen one ("emmas-graduation").
+    """
+    src = tmp_path / "src"
+    (src / "a").mkdir(parents=True)
+    (src / "b").mkdir(parents=True)
+    # First seen: a human-authored name, no date anywhere in it.
+    (src / "a" / "Emma's graduation.jpg").write_bytes(b"tie-break")
+    dest = tmp_path / "dest"
+
+    with Catalog(tmp_path / "c.db") as cat:
+        first = Pipeline(src, dest, cat).run()
+        digest = first.results[0].sha256_b64url
+        first_row = cat.get_by_sha256(digest)
+        assert first_row["descriptor_tier"] == DESC_HUMAN_FILENAME
+        assert first_row["descriptor_value"] == "emmas-graduation"
+        assert first_row["date_tier"] == DATE_NONE
+
+        # Same bytes, found later at a path that is ALSO human-authored
+        # (same descriptor tier -- a tie) but additionally carries a date
+        # (a strict improvement on the date dimension only).
+        (src / "b" / "Bobs party 2019-07-04.jpg").write_bytes(b"tie-break")
+        Pipeline(src, dest, cat).run()
+
+        upgraded_row = cat.get_by_sha256(digest)
+        # The date dimension strictly improved, so it must be adopted...
+        assert upgraded_row["date_tier"] == DATE_FILENAME_PATTERN
+        assert upgraded_row["date_value"] == "2019-07-04"
+        # ...but the descriptor dimension only tied (30 == 30), so the
+        # ORIGINAL descriptor must survive untouched -- not be overwritten
+        # by the unrelated name "bobs-party-2019" that happened to arrive
+        # alongside the better date.
+        assert upgraded_row["descriptor_tier"] == DESC_HUMAN_FILENAME
+        assert upgraded_row["descriptor_value"] == "emmas-graduation"
+
+        upgraded_path = Path(upgraded_row["organized_path"])
+        assert upgraded_path.exists()
+        assert upgraded_path.name == f"2019-07-04-emmas-graduation_{digest}.jpg"

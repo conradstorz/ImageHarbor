@@ -17,10 +17,9 @@ from typing import TYPE_CHECKING, Any
 
 from . import tiers
 from .catalog import Catalog
-from .date_resolver import resolve_date
+from .date_resolver import date_from_row, resolve_date
 from .descriptor import resolve_descriptor
 from .discovery import discover_images
-from .enrich import _date_from_row
 from .exif_reader import read_exif
 from .hashing import compute_sha256_b64url, verify_file
 from .relocate import apply_relocation, resolve_organized_path, target_path
@@ -296,9 +295,13 @@ class Pipeline:
             logger.warning("Cannot upgrade %s: organized file missing", sha256_b64url)
             return
 
-        best_date = date if date.tier >= old[0] else _date_from_row(row)
+        # Strict '>' here: is_upgrade fires when EITHER dimension improves, so
+        # the OTHER dimension may merely tie -- and a tie must keep the value
+        # already on record, not be silently overwritten by whatever the new
+        # source path happens to resolve to.
+        best_date = date if date.tier > old[0] else date_from_row(row)
         best_descriptor = (
-            descriptor.value if descriptor.tier >= old[1] else (row["descriptor_value"] or "")
+            descriptor.value if descriptor.tier > old[1] else (row["descriptor_value"] or "")
         )
         proposed = target_path(
             self.organized_dir, best_date, best_descriptor, sha256_b64url,
@@ -310,23 +313,37 @@ class Pipeline:
             logger.warning("Upgrade rename failed for %s: %s", actual.name, exc)
             return
 
-        old_sidecar = sidecar_path_for(actual)
-        if old_sidecar.exists():
-            old_sidecar.replace(sidecar_path_for(proposed))
+        # The file has already moved at this point. A failure carrying the
+        # sidecar or updating the catalog must be logged and swallowed here,
+        # not allowed to propagate and turn a correct "duplicate" result into
+        # an "error" while leaving the catalog pointing at a path that no
+        # longer exists (mirrors enrich.py's separation of these steps).
+        try:
+            old_sidecar = sidecar_path_for(actual)
+            if old_sidecar.exists():
+                old_sidecar.replace(sidecar_path_for(proposed))
+        except OSError as exc:
+            logger.warning("Sidecar carry failed for %s: %s", actual.name, exc)
 
-        self.catalog.set_placement(
-            sha256_b64url,
-            organized_path=str(proposed),
-            date_value=best_date.date_str,
-            date_tier=best_date.tier,
-            date_source=best_date.source,
-            descriptor_value=best_descriptor,
-            descriptor_tier=new[1],
-            descriptor_source=(
-                descriptor.source if descriptor.tier >= old[1]
-                else (row["descriptor_source"] or "none")
-            ),
-        )
+        try:
+            self.catalog.set_placement(
+                sha256_b64url,
+                organized_path=str(proposed),
+                date_value=best_date.date_str,
+                date_tier=best_date.tier,
+                date_source=best_date.source,
+                descriptor_value=best_descriptor,
+                descriptor_tier=new[1],
+                descriptor_source=(
+                    descriptor.source if descriptor.tier > old[1]
+                    else (row["descriptor_source"] or "none")
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Catalog update failed after upgrading %s: %s", proposed.name, exc
+            )
+            return
         logger.info("Upgraded %s from a better-named duplicate", proposed.name)
 
     def _copy_to_duplicates(self, source_path: Path, sha256_b64url: str) -> None:

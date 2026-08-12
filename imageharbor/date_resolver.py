@@ -102,6 +102,28 @@ _UNDATED = ResolvedDate(
 )
 
 
+def date_from_row(row: Any) -> ResolvedDate:
+    """Rebuild a :class:`ResolvedDate` from stored catalog columns.
+
+    Shared by the facts pass and the enrichment pass -- both need to compare a
+    freshly-resolved date against the one already on record, and this module
+    is the dependency-light home for that logic (no AI, no catalog import).
+    """
+    raw = row["date_value"]
+    value = None
+    if raw:
+        try:
+            value = datetime.strptime(raw, "%Y-%m-%d")
+        except ValueError:
+            logger.warning("Unparseable stored date %r; treating as undated", raw)
+    tier = row["date_tier"] or tiers.DATE_NONE
+    return ResolvedDate(
+        value=value,
+        tier=tier,
+        source=row["date_source"] or tiers.DATE_SOURCE_NAMES[tiers.DATE_NONE],
+    )
+
+
 def _plausible(dt: datetime) -> bool:
     return _MIN_YEAR <= dt.year <= _MAX_YEAR
 
