@@ -1990,13 +1990,23 @@ def test_find_by_digest_ignores_a_sidecar_carrying_the_same_digest(tmp_path):
 
     If self-healing returned the sidecar, the catalog would record a .json as
     the image's organized_path.
+
+    The stems differ here deliberately, because that is the real scenario: the
+    image was renamed and its sidecar left behind under the OLD name. With
+    IDENTICAL stems this test would be vacuous -- "jpg" sorts before "json", so
+    sorted() alone would pick the image and the test would pass even with the
+    extension filter removed. Here the orphan sorts FIRST, so only the filter
+    can save it.
     """
-    img = tmp_path / "2019" / "2019-07" / f"2019-07-04-beach_{_D}.jpg"
-    img.parent.mkdir(parents=True)
+    root = tmp_path / "2019" / "2019-07"
+    root.mkdir(parents=True)
+    orphan = root / f"aaa-old-name_{_D}.json"
+    orphan.write_text("{}", encoding="utf-8")
+    img = root / f"zzz-new-name_{_D}.jpg"
     img.write_bytes(b"content")
-    # Sorts BEFORE the image, so a naive glob would hit it first.
-    sidecar = img.with_name(f"2019-07-04-beach_{_D}.json")
-    sidecar.write_text("{}", encoding="utf-8")
+
+    # Guards this test against silently becoming vacuous again.
+    assert sorted([orphan, img])[0] == orphan
 
     assert find_by_digest(tmp_path, _D) == img
 
