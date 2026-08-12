@@ -152,7 +152,15 @@ Everything else follows from this single predicate:
   correct a tier-10 filename guess, but two dates of equal rank never swap.
   This is what lets a weak filename-derived date self-correct once real
   evidence arrives; without it a wrong guess would be permanent.
-- `--reclassify` bypasses the predicate for a deliberate re-do.
+- `--reclassify` does **not** bypass the predicate. It bypasses the *work
+  queue* only — `enrich_library` walks `iter_all()` instead of
+  `iter_unenriched()`, so already-enriched rows are re-described and
+  re-recorded (catalog + sidecar) — but `is_upgrade` still gates every
+  rename, so re-classifying an already-enriched photo is a guaranteed
+  rename no-op: the existing row already ties the new AI answer at
+  `DESC_AI_SUBJECT`. (Implemented as such; this note corrects an earlier
+  draft of this design that described `--reclassify` as bypassing the
+  predicate itself — see `tests/test_monotonicity.py`.)
 
 ### What actually triggers a date upgrade
 

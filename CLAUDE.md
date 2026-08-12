@@ -297,7 +297,13 @@ Module responsibilities:
   can therefore never displace a human-authored filename (`DESC_HUMAN_FILENAME`,
   tier 30) — this is enforced structurally by the predicate, not by care at any
   call site. Never add a code path that renames or relocates a file
-  unconditionally; `--reclassify` is the one deliberate, explicit bypass.
+  unconditionally. **`--reclassify` does NOT bypass this predicate** — it only
+  bypasses the *work queue* (`iter_all()` instead of `iter_unenriched()`, so
+  already-enriched rows are revisited); `is_upgrade` still gates the rename for
+  every row it walks, so re-running `--reclassify` on an already-enriched photo
+  re-records classification (catalog + sidecar) but is a guaranteed rename
+  no-op, because the existing row already ties the new answer at
+  `DESC_AI_SUBJECT`. See `tests/test_monotonicity.py` for the pinned behavior.
 - **File mtime must never enter the date ladder.** `date_resolver.py` deliberately
   never reads `stat().st_mtime`: mtime records when a file was copied, not when a
   photo was taken, and asserting a date we can't support is exactly the quiet
