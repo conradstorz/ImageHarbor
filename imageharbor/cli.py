@@ -10,6 +10,7 @@ import click
 
 from . import __version__
 from .catalog import Catalog
+from .enrich import enrich_library
 from .hashing import extract_digest_from_stem, verify_pcs_file
 from .pipeline import Pipeline
 
@@ -118,8 +119,92 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     help="Plan operations without writing any files.",
 )
 @click.option(
+    "--no-recursive",
+    is_flag=True,
+    default=False,
+    help="Do not recurse into sub-directories.",
+)
+def process(
+    source: Path,
+    dest: Path,
+    catalog_path: Path | None,
+    duplicates_dir: Path | None,
+    sidecar: bool,
+    dry_run: bool,
+    no_recursive: bool,
+) -> None:
+    """Discover, hash, copy and catalog photos from SOURCE to DEST.
+
+    This is the facts pass: it makes no AI calls and requires no AI backend
+    to be configured. Run `enrich` afterwards to describe and classify the
+    organized copies.
+    """
+    if catalog_path is None:
+        catalog_path = dest / "catalog.db"
+
+    # In dry-run mode nothing may touch the disk: skip creating the dest
+    # directory and use an in-memory catalog (sqlite3 ":memory:" creates no
+    # file).  The pipeline performs no upserts in dry-run, so it stays empty.
+    if not dry_run:
+        dest.mkdir(parents=True, exist_ok=True)
+
+    catalog_target = Path(":memory:") if dry_run else catalog_path
+
+    with Catalog(catalog_target) as catalog:
+        pipeline = Pipeline(
+            source_dir=source,
+            organized_dir=dest,
+            catalog=catalog,
+            duplicates_dir=duplicates_dir,
+            write_sidecars=sidecar,
+            dry_run=dry_run,
+        )
+        stats = pipeline.run(recursive=not no_recursive)
+
+    # Summary
+    if dry_run:
+        click.echo("[DRY-RUN] No files were written.")
+    click.echo(
+        f"Done. Total={stats.total}  Copied={stats.copied}  "
+        f"Duplicates={stats.duplicates}  Errors={stats.errors}"
+    )
+
+    if stats.errors:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# enrich
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option(
+    "--dest",
+    envvar="IMAGEHARBOR_DEST",
+    required=True,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+@click.option(
+    "--sidecar/--no-sidecar",
+    envvar="IMAGEHARBOR_SIDECAR",
+    default=False,
+    show_default=True,
+    help="Write/update a JSON sidecar alongside each organized image.",
+)
+@click.option(
     "--ai",
     "ai_backend",
+    envvar="IMAGEHARBOR_AI",
     default="stub",
     show_default=True,
     type=click.Choice(["stub", "openai"], case_sensitive=False),
@@ -154,12 +239,6 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     help="API key (or set IMAGEHARBOR_AI_API_KEY / OPENAI_API_KEY).",
 )
 @click.option(
-    "--no-recursive",
-    is_flag=True,
-    default=False,
-    help="Do not recurse into sub-directories.",
-)
-@click.option(
     "--breaker-threshold",
     envvar="IMAGEHARBOR_BREAKER_THRESHOLD",
     default=5,
@@ -167,60 +246,63 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     type=int,
     help="Consecutive AI failures before aborting (0 disables).",
 )
-def process(
-    source: Path,
+@click.option(
+    "--limit",
+    default=None,
+    type=int,
+    help="Enrich at most this many images.",
+)
+@click.option(
+    "--reclassify",
+    is_flag=True,
+    default=False,
+    help="Re-run classification on already-enriched images.",
+)
+def enrich(
     dest: Path,
     catalog_path: Path | None,
-    duplicates_dir: Path | None,
     sidecar: bool,
-    dry_run: bool,
     ai_backend: str,
     ai_base_url: str | None,
     ai_model: str,
     ai_timeout: float,
     openai_key: str | None,
-    no_recursive: bool,
     breaker_threshold: int,
+    limit: int | None,
+    reclassify: bool,
 ) -> None:
-    """Discover, classify, copy and catalog photos from SOURCE to DEST."""
+    """Describe and classify already-organized images in DEST.
+
+    Reads the organized copies, so the original source volume need not be
+    mounted. Safe to interrupt and re-run: a file is only ever renamed when
+    the result is strictly better.
+    """
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
 
     classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
+    breaker = _build_breaker(breaker_threshold, 60.0, 900.0)
 
-    # In dry-run mode nothing may touch the disk: skip creating the dest
-    # directory and use an in-memory catalog (sqlite3 ":memory:" creates no
-    # file).  The pipeline performs no upserts in dry-run, so it stays empty.
-    if not dry_run:
-        dest.mkdir(parents=True, exist_ok=True)
-
-    catalog_target = Path(":memory:") if dry_run else catalog_path
-
-    with Catalog(catalog_target) as catalog:
-        pipeline = Pipeline(
-            source_dir=source,
-            organized_dir=dest,
-            catalog=catalog,
-            classifier=classifier,
-            duplicates_dir=duplicates_dir,
+    with Catalog(catalog_path) as catalog:
+        stats = enrich_library(
+            catalog,
+            dest,
+            classifier,
             write_sidecars=sidecar,
-            dry_run=dry_run,
+            breaker=breaker,
+            limit=limit,
+            reclassify=reclassify,
         )
-        breaker = _build_breaker(breaker_threshold, 60.0, 900.0)
-        stats = pipeline.run(recursive=not no_recursive, breaker=breaker)
 
-    # Summary
-    if dry_run:
-        click.echo("[DRY-RUN] No files were written.")
     click.echo(
-        f"Done. Total={stats.total}  Copied={stats.copied}  "
-        f"Duplicates={stats.duplicates}  Errors={stats.errors}"
+        f"Enriched={stats.enriched}  Renamed={stats.renamed}  "
+        f"Errors={stats.errors}  Total={stats.total}"
     )
 
-    if breaker.is_open():
+    if stats.aborted:
         click.echo(
             f"AI backend appears down — aborted after {breaker.trip_threshold} "
-            f"consecutive failures ({stats.copied + stats.duplicates} processed).",
+            "consecutive failures.",
             err=True,
         )
         sys.exit(1)
@@ -408,7 +490,6 @@ def watch(
             source_dir=source,
             organized_dir=dest,
             catalog=catalog,
-            classifier=classifier,
             duplicates_dir=duplicates_dir,
             write_sidecars=sidecar,
         )
@@ -421,6 +502,7 @@ def watch(
             interval=interval,
             recursive=not no_recursive,
             stop_event=stop_event,
+            classifier=classifier,
             breaker=breaker,
             poison_max_fails=poison_max_fails,
             quarantine_dir=quarantine_dir,
@@ -428,8 +510,11 @@ def watch(
 
     click.echo(
         f"Stopped after {stats.passes} pass(es). "
-        f"Processed={stats.processed} Skipped={stats.skipped_unchanged} "
-        f"Errors={stats.errors} Quarantined={stats.quarantined}"
+        f"Facts[Processed={stats.processed} Skipped={stats.skipped_unchanged} "
+        f"Errors={stats.errors}] "
+        f"Enrich[Enriched={stats.enriched} Renamed={stats.renamed} "
+        f"Errors={stats.enrich_errors}] "
+        f"Quarantined={stats.quarantined}"
     )
 
 

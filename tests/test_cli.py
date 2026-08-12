@@ -154,8 +154,8 @@ def test_process_sidecar_written(runner: CliRunner, tmp_path: Path) -> None:
     assert len(sidecars) == 2
     for s in sidecars:
         data = json.loads(s.read_text(encoding="utf-8"))
-        assert "sha256_b64url" in data
-        assert len(data["sha256_b64url"]) == 43
+        assert "sha256_b64url" in data["identity"]
+        assert len(data["identity"]["sha256_b64url"]) == 43
 
 
 def test_process_no_sidecar_default(runner: CliRunner, tmp_path: Path) -> None:
@@ -211,6 +211,59 @@ def test_process_missing_source_errors(runner: CliRunner, tmp_path: Path) -> Non
     )
     # Click validates existence of --source (exists=True) -> usage error.
     assert result.exit_code != 0
+
+
+def test_process_no_longer_accepts_ai_flags(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    result = CliRunner().invoke(
+        main, ["process", "--source", str(src), "--dest", str(tmp_path / "d"), "--ai", "stub"]
+    )
+    assert result.exit_code != 0
+    assert "no such option" in result.output.lower()
+
+
+def test_process_organizes_without_any_ai(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
+    dest = tmp_path / "dest"
+
+    result = CliRunner().invoke(
+        main, ["process", "--source", str(src), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    assert (dest / "2019" / "2019-07").exists()
+
+
+# ---------------------------------------------------------------------------
+# enrich
+# ---------------------------------------------------------------------------
+
+
+def test_enrich_command_exists_and_reports(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
+    dest = tmp_path / "dest"
+
+    runner = CliRunner()
+    runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    result = runner.invoke(
+        main, ["enrich", "--dest", str(dest), "--ai", "stub"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "enriched" in result.output.lower()
+
+
+def test_enrich_accepts_limit_and_reclassify(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    result = CliRunner().invoke(
+        main,
+        ["enrich", "--dest", str(dest), "--ai", "stub", "--limit", "1", "--reclassify"],
+    )
+    assert result.exit_code == 0, result.output
 
 
 # ---------------------------------------------------------------------------
@@ -383,26 +436,24 @@ def test_catalog_get_missing(runner: CliRunner, tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# process --ai openai (no openai package required)
+# enrich --ai openai (no openai package required)
 # ---------------------------------------------------------------------------
 
 
-def test_process_ai_openai_without_package_fails_gracefully(
+def test_enrich_ai_openai_without_package_fails_gracefully(
     runner: CliRunner, tmp_path: Path
 ) -> None:
     """With --ai openai, if the openai backend can't be constructed (e.g. the
     optional package is unavailable or no key), the run must fail, not crash
     silently.  We only assert a non-zero exit and that no crash produced a
     successful summary."""
-    src = _source_with_two_jpegs(tmp_path)
     dest = tmp_path / "organized"
+    dest.mkdir()
 
     result = runner.invoke(
         main,
         [
-            "process",
-            "--source",
-            str(src),
+            "enrich",
             "--dest",
             str(dest),
             "--ai",
@@ -466,33 +517,16 @@ def test_cli_watch_wires_args(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_run_aborts_on_breaker_trip(tmp_path):
-    from imageharbor.catalog import Catalog
-    from imageharbor.circuit_breaker import CircuitBreaker
-    from imageharbor.pipeline import Pipeline
-
-    src = tmp_path / "src"
-    src.mkdir()
-    for i in range(5):
-        (src / f"img_{i}.jpg").write_bytes(b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
-
-    class _AllFail:
-        def describe(self, image_path, exif_data):
-            raise RuntimeError("down")
-        def adjudicate(self, label, candidates):
-            return None
-        def pick_class(self, content, classes):
-            return "900"
-
-    with Catalog(tmp_path / "cat.db") as cat:
-        pipeline = Pipeline(src, tmp_path / "org", cat, classifier=_AllFail())
-        breaker = CircuitBreaker(trip_threshold=2, now=lambda: 0.0)
-        stats = pipeline.run(breaker=breaker)
-    assert breaker.is_open()
-    assert stats.errors == 2          # aborted after the trip, 3 files untried
+# NOTE: `Pipeline` (the facts pass) no longer accepts a `classifier` and
+# `Pipeline.run()` no longer accepts a `breaker` -- the facts pass makes no
+# AI calls at all now (see imageharbor/pipeline.py). Breaker-trip-aborts-the-
+# pass behavior lives in the enrichment pass and is covered directly by
+# tests/test_enrich.py::test_a_tripped_breaker_aborts_the_pass. What remains
+# here is CLI-level: `enrich` must report and exit non-zero when the breaker
+# trips.
 
 
-def test_process_command_aborts_and_reports_when_backend_down(tmp_path, monkeypatch):
+def test_enrich_command_aborts_and_reports_when_backend_down(tmp_path, monkeypatch):
     from click.testing import CliRunner
 
     from imageharbor.cli import main
@@ -501,6 +535,11 @@ def test_process_command_aborts_and_reports_when_backend_down(tmp_path, monkeypa
     src.mkdir()
     for i in range(4):
         (src / f"img_{i}.jpg").write_bytes(b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
+    dest = tmp_path / "org"
+
+    runner = CliRunner()
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
 
     # Force the stub classifier to fail so the breaker trips.
     from imageharbor.ai_classifier import StubClassifier
@@ -510,11 +549,9 @@ def test_process_command_aborts_and_reports_when_backend_down(tmp_path, monkeypa
 
     monkeypatch.setattr(StubClassifier, "describe", _boom)
 
-    runner = CliRunner()
     result = runner.invoke(
         main,
-        ["process", "--source", str(src), "--dest", str(tmp_path / "org"),
-         "--breaker-threshold", "2"],
+        ["enrich", "--dest", str(dest), "--breaker-threshold", "2"],
     )
     assert result.exit_code == 1
     assert "backend appears down" in result.output.lower()
