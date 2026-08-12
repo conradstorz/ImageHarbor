@@ -214,6 +214,57 @@ def test_a_better_named_duplicate_upgrades_the_descriptor(tmp_path):
         assert upgraded_path.name == f"emmas-graduation_{digest}.jpg"
 
 
+def test_a_duplicate_upgrade_re_merges_the_sidecar(tmp_path):
+    """A duplicate upgrade must not leave the sidecar's date/descriptor blocks
+    holding pre-upgrade values.
+
+    `_maybe_upgrade_from_duplicate` carries the sidecar FILE to the new path
+    (a plain rename), but a rename alone doesn't touch its JSON content --
+    unlike enrich.py, which explicitly re-merges after a tier-gated
+    relocation. Regression test for the equivalent fix on the duplicate-
+    upgrade path.
+    """
+    from imageharbor.sidecar import read_sidecar
+
+    src = tmp_path / "src"
+    (src / "a").mkdir(parents=True)
+    (src / "b").mkdir(parents=True)
+    (src / "a" / "IMG_1234.jpg").write_bytes(b"same")
+    dest = tmp_path / "dest"
+
+    with Catalog(tmp_path / "c.db") as cat:
+        first = Pipeline(src, dest, cat, write_sidecars=True).run()
+        digest = first.results[0].sha256_b64url
+        original_path = Path(cat.get_by_sha256(digest)["organized_path"])
+        original_sidecar = read_sidecar(original_path)
+        assert original_sidecar["descriptor"]["tier"] == DESC_NONE
+        assert original_sidecar["descriptor"]["value"] == ""
+
+        (src / "b" / "Emma's graduation.jpg").write_bytes(b"same")
+        Pipeline(src, dest, cat, write_sidecars=True).run()
+
+        upgraded_row = cat.get_by_sha256(digest)
+        upgraded_path = Path(upgraded_row["organized_path"])
+        assert upgraded_path != original_path
+
+        upgraded_sidecar = read_sidecar(upgraded_path)
+        # The sidecar at the NEW path must reflect the NEW (upgraded) tier
+        # and value, matching what the catalog now records -- not stale
+        # pre-upgrade data merely carried along by the file rename.
+        assert upgraded_sidecar["descriptor"]["tier"] == DESC_HUMAN_FILENAME
+        assert upgraded_sidecar["descriptor"]["value"] == "emmas-graduation"
+        assert upgraded_sidecar["descriptor"]["tier"] == upgraded_row["descriptor_tier"]
+        assert upgraded_sidecar["descriptor"]["value"] == upgraded_row["descriptor_value"]
+        assert upgraded_sidecar["date"]["tier"] == upgraded_row["date_tier"]
+        # Facts recorded by the FIRST pass (identity) must survive the merge.
+        assert upgraded_sidecar["identity"]["sha256_b64url"] == digest
+        # Both source paths must be reflected, not just the triggering one.
+        assert {s["path"] for s in upgraded_sidecar["sources"]} == {
+            str(src / "a" / "IMG_1234.jpg"),
+            str(src / "b" / "Emma's graduation.jpg"),
+        }
+
+
 def test_a_tied_descriptor_survives_while_only_the_date_upgrades(tmp_path):
     """Tie-break regression (Fix Round 1, Critical 2).
 

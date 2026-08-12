@@ -347,6 +347,49 @@ class Pipeline:
             return
         logger.info("Upgraded %s from a better-named duplicate", proposed.name)
 
+        # The sidecar (if any) was carried to the new path above, but merely
+        # renaming it leaves its date/descriptor/sources blocks holding the
+        # PRE-upgrade values -- enrich.py re-merges after a tier-gated
+        # relocation for the same reason; this is that same step for the
+        # duplicate-upgrade path. A failure here must not undo the rename or
+        # catalog update already committed, so it is logged and swallowed.
+        if self.write_sidecars:
+            try:
+                sources = [
+                    {
+                        "path": r["source_path"],
+                        "first_seen": r["first_seen_at"],
+                        "last_seen": r["last_seen_at"],
+                    }
+                    for r in self.catalog.sources_for(sha256_b64url)
+                ]
+                merge_sidecar(
+                    proposed,
+                    {
+                        "sources": sources,
+                        "date": {
+                            "value": best_date.value.isoformat() if best_date.value else None,
+                            "tier": best_date.tier,
+                            "source": best_date.source,
+                        },
+                        "descriptor": {
+                            "value": best_descriptor,
+                            "tier": new[1],
+                            "source": (
+                                descriptor.source if descriptor.tier > old[1]
+                                else (row["descriptor_source"] or "none")
+                            ),
+                        },
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to update sidecar after upgrading %s; file and "
+                    "catalog are already updated",
+                    proposed.name,
+                    exc_info=True,
+                )
+
     def _copy_to_duplicates(self, source_path: Path, sha256_b64url: str) -> None:
         assert self.duplicates_dir is not None
         self.duplicates_dir.mkdir(parents=True, exist_ok=True)
