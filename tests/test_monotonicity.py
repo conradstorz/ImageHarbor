@@ -9,6 +9,7 @@ from imageharbor.pipeline import Pipeline
 from imageharbor.tiers import (
     DATE_FILENAME_PATTERN,
     DATE_NONE,
+    DESC_AI_SUBJECT,
     DESC_HUMAN_FILENAME,
     DESC_NONE,
 )
@@ -311,3 +312,77 @@ def test_a_tied_descriptor_survives_while_only_the_date_upgrades(tmp_path):
         upgraded_path = Path(upgraded_row["organized_path"])
         assert upgraded_path.exists()
         assert upgraded_path.name == f"2019-07-04-emmas-graduation_{digest}.jpg"
+
+
+def test_a_human_named_duplicate_displaces_an_ai_name(tmp_path):
+    """The one cross-pass transition nothing covered: enrichment names a file,
+    then the facts pass finds a better-named duplicate and displaces it.
+
+    Enrichment can only ever reach DESC_AI_SUBJECT (20); a human-authored
+    filename is 30. So a duplicate arriving later under a human name must win --
+    and the classification enrichment recorded must survive the rename.
+    """
+    from imageharbor.sidecar import read_sidecar
+
+    src = tmp_path / "src"
+    # discover_images yields in sorted posix-path order, so "a" (camera-named,
+    # no-op duplicate on the second pass) must sort before "b" (human-named,
+    # the one that triggers the upgrade).
+    (src / "a").mkdir(parents=True)
+    (src / "b").mkdir(parents=True)
+    (src / "a" / "IMG_1234.jpg").write_bytes(b"same-bytes")
+    dest = tmp_path / "dest"
+
+    with Catalog(tmp_path / "c.db") as cat:
+        # 1. Facts pass on the camera-named file alone: no human name, no AI --
+        # descriptor tier must be DESC_NONE.
+        first = Pipeline(src, dest, cat, write_sidecars=True).run()
+        digest = first.results[0].sha256_b64url
+        first_row = cat.get_by_sha256(digest)
+        assert first_row["descriptor_tier"] == DESC_NONE
+
+        # 2. Enrich: the AI names it "beach" -- DESC_AI_SUBJECT, a strict
+        # upgrade over DESC_NONE, so a rename happens.
+        enrich_library(cat, dest, Fixed("beach"), write_sidecars=True)
+        enriched_row = cat.get_by_sha256(digest)
+        assert enriched_row["descriptor_tier"] == DESC_AI_SUBJECT
+        enriched_path = Path(enriched_row["organized_path"])
+        assert enriched_path.name == f"beach_{digest}.jpg"
+        enriched_sidecar = read_sidecar(enriched_path)
+        assert enriched_sidecar["classification"]["primary_subject"] == "beach"
+
+        # 3. Add a duplicate under a human-authored name and re-run the facts
+        # pass. Human filename (30) beats AI subject (20): this must displace
+        # the AI's name, not merely tie or lose to it.
+        (src / "b" / "Emma's graduation.jpg").write_bytes(b"same-bytes")
+        Pipeline(src, dest, cat, write_sidecars=True).run()
+
+        # 4. The upgrade happened: new human-named path, DESC_HUMAN_FILENAME,
+        # old path and old sidecar are both gone.
+        upgraded_row = cat.get_by_sha256(digest)
+        assert upgraded_row["descriptor_tier"] == DESC_HUMAN_FILENAME
+        upgraded_path = Path(upgraded_row["organized_path"])
+        assert upgraded_path.name == f"emmas-graduation_{digest}.jpg"
+        assert not enriched_path.exists()
+        assert upgraded_path.exists()
+        assert not read_sidecar(enriched_path)
+        old_sidecar_path = enriched_path.with_name(f"{enriched_path.stem}.json")
+        assert not old_sidecar_path.exists()
+
+        # 5. Enrichment's classification work survived the rename -- it was
+        # carried and re-merged, not lost.
+        upgraded_sidecar = read_sidecar(upgraded_path)
+        assert upgraded_sidecar["classification"]["primary_subject"] == "beach"
+        assert upgraded_sidecar["descriptor"]["value"] == "emmas-graduation"
+        assert upgraded_sidecar["identity"]["sha256_b64url"] == digest
+
+        # 6. It cannot be clawed back: a different AI answer under
+        # reclassify=True must not displace the now-human-named file. 20 can
+        # never outrank 30.
+        clawback_stats = enrich_library(
+            cat, dest, Fixed("mountain"), write_sidecars=True, reclassify=True
+        )
+        assert clawback_stats.renamed == 0
+        final_row = cat.get_by_sha256(digest)
+        assert Path(final_row["organized_path"]) == upgraded_path
+        assert upgraded_path.exists()
