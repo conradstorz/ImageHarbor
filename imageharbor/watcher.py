@@ -297,7 +297,6 @@ def watch(
     *,
     pipeline: Pipeline,
     catalog: Catalog,
-    source: Path,
     interval: float,
     recursive: bool = True,
     stop_event: threading.Event | None = None,
@@ -317,6 +316,13 @@ def watch(
     Each pass is a full facts-then-enrichment sweep (`run_once`): the facts
     phase always runs; the enrichment phase (and therefore the breaker) is
     skipped while the breaker is OPEN.
+
+    The source tree to walk is taken from ``pipeline.source_dir`` and is
+    deliberately NOT a separate parameter. `run_once` uses its *source*
+    argument only for discovery, while the *pipeline* governs hashing,
+    placement and copying; accepting both here would let a caller point
+    discovery at one tree and the pipeline at another, and the mismatch
+    would be silent. Deriving one from the other makes that unrepresentable.
 
     This loop owns a rotating probe *offset* into `iter_unenriched`'s
     (fixed `ORDER BY p.id`) queue. Without it, a cluster of files that

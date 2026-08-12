@@ -524,7 +524,6 @@ def watch(
         stats = _watcher.watch(
             pipeline=pipeline,
             catalog=catalog,
-            source=source,
             interval=interval,
             recursive=not no_recursive,
             stop_event=stop_event,

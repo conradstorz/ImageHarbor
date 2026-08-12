@@ -614,7 +614,10 @@ def test_cli_watch_wires_args(monkeypatch, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert captured["interval"] == 5.0
-    assert captured["source"] == src
+    # `watch` takes no `source` kwarg: the tree to walk is derived from the
+    # pipeline, so that discovery and the pipeline can never disagree.
+    assert "source" not in captured
+    assert captured["pipeline"].source_dir == src
 
 
 # ---------------------------------------------------------------------------

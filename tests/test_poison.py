@@ -269,7 +269,6 @@ def test_poison_at_the_head_does_not_halt_enrichment(
         watch(
             pipeline=pipeline,
             catalog=catalog,
-            source=src,
             interval=0.0,
             stop_event=stop_event,
             sleep=fake_sleep,

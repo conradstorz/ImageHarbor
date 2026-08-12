@@ -98,7 +98,6 @@ def test_watch_runs_one_pass_then_stops(source_dir: Path, organized_dir: Path, c
     wstats = watch(
         pipeline=pipeline,
         catalog=catalog,
-        source=source_dir,
         interval=1.0,
         stop_event=stop,
         sleep=_sleep,
@@ -155,7 +154,7 @@ def test_watch_exits_immediately_if_stop_already_set(
     pipeline = Pipeline(source_dir, organized_dir, catalog)
     stop = threading.Event()
     stop.set()
-    wstats = watch(pipeline=pipeline, catalog=catalog, source=source_dir, interval=1.0, stop_event=stop)
+    wstats = watch(pipeline=pipeline, catalog=catalog, interval=1.0, stop_event=stop)
     assert wstats.passes == 0
 
 
@@ -206,7 +205,7 @@ def test_watch_sleeps_breaker_backoff_when_open(
         stop.set()                    # exit after first sleep
         return True
 
-    watch(pipeline=pipeline, catalog=catalog, source=src, interval=300.0,
+    watch(pipeline=pipeline, catalog=catalog, interval=300.0,
           stop_event=stop, sleep=_sleep, breaker=breaker)
     assert slept and abs(slept[0] - 60.0) < 1.0   # slept the backoff, not the interval
 
@@ -232,7 +231,7 @@ def test_watch_probe_uses_backoff_not_interval_after_midpass_trip(
         stop.set()             # stop after observing the first between-pass wait
         return True
 
-    watch(pipeline=pipeline, catalog=catalog, source=src, interval=300.0,
+    watch(pipeline=pipeline, catalog=catalog, interval=300.0,
           stop_event=stop, sleep=_sleep, classifier=_AlwaysFails(), breaker=breaker,
           poison_max_fails=5)
     # Facts organizes all 3 files; enrichment then trips (2 fails) on them.
@@ -354,7 +353,6 @@ def test_watch_warns_once_after_many_consecutive_aborted_passes(
         watcher.watch(
             pipeline=pipeline,
             catalog=catalog,
-            source=src,
             interval=0.0,
             stop_event=stop_event,
             classifier=_AlwaysFails(),
