@@ -336,8 +336,9 @@ Module responsibilities:
   queue.** `watcher._reconcile_poison` only counts a failure toward
   `--poison-max-fails` during a *healthy* enrichment pass (>=1 success,
   breaker not tripped this pass) — see `catalog.py`'s `failed_files`
-  description above. `watch()`'s rotating probe offset (see
-  `circuit_breaker.py` entry) lets a half-open probe skip a stuck head
+  description above. `watch()`'s rotating probe offset (implemented in
+  `watcher.py`, using `catalog.iter_unenriched`'s `offset` parameter — the
+  breaker itself is unaware of it) lets a half-open probe skip a stuck head
   cluster and find a working file elsewhere in the queue, so quarantine can
   fire for poison files that have *some* describable file anywhere else in
   `iter_unenriched`. But if the files tripping the breaker are (or become)

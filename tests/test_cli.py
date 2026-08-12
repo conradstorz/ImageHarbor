@@ -236,6 +236,27 @@ def test_process_rejects_dest_equal_to_source(runner: CliRunner, tmp_path: Path)
     assert result.exit_code != 0
 
 
+def test_process_rejects_dest_inside_source_across_relative_and_absolute(
+    runner: CliRunner, tmp_path: Path, monkeypatch
+) -> None:
+    """The guard must compare resolved paths, not the strings as typed.
+
+    A relative --source and an absolute --dest can name the same tree while
+    sharing no textual prefix, which is exactly the shape a naive string
+    comparison misses.
+    """
+    src = tmp_path / "source"
+    src.mkdir()
+    dest = src / "organized"
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(main, ["process", "--source", "source", "--dest", str(dest)])
+
+    assert result.exit_code != 0
+    assert "--dest" in result.output and "--source" in result.output
+    assert not dest.exists()
+
+
 def test_process_allows_sibling_dest(runner: CliRunner, tmp_path: Path) -> None:
     """A --dest that merely shares a parent with --source (not nested inside
     it) must be unaffected by the new guard."""
