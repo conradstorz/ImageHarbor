@@ -2676,6 +2676,80 @@ def test_enrichment_self_heals_a_stale_catalog_path(tmp_path):
     cat.close()
 
 
+def test_self_heal_without_upgrade_carries_the_sidecar(tmp_path):
+    """A stale path repaired at a tier that blocks renaming must keep its sidecar.
+
+    A human-named file cannot be renamed by the AI pass, so it takes the
+    self-heal branch rather than the rename branch. If that branch left the
+    sidecar behind, the merge would rebuild it from an empty base and lose
+    every fact the first pass recorded.
+    """
+    import shutil
+
+    from imageharbor.sidecar import read_sidecar, sidecar_path_for
+
+    cat, dest, result = _facts(tmp_path, "Emma's graduation.jpg")
+    old = result.organized_path
+    assert read_sidecar(old)["identity"]["sha256_b64url"] == result.sha256_b64url
+
+    # Relocate the file and its sidecar is left behind by an external actor.
+    moved = old.parent / f"moved-{old.name}"
+    shutil.move(str(old), str(moved))
+
+    enrich_library(cat, dest, FixedClassifier(), write_sidecars=True)
+
+    healed = Path(cat.get_by_sha256(result.sha256_b64url)["organized_path"])
+    data = read_sidecar(healed)
+    assert data["identity"]["sha256_b64url"] == result.sha256_b64url
+    assert data["descriptor"]["tier"] == tiers.DESC_HUMAN_FILENAME
+    assert data["classification"]["primary_subject"] == "beach"
+    assert not sidecar_path_for(old).exists()
+    cat.close()
+
+
+def test_a_local_failure_does_not_wedge_the_pass(tmp_path):
+    """An exception after perception must not escape or block later rows.
+
+    The queue is ordered by id and a row that raises is never marked enriched
+    or failed, so an escaping exception would crash on the same row forever.
+    """
+    src = _make(tmp_path, "IMG_1.jpg", b"one")
+    (src / "IMG_2.jpg").write_bytes(b"two")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    calls = {"n": 0}
+    real_mark = cat.mark_enriched
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("catalog is busy")
+        return real_mark(*args, **kwargs)
+
+    cat.mark_enriched = flaky
+
+    stats = enrich_library(cat, dest, FixedClassifier())
+
+    assert stats.total == 2
+    assert stats.errors == 1
+    assert stats.enriched == 1
+    assert len(stats.failed) == 1  # the failure is visible to quarantine
+    cat.close()
+
+
+def test_reclassify_skips_rows_with_no_organized_copy(tmp_path):
+    """--reclassify walks the whole catalog, including rows iter_unenriched hides."""
+    cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
+    cat.upsert(sha256_b64url="ORPHAN", original_path="/gone.jpg")
+
+    stats = enrich_library(cat, dest, FixedClassifier(), reclassify=True)
+
+    assert stats.total == 1  # the orphan is skipped, not crashed on
+    cat.close()
+
+
 def test_reclassify_forces_a_second_pass(tmp_path):
     cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
     enrich_library(cat, dest, FixedClassifier(subject="beach"))
@@ -2783,9 +2857,16 @@ def enrich_library(
     taxonomy = Taxonomy(catalog)
     taxonomy.ensure_seeded()
 
-    rows = list(catalog.iter_all()) if reclassify else catalog.iter_unenriched(limit)
-    if reclassify and limit is not None:
-        rows = rows[:limit]
+    if reclassify:
+        # iter_all has no organized_path filter, unlike iter_unenriched -- whose
+        # guard exists precisely because Path(None) raises TypeError. --reclassify
+        # walks the WHOLE catalog, so it must re-apply that guard itself rather
+        # than rely on today's single insert path always populating the column.
+        rows = [r for r in catalog.iter_all() if r["organized_path"]]
+        if limit is not None:
+            rows = rows[:limit]
+    else:
+        rows = catalog.iter_unenriched(limit)
 
     classes = [(n.code, n.label) for n in taxonomy.children(None)]
 
@@ -2821,6 +2902,29 @@ def enrich_library(
 
         if breaker is not None:
             breaker.record_success()
+
+        # INDENT EVERYTHING BELOW, from "Organization:" through the sidecar
+        # merge, into this try block. Everything from here on is LOCAL work --
+        # taxonomy, catalog, filesystem -- and must be isolated per row for two
+        # reasons. First, a failure here is not a backend outage, so it must
+        # never feed the breaker. Second, the queue is ordered by id and a row
+        # that raises is never marked enriched OR failed, so an escaping
+        # exception would crash on the same row every subsequent pass and
+        # permanently block every row behind it. This mirrors
+        # Pipeline._process_one, which wraps its whole per-file body for the
+        # same reason. An escape would also bypass stats.failed entirely,
+        # silently disabling the poison-file quarantine that consumes it.
+        #
+        #     try:
+        #         <organization / mark_enriched / rename / sidecar>
+        #     except Exception as exc:
+        #         logger.exception(
+        #             "Post-perception enrichment failed for %s: %s",
+        #             actual.name, exc,
+        #         )
+        #         stats.errors += 1
+        #         stats.failed.append(digest)
+        #         continue
 
         # Organization: our code picks the class; the AI is only a fallback.
         cls = concept_map.class_for(
@@ -2882,6 +2986,17 @@ def enrich_library(
                 logger.warning("Rename failed for %s: %s", actual.name, exc)
         elif str(actual) != row["organized_path"]:
             # Self-healed a stale path without otherwise changing anything.
+            # The sidecar must follow the file here too. Without this, a file
+            # whose descriptor tier already blocks an AI rename (a human
+            # filename) but which was relocated externally would leave its
+            # sidecar orphaned at the old path -- and the merge below would
+            # then build a fresh one at the new location from an empty base,
+            # silently dropping the facts pass's identity/sources/date/
+            # descriptor data.
+            old_sidecar = sidecar_path_for(recorded)
+            new_sidecar = sidecar_path_for(actual)
+            if old_sidecar.exists() and old_sidecar != new_sidecar:
+                old_sidecar.replace(new_sidecar)
             catalog.set_placement(
                 digest,
                 organized_path=str(actual),
