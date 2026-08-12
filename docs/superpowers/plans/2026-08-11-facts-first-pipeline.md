@@ -3662,6 +3662,20 @@ def _snapshot(dest: Path) -> set[str]:
     return {str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()}
 
 
+def _sidecar_bytes(dest: Path) -> dict[str, bytes]:
+    """Raw sidecar contents, keyed by relative path.
+
+    The fixed point covers the sidecar too -- it is a portable projection of the
+    catalog, so per-pass churn in it (a stray timestamp, non-deterministic key
+    order) is exactly the regression this guarantee exists to catch.
+    """
+    return {
+        str(p.relative_to(dest)): p.read_bytes()
+        for p in dest.rglob("*.json")
+        if p.is_file()
+    }
+
+
 def _library(tmp_path):
     src = tmp_path / "src"
     src.mkdir()
@@ -3678,7 +3692,7 @@ def test_facts_then_enrich_reaches_a_fixed_point(tmp_path):
         enrich_library(cat, dest, Fixed("beach"), write_sidecars=True)
         after_first_cycle = _snapshot(dest)
 
-        for _ in range(3):
+        for i in range(3):
             Pipeline(src, dest, cat, write_sidecars=True).run()
             # reclassify=True is REQUIRED. Without it every row already has
             # enriched_at set, iter_unenriched returns nothing, and Fixed(
@@ -3690,6 +3704,18 @@ def test_facts_then_enrich_reaches_a_fixed_point(tmp_path):
             )
             assert again.total == 3   # the pass genuinely ran on every file
             assert again.renamed == 0  # and changed nothing: equal tier is a no-op
+
+            # The sidecar reaches the fixed point too. It legitimately changes
+            # ONCE, on the "beach" -> "mountain" transition, because the
+            # classifier's answer differs and enrich's rename gate is tier-based
+            # rather than value-based. From the second mountain pass onward the
+            # answer is unchanged, so the bytes must be identical -- do not
+            # exclude .json wholesale, which would make per-pass churn (a stray
+            # timestamp, non-deterministic key order) undetectable.
+            if i == 0:
+                sidecars = _sidecar_bytes(dest)
+            else:
+                assert _sidecar_bytes(dest) == sidecars
 
         assert _snapshot(dest) == after_first_cycle
 
