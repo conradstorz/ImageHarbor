@@ -1359,6 +1359,30 @@ def test_iter_unenriched_excludes_content_quarantined_via_any_source(tmp_path):
         assert cat.iter_unenriched() == []
 
 
+def test_new_content_at_a_quarantined_path_re_enters_the_queue(tmp_path):
+    """Quarantine is scoped to the exact bytes that failed.
+
+    CLAUDE.md: a quarantined file is skipped thereafter "until its bytes
+    change". Replacing a poison photo with a fixed one under the same filename
+    must lift the exclusion for the new content -- and nothing else can, since
+    record_file_failure's stale-stat reset only runs if the file is attempted.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")
+        cat.quarantine_file("/a.jpg")
+        assert cat.iter_unenriched() == []
+
+        # Same path, new bytes: new digest, new size and mtime.
+        cat.upsert(sha256_b64url="D2", original_path="/a.jpg", organized_path="/lib/b.jpg")
+        cat.record_source("D2", "/a.jpg", 20, 222)
+
+        assert {r["sha256_b64url"] for r in cat.iter_unenriched()} == {"D2"}
+
+
 def test_a_merely_failing_file_stays_in_the_queue(tmp_path):
     """Only QUARANTINED content leaves; a file still accruing failures retries."""
     from imageharbor.catalog import Catalog
@@ -1592,6 +1616,16 @@ Add these methods after `record_source_seen`:
         several paths is quarantined if ANY of them is: identical bytes fail
         identically, so one quarantined path condemns the content.
 
+        The join also correlates on `size` and `mtime_ns`, which is what scopes
+        the exclusion to the exact bytes that failed. Without it, a path reused
+        by new content -- replacing a poison photo with a fixed one under the
+        same filename -- would inherit the old quarantine forever, since the new
+        digest's `sources` row shares that path. Nothing could lift it either:
+        `record_file_failure`'s stale-stat reset only runs if the file is
+        attempted, and it never would be. That would break the documented
+        contract that a quarantined file is skipped only "until its bytes
+        change".
+
         `--reclassify` deliberately bypasses this (it walks `iter_all`): asking
         again is the whole point of an explicit re-do.
         """
@@ -1601,6 +1635,7 @@ Add these methods after `record_source_seen`:
             "AND NOT EXISTS ("
             "  SELECT 1 FROM sources s"
             "  JOIN failed_files f ON f.source_path = s.source_path"
+            "   AND f.size = s.size AND f.mtime_ns = s.mtime_ns"
             "  WHERE s.sha256_b64url = p.sha256_b64url AND f.quarantined = 1"
             ") ORDER BY p.id"
         )
