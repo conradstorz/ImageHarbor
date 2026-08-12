@@ -3680,7 +3680,16 @@ def test_facts_then_enrich_reaches_a_fixed_point(tmp_path):
 
         for _ in range(3):
             Pipeline(src, dest, cat, write_sidecars=True).run()
-            enrich_library(cat, dest, Fixed("mountain"), write_sidecars=True)
+            # reclassify=True is REQUIRED. Without it every row already has
+            # enriched_at set, iter_unenriched returns nothing, and Fixed(
+            # "mountain") is never called -- the loop would prove only that the
+            # FACTS pass is idempotent, not that the enrich half converges under
+            # a changing AI answer, which is this guarantee's actual claim.
+            again = enrich_library(
+                cat, dest, Fixed("mountain"), write_sidecars=True, reclassify=True
+            )
+            assert again.total == 3   # the pass genuinely ran on every file
+            assert again.renamed == 0  # and changed nothing: equal tier is a no-op
 
         assert _snapshot(dest) == after_first_cycle
 
@@ -3781,9 +3790,15 @@ And add the method:
             logger.warning("Cannot upgrade %s: organized file missing", sha256_b64url)
             return
 
-        best_date = date if date.tier >= old[0] else _date_from_row(row)
+        # STRICT > on both, not >=. is_upgrade fires when EITHER dimension
+        # improves, so the other may merely tie -- and a tie must keep the value
+        # already recorded. With >=, a duplicate arriving with a better date
+        # would also overwrite an equally-ranked descriptor, silently replacing
+        # a human name already chosen ("emmas-graduation") with an unrelated one
+        # from the new path ("bobs-party-2019"). Equal tier is a no-op.
+        best_date = date if date.tier > old[0] else date_from_row(row)
         best_descriptor = (
-            descriptor.value if descriptor.tier >= old[1] else (row["descriptor_value"] or "")
+            descriptor.value if descriptor.tier > old[1] else (row["descriptor_value"] or "")
         )
         proposed = target_path(
             self.organized_dir, best_date, best_descriptor, sha256_b64url,
@@ -3795,23 +3810,43 @@ And add the method:
             logger.warning("Upgrade rename failed for %s: %s", actual.name, exc)
             return
 
-        old_sidecar = sidecar_path_for(actual)
-        if old_sidecar.exists():
-            old_sidecar.replace(sidecar_path_for(proposed))
+        # The file has already moved. A failure from here on must NOT re-raise:
+        # it would turn a correct "duplicate" result into an "error" and leave
+        # the catalog naming a path that no longer exists. enrich.py separates
+        # these for the same reason. The stale row self-heals on a later pass
+        # via relocate.resolve_organized_path's digest scan.
+        try:
+            old_sidecar = sidecar_path_for(actual)
+            if old_sidecar.exists():
+                old_sidecar.replace(sidecar_path_for(proposed))
+        except OSError as exc:
+            logger.warning("Sidecar carry failed for %s: %s", proposed.name, exc)
 
-        self.catalog.set_placement(
-            sha256_b64url,
-            organized_path=str(proposed),
-            date_value=best_date.date_str,
-            date_tier=best_date.tier,
-            date_source=best_date.source,
-            descriptor_value=best_descriptor,
-            descriptor_tier=new[1],
-            descriptor_source=(
-                descriptor.source if descriptor.tier >= old[1]
-                else (row["descriptor_source"] or "none")
-            ),
-        )
+        try:
+            self.catalog.set_placement(
+                sha256_b64url,
+                organized_path=str(proposed),
+                date_value=best_date.date_str,
+                date_tier=best_date.tier,
+                date_source=best_date.source,
+                descriptor_value=best_descriptor,
+                descriptor_tier=new[1],
+                descriptor_source=(
+                    # Strict >, matching best_descriptor above: a tie keeps the
+                    # source already recorded.
+                    descriptor.source if descriptor.tier > old[1]
+                    else (row["descriptor_source"] or "none")
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Catalog update failed after relocating %s; the row is stale but "
+                "self-heals by digest on a later pass",
+                proposed.name,
+                exc_info=True,
+            )
+            return
+
         logger.info("Upgraded %s from a better-named duplicate", proposed.name)
 ```
 
@@ -3819,12 +3854,19 @@ Add the needed imports to `pipeline.py`:
 
 ```python
 from . import tiers
-from .enrich import _date_from_row
+from .date_resolver import date_from_row, resolve_date
 from .relocate import apply_relocation, resolve_organized_path, target_path
 from .sidecar import merge_sidecar, sidecar_path_for
 ```
 
-If importing `_date_from_row` from `enrich` creates a circular import (`enrich` imports `pipeline`? it does not — verify), move `_date_from_row` into `date_resolver.py` as a public `date_from_row(row)` and import it from there in both modules.
+**`date_from_row` lives in `date_resolver.py`, not `enrich.py`.** Move the helper
+there as a public function and have BOTH `pipeline.py` and `enrich.py` import it
+from there. `pipeline.py` is the AI-free facts pass and `enrich.py` is the AI pass
+built on top of it, so importing downward from `pipeline` into `enrich` inverts
+the layering: any module-level import later added anywhere in `enrich.py`'s
+graph would silently leak into the facts pass's import chain, which is exactly
+the invariant that pass exists to hold. `date_resolver.py` is the dependency-light
+module both already import from.
 
 - [ ] **Step 4: Run test to verify it passes**
 
