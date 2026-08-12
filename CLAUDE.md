@@ -240,19 +240,9 @@ Module responsibilities:
   aside": it stays fully organized, verified, and cataloged by the facts pass, and
   is excluded from `iter_unenriched()` until its bytes change. Failures during a
   breaker-tripped outage never count, so a backend outage cannot mis-quarantine
-  good files. **Accepted limitation:** quarantine requires a *healthy* pass
-  (>=1 success, not tripped), so if the poison files remaining in
-  `iter_unenriched` ever constitute the *entire* remaining queue, no pass can
-  ever be both non-tripped and contain a success — those files are structurally
-  un-quarantinable in that state. This is deliberate, not a bug: an all-poison
-  remaining queue is indistinguishable from a real backend outage, and
-  quarantining anyway would risk condemning an entire library during a genuine
-  outage. The cost is bounded to one half-open probe per backoff interval
-  (`watcher.watch`'s rotating probe offset), so the state self-resolves as soon
-  as any describable file reappears in the queue. If it persists,
-  `watcher.watch` logs one WARNING per threshold crossing (not per pass, see
-  `CONSECUTIVE_ABORT_WARNING_THRESHOLD`, 10 consecutive aborted passes) naming
-  the digests currently at the head of the queue.
+  good files. Quarantine requires a *healthy* pass to observe the failure —
+  see "Known limitations" below for the accepted boundary this creates when
+  poison files constitute the entire remaining queue.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
