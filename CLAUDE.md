@@ -240,7 +240,19 @@ Module responsibilities:
   aside": it stays fully organized, verified, and cataloged by the facts pass, and
   is excluded from `iter_unenriched()` until its bytes change. Failures during a
   breaker-tripped outage never count, so a backend outage cannot mis-quarantine
-  good files.
+  good files. **Accepted limitation:** quarantine requires a *healthy* pass
+  (>=1 success, not tripped), so if the poison files remaining in
+  `iter_unenriched` ever constitute the *entire* remaining queue, no pass can
+  ever be both non-tripped and contain a success — those files are structurally
+  un-quarantinable in that state. This is deliberate, not a bug: an all-poison
+  remaining queue is indistinguishable from a real backend outage, and
+  quarantining anyway would risk condemning an entire library during a genuine
+  outage. The cost is bounded to one half-open probe per backoff interval
+  (`watcher.watch`'s rotating probe offset), so the state self-resolves as soon
+  as any describable file reappears in the queue. If it persists,
+  `watcher.watch` logs one WARNING per threshold crossing (not per pass, see
+  `CONSECUTIVE_ABORT_WARNING_THRESHOLD`, 10 consecutive aborted passes) naming
+  the digests currently at the head of the queue.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
@@ -321,6 +333,35 @@ Module responsibilities:
   Preserve this copy → verify → catalog ordering when editing the pipeline.
 - **Runtime output directories are git-ignored, not source** (`Photos-Organized/`,
   `Review/`, `Duplicates/`, `Logs/`, `catalog.db`, etc. in `.gitignore`).
+
+## Known limitations
+
+- **Poison-quarantine cannot fire when the poison IS the entire remaining
+  queue.** `watcher._reconcile_poison` only counts a failure toward
+  `--poison-max-fails` during a *healthy* enrichment pass (>=1 success,
+  breaker not tripped this pass) — see `catalog.py`'s `failed_files`
+  description above. `watch()`'s rotating probe offset (see
+  `circuit_breaker.py` entry) lets a half-open probe skip a stuck head
+  cluster and find a working file elsewhere in the queue, so quarantine can
+  fire for poison files that have *some* describable file anywhere else in
+  `iter_unenriched`. But if the files tripping the breaker are (or become)
+  the *whole* unenriched queue — no describable file left to probe into —
+  no pass can ever be simultaneously non-tripped and contain them, so they
+  stay permanently un-quarantined in that state. This is accepted, not a
+  bug: an all-poison remaining queue is information-theoretically
+  indistinguishable from a real backend outage, and quarantining anyway
+  would risk condemning an entire library during a genuine outage — exactly
+  what the tripped/no-success discard rules exist to prevent. The cost is
+  bounded (one half-open probe per backoff interval, capped at
+  `--breaker-backoff-cap`, 900s by default) and self-resolving (any new
+  describable file — a fresh photo, a poison file whose bytes change —
+  lets normal quarantine accounting resume). `watch()` logs one diagnostic
+  warning per occurrence via `CONSECUTIVE_ABORT_WARNING_THRESHOLD` if this
+  persists, so it is visible rather than silent. See the "Known, deliberate
+  limitation" note on `watcher._reconcile_poison` for the full reasoning,
+  and `tests/test_poison.py::test_poison_at_the_head_does_not_halt_enrichment`
+  for the test that exercises the boundary (it asserts quarantine only for
+  poison files that DO have a good neighbour elsewhere in the queue).
 
 ## Origin & design reference
 

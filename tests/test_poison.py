@@ -146,7 +146,7 @@ def test_poison_at_the_head_does_not_halt_enrichment(
                         always discarded, and a half-open probe landing on
                         either alone reopens on that single failure -- so
                         this pair can never itself be quarantined, and the
-                        test does not assert on it.
+                        test does NOT assert on it.
       b0 good, b1 target, b2 good, b3 target, b4 good, b5 target, b6 good
                      -- alternating tail: every target poison file has a
                         good neighbour on both sides, so once a probe's
@@ -157,6 +157,22 @@ def test_poison_at_the_head_does_not_halt_enrichment(
                         that one HEALTHY pass, which is exactly the
                         condition `_reconcile_poison` requires to count a
                         failure toward quarantine.
+
+    Why the assertion is deliberately scoped to the "target" files and not
+    the "trigger" pair: quarantine requires a HEALTHY pass (>=1 success,
+    not tripped) to observe a failure. The trigger pair has no good
+    neighbour ANYWHERE in the queue at the moment it trips the breaker, so
+    no pass can ever be simultaneously non-tripped and contain them -- they
+    are structurally un-quarantinable in this layout, by design, not by an
+    outstanding gap in the fix. This is the documented, accepted boundary
+    described on `_reconcile_poison` ("Known, deliberate limitation"): a
+    poison file (or cluster) that is the ENTIRE remaining unenriched queue
+    is information-theoretically indistinguishable from a real backend
+    outage, and quarantining it anyway would risk condemning a whole
+    library during a genuine outage -- exactly what "tripped -> discard"
+    exists to prevent. The target files, by contrast, DO have good
+    neighbours elsewhere in the queue, so they fall within the guarantee
+    the fix actually provides, and this test asserts on them.
     """
     src = tmp_path / "src"
     src.mkdir()

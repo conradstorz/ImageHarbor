@@ -27,6 +27,13 @@ from .pipeline import Pipeline
 
 logger = logging.getLogger(__name__)
 
+# How many consecutive ABORTED enrichment passes (see `watch()`) trigger a
+# single diagnostic warning that enrichment is making no progress. ~10 passes
+# at the 900s backoff cap is roughly 2.5 hours -- long enough that a couple of
+# slow probes against a flaky-but-recovering backend don't false-positive,
+# short enough that a genuinely stuck watcher gets flagged well within a day.
+CONSECUTIVE_ABORT_WARNING_THRESHOLD = 10
+
 
 @dataclass
 class WatchStats:
@@ -126,6 +133,26 @@ def _reconcile_poison(
     - Pass had >=1 success       -> backend proven up: count each failure; a
       file reaching poison_max_fails is quarantined (and optionally copied).
     - Neither                    -> health unknowable: discard (conservative).
+
+    Known, deliberate limitation: quarantine requires a HEALTHY pass (>=1
+    success, not tripped). If the poison files remaining in `iter_unenriched`
+    ever constitute the ENTIRE unenriched queue (no describable file left
+    anywhere to probe into), no pass can ever satisfy that condition for
+    them: a full pass trips before any success can land, and a half-open
+    probe re-opens on its first (poison) failure before a success can land
+    either. Those files are therefore structurally un-quarantinable in that
+    state -- and this is intentional, not a bug: an all-poison remaining
+    queue is information-theoretically indistinguishable from a real backend
+    outage, and quarantining anyway would risk condemning an entire library
+    during a real outage, which is exactly what the "tripped -> discard" and
+    "no success -> discard" rules above exist to prevent. The cost is
+    bounded: `watch()`'s rotating probe offset still attempts one half-open
+    probe per backoff interval (capped at `breaker.backoff_cap`, 900s by
+    default), so as soon as even one describable file reappears in the
+    queue (a new photo arrives, a poison file's bytes change, etc.) normal
+    quarantine accounting resumes. See also `watch()`'s
+    CONSECUTIVE_ABORT_WARNING_THRESHOLD, which logs a diagnostic (not an
+    error, and not a quarantine action) if this state persists.
     """
     if tripped or not pass_had_success or not failed_buffer:
         return
@@ -302,12 +329,24 @@ def watch(
     case, where an offset that has run past the end of the current queue
     would otherwise leave the breaker half-open forever with nothing left
     to probe).
+
+    This does not guarantee every poison file is eventually quarantined: if
+    the files that keep tripping the breaker constitute the ENTIRE
+    remaining unenriched queue, no pass can ever be both non-tripped and
+    contain a success, so quarantine can never fire for them -- see the
+    "Known, deliberate limitation" note on `_reconcile_poison`. That state
+    is bounded in cost (one probe per backoff interval) but could in
+    principle persist indefinitely if the AI backend never recovers and no
+    new describable file ever arrives; this loop logs one diagnostic
+    warning (see `CONSECUTIVE_ABORT_WARNING_THRESHOLD`) if that happens, so
+    it is visible in the logs rather than silent.
     """
     stop_event = stop_event or threading.Event()
     if sleep is None:
         sleep = stop_event.wait  # interruptible sleep
     wstats = WatchStats()
     probe_offset = 0
+    consecutive_aborted_passes = 0
     while not stop_event.is_set():
         if breaker is not None and breaker.is_open():
             wait = breaker.seconds_until_probe()
@@ -336,11 +375,30 @@ def watch(
                 # function's docstring.
                 step = max(1, breaker.trip_threshold) if breaker is not None else 1
                 probe_offset += step
+                consecutive_aborted_passes += 1
+                if consecutive_aborted_passes == CONSECUTIVE_ABORT_WARNING_THRESHOLD:
+                    # Log exactly once per threshold crossing -- not on every
+                    # subsequent pass while it stays >= threshold, and again
+                    # if it later resets and climbs back up. Read-only
+                    # diagnostic query, separate from the probe's own
+                    # offset-based iter_unenriched call above.
+                    head = catalog.iter_unenriched(limit=5, offset=0)
+                    head_digests = [row["sha256_b64url"] for row in head]
+                    logger.warning(
+                        "Enrichment has made no progress across %d consecutive "
+                        "aborted passes; the AI backend may be down, or every "
+                        "remaining file may be undescribable (see "
+                        "_reconcile_poison's 'Known, deliberate limitation' "
+                        "note). Files currently at the head of the queue: %s",
+                        consecutive_aborted_passes,
+                        head_digests,
+                    )
             else:
                 # Covers both a clean completion AND total == 0 (an
                 # offset that outran the queue): either way there is
                 # nothing gained by staying non-zero.
                 probe_offset = 0
+                consecutive_aborted_passes = 0
         wstats.passes += 1
         wstats.processed += facts.processed
         wstats.skipped_unchanged += facts.skipped_unchanged
