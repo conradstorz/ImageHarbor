@@ -2685,6 +2685,7 @@ def test_self_heal_without_upgrade_carries_the_sidecar(tmp_path):
     every fact the first pass recorded.
     """
     import shutil
+    from pathlib import Path
 
     from imageharbor.sidecar import read_sidecar, sidecar_path_for
 
