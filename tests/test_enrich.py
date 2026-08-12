@@ -1,7 +1,5 @@
 """Tests for the AI enrichment pass and its non-degradation guarantee."""
 
-import pytest
-
 from imageharbor import tiers
 from imageharbor.ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from imageharbor.catalog import Catalog
@@ -157,6 +155,81 @@ def test_enrichment_self_heals_a_stale_catalog_path(tmp_path):
 
     assert stats.errors == 0
     assert stats.enriched == 1
+    cat.close()
+
+
+def test_self_heal_without_upgrade_carries_the_sidecar(tmp_path):
+    """A stale path repaired at a tier that blocks renaming must keep its sidecar.
+
+    A human-named file cannot be renamed by the AI pass, so it takes the
+    self-heal branch rather than the rename branch. If that branch left the
+    sidecar behind, the merge would rebuild it from an empty base and lose
+    every fact the first pass recorded.
+    """
+    import shutil
+    from pathlib import Path
+
+    from imageharbor.sidecar import read_sidecar, sidecar_path_for
+
+    cat, dest, result = _facts(tmp_path, "Emma's graduation.jpg")
+    old = result.organized_path
+    assert read_sidecar(old)["identity"]["sha256_b64url"] == result.sha256_b64url
+
+    # Relocate the file and its sidecar is left behind by an external actor.
+    moved = old.parent / f"moved-{old.name}"
+    shutil.move(str(old), str(moved))
+
+    enrich_library(cat, dest, FixedClassifier(), write_sidecars=True)
+
+    healed = Path(cat.get_by_sha256(result.sha256_b64url)["organized_path"])
+    data = read_sidecar(healed)
+    assert data["identity"]["sha256_b64url"] == result.sha256_b64url
+    assert data["descriptor"]["tier"] == tiers.DESC_HUMAN_FILENAME
+    assert data["classification"]["primary_subject"] == "beach"
+    assert not sidecar_path_for(old).exists()
+    cat.close()
+
+
+def test_a_local_failure_does_not_wedge_the_pass(tmp_path):
+    """An exception after perception must not escape or block later rows.
+
+    The queue is ordered by id and a row that raises is never marked enriched
+    or failed, so an escaping exception would crash on the same row forever.
+    """
+    src = _make(tmp_path, "IMG_1.jpg", b"one")
+    (src / "IMG_2.jpg").write_bytes(b"two")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    calls = {"n": 0}
+    real_mark = cat.mark_enriched
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("catalog is busy")
+        return real_mark(*args, **kwargs)
+
+    cat.mark_enriched = flaky
+
+    stats = enrich_library(cat, dest, FixedClassifier())
+
+    assert stats.total == 2
+    assert stats.errors == 1
+    assert stats.enriched == 1
+    assert len(stats.failed) == 1  # the failure is visible to quarantine
+    cat.close()
+
+
+def test_reclassify_skips_rows_with_no_organized_copy(tmp_path):
+    """--reclassify walks the whole catalog, including rows iter_unenriched hides."""
+    cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
+    cat.upsert(sha256_b64url="ORPHAN", original_path="/gone.jpg")
+
+    stats = enrich_library(cat, dest, FixedClassifier(), reclassify=True)
+
+    assert stats.total == 1  # the orphan is skipped, not crashed on
     cat.close()
 
 
