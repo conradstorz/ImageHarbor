@@ -1359,6 +1359,45 @@ def test_iter_unenriched_excludes_content_quarantined_via_any_source(tmp_path):
         assert cat.iter_unenriched() == []
 
 
+def test_quarantine_survives_a_metadata_only_mtime_change(tmp_path):
+    """A touch must not lift a quarantine whose bytes never changed.
+
+    iter_unenriched correlates the exclusion on (path, size, mtime_ns). If
+    record_source overwrote those stats on re-observation, a backup tool or a
+    CIFS remount touching the file would silently re-admit known-poison content
+    to the AI queue.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")
+        cat.quarantine_file("/a.jpg")
+        assert cat.iter_unenriched() == []
+
+        # Same bytes, same digest, only the mtime moved.
+        cat.record_source("D1", "/a.jpg", 10, 999)
+
+        assert cat.iter_unenriched() == []
+
+
+def test_record_source_freezes_stats_for_unchanged_content(tmp_path):
+    """The row is keyed by digest, so its stats describe fixed content."""
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        first = cat.sources_for("D1")[0]["last_seen_at"]
+        cat.record_source("D1", "/a.jpg", 10, 999)
+
+        row = cat.sources_for("D1")[0]
+        assert row["mtime_ns"] == 111
+        assert row["size"] == 10
+        assert row["last_seen_at"] >= first
+
+
 def test_new_content_at_a_quarantined_path_re_enters_the_queue(tmp_path):
     """Quarantine is scoped to the exact bytes that failed.
 
@@ -1539,6 +1578,15 @@ Add these methods after `record_source_seen`:
         One row per distinct source path: this is the many-to-one back-pointer
         set that replaces a single `original_path`. `first_seen_at` is written
         once and never updated.
+
+        `size` and `mtime_ns` are likewise written once. The row is keyed by
+        digest, so its content is fixed by definition -- size is a function of
+        that content and cannot change, and an mtime that moves without the
+        bytes moving is metadata noise (a touch, a backup tool, a CIFS
+        remount). Overwriting the stats on re-observation would let that noise
+        silently lift a quarantine, because `iter_unenriched` correlates the
+        exclusion on exactly this `(path, size, mtime_ns)` triple. Only
+        `last_seen_at` moves.
         """
         now = _now_iso()
         self._conn.execute(
@@ -1547,8 +1595,6 @@ Add these methods after `record_source_seen`:
                 sha256_b64url, source_path, size, mtime_ns, first_seen_at, last_seen_at
             ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(sha256_b64url, source_path) DO UPDATE SET
-                size = excluded.size,
-                mtime_ns = excluded.mtime_ns,
                 last_seen_at = excluded.last_seen_at
             """,
             (sha256_b64url, source_path, size, mtime_ns, now, now),
