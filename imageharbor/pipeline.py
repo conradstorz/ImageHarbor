@@ -15,14 +15,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import tiers
 from .catalog import Catalog
 from .date_resolver import resolve_date
 from .descriptor import resolve_descriptor
 from .discovery import discover_images
+from .enrich import _date_from_row
 from .exif_reader import read_exif
 from .hashing import compute_sha256_b64url, verify_file
-from .relocate import target_path
-from .sidecar import merge_sidecar
+from .relocate import apply_relocation, resolve_organized_path, target_path
+from .sidecar import merge_sidecar, sidecar_path_for
 
 if TYPE_CHECKING:
     from .date_resolver import ResolvedDate
@@ -174,6 +176,7 @@ class Pipeline:
                 self.catalog.record_source(
                     sha256_b64url, str(source_path), stat.st_size, stat.st_mtime_ns
                 )
+                self._maybe_upgrade_from_duplicate(source_path, sha256_b64url)
                 if self.duplicates_dir:
                     self._copy_to_duplicates(source_path, sha256_b64url)
             return ProcessResult(
@@ -266,6 +269,65 @@ class Pipeline:
             status="copied",
             organized_path=organized_path,
         )
+
+    def _maybe_upgrade_from_duplicate(
+        self, source_path: Path, sha256_b64url: str
+    ) -> None:
+        """Re-evaluate a known file's tiers against a newly-seen source path.
+
+        Identical bytes mean identical EXIF, but not identical filenames: the
+        same photo found at a better-named path can supply a date or a
+        descriptor the first copy lacked.
+        """
+        row = self.catalog.get_by_sha256(sha256_b64url)
+        if row is None or not row["organized_path"]:
+            return
+
+        date = resolve_date(source_path, {})
+        descriptor = resolve_descriptor(source_path)
+        old = (row["date_tier"] or 0, row["descriptor_tier"] or 0)
+        new = (max(old[0], date.tier), max(old[1], descriptor.tier))
+        if not tiers.is_upgrade(old, new):
+            return
+
+        recorded = Path(row["organized_path"])
+        actual = resolve_organized_path(self.organized_dir, recorded, sha256_b64url)
+        if actual is None:
+            logger.warning("Cannot upgrade %s: organized file missing", sha256_b64url)
+            return
+
+        best_date = date if date.tier >= old[0] else _date_from_row(row)
+        best_descriptor = (
+            descriptor.value if descriptor.tier >= old[1] else (row["descriptor_value"] or "")
+        )
+        proposed = target_path(
+            self.organized_dir, best_date, best_descriptor, sha256_b64url,
+            actual.suffix.lstrip(".").lower(),
+        )
+        try:
+            apply_relocation(actual, proposed)
+        except OSError as exc:
+            logger.warning("Upgrade rename failed for %s: %s", actual.name, exc)
+            return
+
+        old_sidecar = sidecar_path_for(actual)
+        if old_sidecar.exists():
+            old_sidecar.replace(sidecar_path_for(proposed))
+
+        self.catalog.set_placement(
+            sha256_b64url,
+            organized_path=str(proposed),
+            date_value=best_date.date_str,
+            date_tier=best_date.tier,
+            date_source=best_date.source,
+            descriptor_value=best_descriptor,
+            descriptor_tier=new[1],
+            descriptor_source=(
+                descriptor.source if descriptor.tier >= old[1]
+                else (row["descriptor_source"] or "none")
+            ),
+        )
+        logger.info("Upgraded %s from a better-named duplicate", proposed.name)
 
     def _copy_to_duplicates(self, source_path: Path, sha256_b64url: str) -> None:
         assert self.duplicates_dir is not None
