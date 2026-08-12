@@ -2713,7 +2713,7 @@ run is a no-op.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -2741,6 +2741,10 @@ class EnrichStats:
     renamed: int = 0
     errors: int = 0
     aborted: bool = False
+    # Digests that failed this pass. The watcher feeds these to poison-file
+    # reconciliation: with no AI in the facts pass, this is now the ONLY source
+    # of the per-file failure signal quarantine depends on.
+    failed: list[str] = field(default_factory=list)
 
 
 def _date_from_row(row) -> ResolvedDate:
@@ -2794,6 +2798,7 @@ def enrich_library(
         if actual is None:
             logger.error("Organized file missing for %s (%s)", digest, recorded)
             stats.errors += 1
+            stats.failed.append(digest)
             continue
 
         try:
@@ -2801,6 +2806,7 @@ def enrich_library(
         except Exception as exc:
             logger.warning("Enrichment failed for %s: %s", actual.name, exc)
             stats.errors += 1
+            stats.failed.append(digest)
             if breaker is not None:
                 breaker.record_failure()
                 if breaker.is_open():
@@ -3063,6 +3069,42 @@ def run_once(
 ```
 
 Rewire the existing `watch` loop to call `run_once` per pass, keep the existing backoff/half-open logic driving the breaker between passes, and update the stop-summary to report facts and enrichment counts separately. Update the `Pipeline(...)` construction anywhere else in the file to drop the `classifier=` argument.
+
+**Poison quarantine moves to the enrichment phase.** The existing reconciliation
+counted a file toward quarantine when `pipeline.process_file()` returned
+`status == "error"` — and the only thing that ever produced that error was the
+AI classifier raising inside `describe()`. The facts pass makes no AI calls, so
+that signal is now permanently absent and quarantine would never fire.
+
+This is a re-wiring, not a redesign. `watcher.py` keeps `_reconcile_poison`,
+`_copy_to_quarantine`, and the failed-file buffer exactly as they are, together
+with the safety property that failures observed while the breaker is OPEN never
+count — a backend outage must not mis-quarantine good files. What changes is
+the source of failures: they now come from the enrichment phase's per-file
+errors rather than from facts-pass results.
+
+`enrich_library` must therefore report which digests failed. Extend `EnrichStats`
+with `failed: list[str]` (digests, appended in the same place `stats.errors` is
+incremented) and have `run_once` feed those to the reconciliation.
+
+Quarantine now means **"stop asking the model about this one"**, not "set this
+file aside". A file that cannot be described is still fully organized, verified,
+and catalogued by the facts pass — only its enrichment is abandoned.
+
+- [ ] **Step 3a: Rewrite `tests/test_poison.py` for the new signal path**
+
+Two tests fail after Task 9 because they simulate poison via a raising
+classifier reaching the facts pass: `test_poison_file_quarantined_after_k_healthy_passes`
+and `test_quarantine_copies_to_dir_when_set`. Rewrite both to drive failures
+through `enrich_library` instead — the classifier raises during enrichment, the
+facts pass still succeeds, and the file is quarantined after
+`--poison-max-fails` healthy enrichment attempts.
+
+Keep the existing safety test asserting that failures during a breaker-tripped
+outage never count toward quarantine; that property is unchanged and is the
+reason the reconciliation exists. Add one test asserting a quarantined file is
+still present and verifiable in the organized tree — quarantine must not remove
+or relocate it.
 
 - [ ] **Step 4: Run test to verify it passes**
 
