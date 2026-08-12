@@ -506,25 +506,43 @@ def test_set_placement_updates_path_and_tiers(tmp_path):
         assert cat.tiers_for("D1") == (40, 20)
 
 
+_OLD_PHOTOS_TABLE_DDL = (
+    "CREATE TABLE photos (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "sha256_b64url TEXT NOT NULL UNIQUE, original_path TEXT NOT NULL, "
+    "organized_path TEXT, pcs_version TEXT NOT NULL DEFAULT '1', "
+    "pcs_primary TEXT NOT NULL DEFAULT '900', pcs_name TEXT NOT NULL DEFAULT 'miscellaneous', "
+    "secondary_tags TEXT NOT NULL DEFAULT '[]', ai_caption TEXT NOT NULL DEFAULT '', "
+    "objects TEXT NOT NULL DEFAULT '[]', ocr_text TEXT NOT NULL DEFAULT '', "
+    "exif TEXT NOT NULL DEFAULT '{}', model_version TEXT NOT NULL DEFAULT 'unknown', "
+    "processing_history TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, processed_at TEXT)"
+)
+
+
 def test_existing_catalog_gains_new_columns(tmp_path):
-    """An older DB must open and upgrade without losing rows."""
+    """An older DB must open and upgrade without losing rows.
+
+    `sources` is pre-populated here so this test isolates the additive
+    ALTER TABLE column-upgrade mechanism from the separate legacy-catalog
+    guard (see test_legacy_catalog_with_rows_and_no_sources_raises below,
+    which covers the case this DB would otherwise also trigger).
+    """
     import sqlite3
     from imageharbor.catalog import Catalog
 
     db = tmp_path / "old.db"
     conn = sqlite3.connect(str(db))
-    conn.execute(
-        "CREATE TABLE photos (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "sha256_b64url TEXT NOT NULL UNIQUE, original_path TEXT NOT NULL, "
-        "organized_path TEXT, pcs_version TEXT NOT NULL DEFAULT '1', "
-        "pcs_primary TEXT NOT NULL DEFAULT '900', pcs_name TEXT NOT NULL DEFAULT 'miscellaneous', "
-        "secondary_tags TEXT NOT NULL DEFAULT '[]', ai_caption TEXT NOT NULL DEFAULT '', "
-        "objects TEXT NOT NULL DEFAULT '[]', ocr_text TEXT NOT NULL DEFAULT '', "
-        "exif TEXT NOT NULL DEFAULT '{}', model_version TEXT NOT NULL DEFAULT 'unknown', "
-        "processing_history TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, processed_at TEXT)"
-    )
+    conn.execute(_OLD_PHOTOS_TABLE_DDL)
     conn.execute(
         "INSERT INTO photos (sha256_b64url, original_path, created_at) VALUES ('OLD', '/x.jpg', 'now')"
+    )
+    conn.execute(
+        "CREATE TABLE sources (sha256_b64url TEXT NOT NULL, source_path TEXT NOT NULL, "
+        "size INTEGER, mtime_ns INTEGER, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, "
+        "PRIMARY KEY (sha256_b64url, source_path))"
+    )
+    conn.execute(
+        "INSERT INTO sources (sha256_b64url, source_path, size, mtime_ns, first_seen_at, last_seen_at) "
+        "VALUES ('OLD', '/x.jpg', 1, 1, 'now', 'now')"
     )
     conn.commit()
     conn.close()
@@ -532,3 +550,79 @@ def test_existing_catalog_gains_new_columns(tmp_path):
     with Catalog(db) as cat:
         assert cat.get_by_sha256("OLD") is not None
         assert cat.tiers_for("OLD") == (0, 0)
+
+
+def test_legacy_catalog_with_rows_and_no_sources_raises(tmp_path):
+    """A pre-redesign catalog (photo rows, no `sources`, no schema_version)
+    must never be opened in place -- see `LegacyCatalogError`. Opening it
+    would make every existing row look unenriched and undated, and the next
+    enrichment pass would relocate the whole organized tree into Undated/.
+    """
+    import sqlite3
+
+    from imageharbor.catalog import Catalog, LegacyCatalogError
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(_OLD_PHOTOS_TABLE_DDL)
+    conn.execute(
+        "INSERT INTO photos (sha256_b64url, original_path, created_at) VALUES ('OLD', '/x.jpg', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(LegacyCatalogError, match="docs/rebuild.md"):
+        Catalog(db)
+
+
+def test_legacy_catalog_empty_opens(tmp_path):
+    """An old-schema DB with a `photos` table but zero rows is not a hazard
+    (there is nothing to misinterpret) -- it must open normally and get
+    stamped at the current schema version."""
+    import sqlite3
+
+    from imageharbor.catalog import SCHEMA_VERSION, Catalog
+
+    db = tmp_path / "legacy_empty.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(_OLD_PHOTOS_TABLE_DDL)
+    conn.commit()
+    conn.close()
+
+    with Catalog(db) as cat:
+        assert cat.count() == 0
+        row = cat._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        assert row is not None and row["value"] == SCHEMA_VERSION
+
+
+def test_fresh_catalog_carries_schema_version(tmp_path):
+    """A brand-new catalog must open normally and be stamped at the current
+    schema version."""
+    from imageharbor.catalog import SCHEMA_VERSION, Catalog
+
+    with Catalog(tmp_path / "fresh.db") as cat:
+        row = cat._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        assert row is not None and row["value"] == SCHEMA_VERSION
+
+
+def test_reopening_a_v2_catalog_is_a_noop(tmp_path):
+    """Reopening an already-stamped catalog must not raise and must not
+    rewrite the stamp."""
+    from imageharbor.catalog import SCHEMA_VERSION, Catalog
+
+    db = tmp_path / "v2.db"
+    with Catalog(db) as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg")
+        cat.record_source("D1", "/a.jpg", 1, 1)
+
+    with Catalog(db) as cat:
+        assert cat.get_by_sha256("D1") is not None
+        rows = cat._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["value"] == SCHEMA_VERSION

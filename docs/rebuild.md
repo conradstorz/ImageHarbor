@@ -14,6 +14,20 @@ This runbook covers rebuilding the live hpz440 deployment. See
 set up, and [`CLAUDE.md`](../CLAUDE.md) for the two-pass architecture this
 produces.
 
+**Why this runbook must be followed rather than pointing `--dest` at the old
+catalog.** A pre-redesign catalog has photo rows but no `sources` rows (that
+table didn't exist yet) and no `date_tier`/`descriptor_tier`/`enriched_at`
+values — `Catalog._ensure_photo_columns` would make it *open* cleanly by
+adding the missing columns, but every existing row would then read as
+`date_tier=0` (Undated) and `enriched_at IS NULL` (never enriched). The next
+`enrich` (or `watch`) pass would treat the entire existing library as
+unenriched and undated, and relocate the whole already-organized tree into
+`Undated/`. `Catalog.__init__` now detects this shape (photo rows present, no
+`schema_version` stamp, `sources` empty) and refuses to open the catalog at
+all, raising `LegacyCatalogError` and pointing here, rather than silently
+corrupting placement — so skipping this runbook and pointing at the old
+catalog directly fails fast instead of quietly wrecking the library.
+
 ## The core guarantee
 
 **The source is never modified by any step below.** `process` only ever reads

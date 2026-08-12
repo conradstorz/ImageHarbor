@@ -84,7 +84,36 @@ CREATE TABLE IF NOT EXISTS sources (
     PRIMARY KEY (sha256_b64url, source_path)
 );
 CREATE INDEX IF NOT EXISTS idx_sources_digest ON sources(sha256_b64url);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+# Bumped when a catalog schema change is significant enough that opening an
+# old catalog in place would silently corrupt its data (see
+# `Catalog._guard_legacy_catalog`). Stamped into `meta` on every catalog that
+# opens successfully, so a future such change has something to compare against.
+SCHEMA_VERSION = "2"
+
+
+class LegacyCatalogError(Exception):
+    """Raised when a pre-redesign (schema v1) catalog with real content is
+    opened in place instead of being rebuilt.
+
+    See `docs/rebuild.md`. The 2026-08-11 facts-first redesign added the
+    `date_tier`/`descriptor_tier`/`enriched_at` columns and the `sources`
+    table; `Catalog._ensure_photo_columns` makes an old database *open*
+    cleanly by adding the missing columns, but every pre-existing row then
+    reads as `date_tier=0` (Undated) and `enriched_at IS NULL` (never
+    enriched). `iter_unenriched` would return the whole existing library, and
+    `tiers.is_upgrade((0, 0), (0, 20))` is True for every one of those rows --
+    so the very first `enrich` (or `watch`) pass against an old catalog opened
+    in place would relocate the entire already-organized tree into
+    `Undated/`. The fix is to rebuild the catalog against the same source
+    into a fresh destination (`docs/rebuild.md`), not to open the old one.
+    """
 
 # Columns added to `photos` after the original schema shipped. Applied
 # additively on open so an existing catalog upgrades in place.
@@ -141,6 +170,7 @@ class Catalog:
         self._conn.executescript(_SCHEMA)
         self._ensure_photo_columns()
         self._conn.commit()
+        self._guard_legacy_catalog()
         logger.debug("Catalog opened at %s", db_path)
 
     def _ensure_photo_columns(self) -> None:
@@ -152,6 +182,47 @@ class Catalog:
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE photos ADD COLUMN {name} {ddl}")
                 logger.debug("Catalog upgraded: added photos.%s", name)
+
+    def _guard_legacy_catalog(self) -> None:
+        """Refuse to open a pre-redesign catalog in place; stamp a fresh one.
+
+        Detection: `photos` has rows, `meta` has no `schema_version` row, and
+        `sources` is empty. Every write path added by the facts-first
+        redesign populates `sources` (the facts pass always calls
+        `record_source`), so a catalog with photo rows but zero `sources`
+        rows and no version stamp is unambiguously pre-redesign -- see
+        `LegacyCatalogError` for what opening it in place would do.
+
+        A brand-new catalog (no rows at all) and an empty legacy catalog (the
+        `photos` table exists but nothing was ever written to it) are not a
+        hazard either way -- there is nothing to misinterpret -- so both are
+        stamped and opened normally. A catalog already stamped at the current
+        version is a no-op.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        if row is not None:
+            return
+        photos_count = self._conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+        if photos_count > 0:
+            sources_count = self._conn.execute(
+                "SELECT COUNT(*) FROM sources"
+            ).fetchone()[0]
+            if sources_count == 0:
+                raise LegacyCatalogError(
+                    f"{self._db_path} looks like a pre-redesign ImageHarbor catalog "
+                    "(it has photo rows but no 'sources' rows and no schema_version "
+                    "stamp). Opening it in place would relocate the entire existing "
+                    "organized tree into Undated/ on the next enrichment pass -- see "
+                    "docs/rebuild.md for how to rebuild it safely into a fresh "
+                    "destination instead."
+                )
+        self._conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+            (SCHEMA_VERSION,),
+        )
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Write
