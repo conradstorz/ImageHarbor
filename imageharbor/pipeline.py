@@ -323,7 +323,7 @@ class Pipeline:
             if old_sidecar.exists():
                 old_sidecar.replace(sidecar_path_for(proposed))
         except OSError as exc:
-            logger.warning("Sidecar carry failed for %s: %s", actual.name, exc)
+            logger.warning("Sidecar carry failed for %s: %s", proposed.name, exc)
 
         try:
             self.catalog.set_placement(
@@ -341,7 +341,8 @@ class Pipeline:
             )
         except Exception as exc:
             logger.warning(
-                "Catalog update failed after upgrading %s: %s", proposed.name, exc
+                "Catalog update failed after upgrading %s: %s", proposed.name, exc,
+                exc_info=True,
             )
             return
         logger.info("Upgraded %s from a better-named duplicate", proposed.name)

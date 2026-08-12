@@ -34,6 +34,15 @@ def _snapshot(dest: Path) -> set[str]:
     return {str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()}
 
 
+def _sidecar_bytes(dest: Path) -> dict[str, bytes]:
+    """Raw sidecar contents, keyed by relative path."""
+    return {
+        str(p.relative_to(dest)): p.read_bytes()
+        for p in dest.rglob("*.json")
+        if p.is_file()
+    }
+
+
 def _library(tmp_path):
     src = tmp_path / "src"
     src.mkdir()
@@ -53,19 +62,15 @@ def test_facts_then_enrich_reaches_a_fixed_point(tmp_path):
         # Capture the actual IMAGE bytes at each path (not just the count of
         # names) so this test would fail if a later cycle silently swapped
         # one file's content for another's while preserving the set of
-        # relative paths. Sidecars are deliberately excluded here: per
-        # enrich.py, classification is written to the sidecar UNCONDITIONALLY
-        # on every pass (only the filename/catalog rename is gated by
-        # is_upgrade), so a sidecar legitimately records the latest AI
-        # perception (e.g. primary_subject "beach" -> "mountain") even when
-        # nothing about the organized file's placement or name changes.
+        # relative paths.
         image_bytes_after_first_cycle = {
             p: p.read_bytes()
             for p in dest.rglob("*")
             if p.is_file() and p.suffix != ".json"
         }
 
-        for _ in range(3):
+        sidecars: dict[str, bytes] = {}
+        for i in range(3):
             Pipeline(src, dest, cat, write_sidecars=True).run()
             # reclassify=True forces every row back through Fixed("mountain")
             # even though all three are already enriched -- otherwise
@@ -78,6 +83,19 @@ def test_facts_then_enrich_reaches_a_fixed_point(tmp_path):
             )
             assert again.total == 3    # the pass genuinely ran on every file
             assert again.renamed == 0  # and changed nothing: equal tier is a no-op
+
+            # Sidecars must be stable ACROSS these repeated re-runs (i=0,1,2):
+            # the classifier answer ("mountain") is identical every time in
+            # this loop, so nothing here should cause per-pass churn (a stray
+            # timestamp, non-deterministic key order, etc). This is narrower
+            # than "sidecars never change at all" -- the one legitimate
+            # change, "beach" -> "mountain" on the FIRST call in this loop,
+            # already happened before this snapshot is taken, so it is not
+            # what this assertion is checking.
+            if i == 0:
+                sidecars = _sidecar_bytes(dest)
+            else:
+                assert _sidecar_bytes(dest) == sidecars
 
         assert _snapshot(dest) == after_first_cycle
         # The classifier changed subject ("beach" -> "mountain") between
