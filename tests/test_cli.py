@@ -363,7 +363,7 @@ def test_verify_non_pcs_file_skipped(runner: CliRunner, tmp_path: Path) -> None:
     # No per-file FAIL line (the summary word "FAILED" does not count).
     assert not any(ln.startswith("FAIL ") for ln in result.output.splitlines())
     assert "0 OK, 0 FAILED" in result.output
-    assert "No PCS-format image files found to verify." in result.output
+    assert "No organized image files (with an embedded digest) found to verify." in result.output
 
 
 def test_verify_directory_mixes_ok_and_skip(runner: CliRunner, tmp_path: Path) -> None:

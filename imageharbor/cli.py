@@ -555,7 +555,12 @@ def watch(
     type=click.Path(exists=True, path_type=Path),
 )
 def verify(path: Path) -> None:
-    """Verify PCS filename integrity for PATH (file or directory)."""
+    """Verify organized-file integrity for PATH (file or directory).
+
+    Every organized file embeds its SHA-256 digest in its filename (the last
+    43 characters of the stem, Base64url-encoded); this re-hashes each file's
+    content and confirms it still matches the digest embedded in its name.
+    """
     from .discovery import SUPPORTED_EXTENSIONS
 
     targets: list[Path]
@@ -574,7 +579,7 @@ def verify(path: Path) -> None:
             continue
         digest = extract_digest_from_stem(target.stem)
         if digest is None:
-            # Not a PCS-named file; skip silently
+            # No embedded digest in this filename; skip silently
             skip_count += 1
             continue
         if verify_pcs_file(target):
@@ -585,11 +590,11 @@ def verify(path: Path) -> None:
             click.echo(f"FAIL {target}", err=True)
 
     click.echo(
-        f"\nVerified {ok_count + fail_count} PCS image(s) "
-        f"({skip_count} non-image/non-PCS skipped): {ok_count} OK, {fail_count} FAILED"
+        f"\nVerified {ok_count + fail_count} organized image(s) "
+        f"({skip_count} non-image/no-digest skipped): {ok_count} OK, {fail_count} FAILED"
     )
     if ok_count + fail_count == 0:
-        click.echo("No PCS-format image files found to verify.", err=True)
+        click.echo("No organized image files (with an embedded digest) found to verify.", err=True)
         sys.exit(1)
     if fail_count:
         sys.exit(1)
