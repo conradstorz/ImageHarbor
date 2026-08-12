@@ -415,20 +415,39 @@ def test_pipeline_sidecar_failure_run_counts_no_errors(
 # ---------------------------------------------------------------------------
 
 
-def test_facts_pass_makes_no_ai_call(tmp_path, monkeypatch):
-    """The facts pass must not import or invoke a classifier."""
-    import imageharbor.ai_classifier as ai
+def test_facts_pass_makes_no_ai_call() -> None:
+    """`imageharbor.pipeline` must not import a classifier at all.
 
-    def boom(*args, **kwargs):
-        raise AssertionError("the facts pass called the AI")
+    A previous version of this test patched `StubClassifier.describe` and
+    asserted it was never called -- but `Pipeline` never constructs a
+    `StubClassifier` (or any classifier), so the patch was never in a
+    position to fire and the test was near-vacuous: it would pass even if
+    `pipeline.py` imported and called the AI directly through some other
+    path. Assert the actual claim instead, as a real import-boundary check:
+    importing `imageharbor.pipeline` in a fresh subprocess must never pull
+    `imageharbor.ai_classifier` into `sys.modules`. A subprocess is required
+    because within the same test process `ai_classifier` is typically
+    already imported by other tests/fixtures, which would make an in-process
+    check pass or fail for the wrong reason.
+    """
+    import subprocess
+    import sys
 
-    monkeypatch.setattr(ai.StubClassifier, "describe", boom)
-
-    src, dest = tmp_path / "src", tmp_path / "dest"
-    _make_image(src / "Emma's graduation.jpg")
-    with Catalog(tmp_path / "c.db") as cat:
-        stats = Pipeline(src, dest, cat).run()
-    assert stats.copied == 1
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import imageharbor.pipeline, sys\n"
+            "assert 'imageharbor.ai_classifier' not in sys.modules, (\n"
+            "    'imageharbor.pipeline import pulled in imageharbor.ai_classifier'\n"
+            ")\n",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"import-boundary check failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
 
 
 def test_human_named_undated_file_lands_in_undated(tmp_path):
