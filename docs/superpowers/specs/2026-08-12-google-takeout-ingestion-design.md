@@ -1,8 +1,30 @@
 # Google Takeout ingestion — design
 
 **Date:** 2026-08-12
-**Status:** approved, not yet implemented
+**Status:** implemented 2026-08-15 (see `docs/superpowers/plans/2026-08-15-google-takeout-ingestion.md`)
 **Extends:** [`2026-08-11-facts-first-pipeline-design.md`](2026-08-11-facts-first-pipeline-design.md)
+
+**Implementation notes — three deliberate departures from the text above:**
+
+1. `pairing.py` runs the case-insensitive retry (rung 6 in this document)
+   *before* truncation recovery (rung 5). An exact match modulo extension case
+   is strictly stronger evidence than a unique-prefix match, so running the
+   fuzzier rung first could shadow it. Rungs 1–4 keep the specified order.
+2. Phase 1 does **not** skip a `complete` archive "entirely": it loads that
+   archive's member paths from `takeout_members` (no zip opened, nothing
+   decompressed) so they still contribute to the global pairing index. Skipping
+   them outright would hide the sidecars of an archive ingested *before* the
+   part holding the photos they describe — the late-sidecar case in reverse.
+3. Phase 1 is a **two-pass** survey. Contributing an already-`complete`
+   archive's member paths to the pairing index solves only sidecars-first
+   ordering. The opposite -- and more common -- order is photos-first: part 1
+   ingests, its photos land in `Undated/` because their sidecars are in part 2,
+   part 1 is marked `complete`, and nothing ever revisits it. A second pass
+   therefore reopens a complete archive when, and only when, a member
+   demonstrably gained something: it is an image or video, has no
+   `sidecar_path` on record, and the freshly-built index now resolves one.
+   Reopened members return to `pending` and re-ingest as duplicates, routing
+   through `_maybe_upgrade_from_duplicate` -- no new placement code.
 
 ## Goal
 

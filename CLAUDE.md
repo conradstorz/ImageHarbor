@@ -42,6 +42,8 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 | Run the CLI | `uv run imageharbor --help` |
 | Organize a library (facts pass, no AI) | `uv run imageharbor process --source SRC --dest DEST` |
 | Describe/classify the organized copies | `uv run imageharbor enrich --dest DEST --ai openai` |
+| Ingest Google Takeout archives | `uv run imageharbor takeout ingest --archives DIR --dest DEST` |
+| Report Takeout ingestion progress | `uv run imageharbor takeout status --catalog DEST/catalog.db` |
 | Re-verify integrity | `uv run imageharbor verify DEST` |
 | Watch a library continuously (both passes) | `uv run imageharbor watch --source SRC --dest DEST` |
 | Build the Docker image | `docker build -t imageharbor:latest .` |
@@ -89,6 +91,30 @@ Module responsibilities:
   sidecar. Owns the `PipelineStats`/`ProcessResult` result types. If a post-copy
   integrity check fails, the copy is deleted and an error is raised — nothing
   enters the catalog unverified.
+- **`takeout/`** — Google Takeout archive ingestion, a third entry point into the
+  facts pass (`imageharbor takeout ingest`). Two phases: a **survey** that reads
+  only zip central directories (no decompression) and builds ONE pairing index
+  across every archive in the batch, then a resumable **ingest** that extracts
+  one member at a time into `<dest>/.takeout-staging/` and hands it to
+  `Pipeline.process_file`. The survey itself is two passes: pass one records
+  every `complete` archive's member paths from `takeout_members` (no zip
+  reopened) so a batch that already finished still contributes to the pairing
+  index; pass two then reopens a `complete` archive — and only that archive —
+  when the freshly-built index newly resolves a sidecar for one of its members
+  (an image/video with no `sidecar_path` on record), returning that member to
+  `pending` so it re-ingests as a duplicate through
+  `_maybe_upgrade_from_duplicate` and upgrades in place, handling the
+  photos-first-then-sidecars-later ordering with no new placement code. Four
+  modules: `metadata.py` (pure Google-JSON parser, never raises), `pairing.py`
+  (pure media→sidecar matcher that returns `None` rather than guess),
+  `archive.py` (identity, enumeration, classification, extraction), `ingest.py`
+  (the only module with side effects). Archives are opened `'r'` only and are
+  never modified. Makes **no AI calls**, so — exactly like the facts pass — it
+  never consults or feeds the circuit breaker. Videos are enumerated and
+  recorded as `deferred` with their capture date but no bytes are copied; video
+  ingestion is a deliberate later project. The global (not per-archive) pairing
+  index is load-bearing: Google's multi-part zips split by size across the file
+  list, so a photo and its `.json` routinely land in different parts.
 - **`tiers.py`** — pure, I/O-free module defining the two independent quality
   ladders (`DATE_*`, `DESC_*`) and the single predicate `is_upgrade(old, new)` that
   governs every rename in the system: a proposed `(date_tier, descriptor_tier)`
@@ -101,7 +127,11 @@ Module responsibilities:
   absent from the ladder because it records when a file was copied, not when a
   photo was taken. `date_from_row` rebuilds a `ResolvedDate` from stored catalog
   columns so both passes can compare a freshly-resolved date against the one on
-  record.
+  record. `resolve_date`'s `external_date` keyword populates the
+  `DATE_EXTERNAL_SIDECAR` (30) rung, which sits below EXIF `DateTimeOriginal` and
+  above `DateTimeDigitized`/`DateTime` — in practice Google Takeout's
+  `photoTakenTime`. Google's `creationTime` is deliberately excluded for the
+  same reason mtime is: it records upload time, not capture time.
 - **`descriptor.py`** — resolves a `ResolvedDescriptor` from the original
   filename's stem: a stem that doesn't match a `CAMERA_PATTERNS` entry (IMG_1234,
   DSC0042, Screenshot_…, WhatsApp Image …, etc.) is human-authored and gets
@@ -243,6 +273,13 @@ Module responsibilities:
   good files. Quarantine requires a *healthy* pass to observe the failure —
   see "Known limitations" below for the accepted boundary this creates when
   poison files constitute the entire remaining queue.
+  A `takeout_archives` table (`archive_id` = SHA-256 of the zip's own bytes,
+  `status` partial|complete|corrupt) and a `takeout_members` table
+  (`(archive_id, member_path)`, with terminal statuses `ingested`/`duplicate`/
+  `deferred`/`parsed`/`ignored`/`skipped_trash` and non-terminal `pending`/
+  `failed`) back Takeout ingestion's four idempotency layers. Both are purely
+  additive, so `SCHEMA_VERSION` stays `"2"` and an existing catalog upgrades in
+  place.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
@@ -257,7 +294,7 @@ Module responsibilities:
   `descriptor`/`exif`; the enrichment pass later merges `classification`. There is
   no standalone `write_sidecar` anymore — `merge_sidecar` is the only entry point.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
-  `catalog list/get`).
+  `catalog list/get`, `takeout ingest/status`).
 
 ## Critical invariants — do not break these
 
@@ -308,6 +345,13 @@ Module responsibilities:
   never reads `stat().st_mtime`: mtime records when a file was copied, not when a
   photo was taken, and asserting a date we can't support is exactly the quiet
   corruption the project's SHA-256 discipline exists to prevent.
+- **Takeout pairing never guesses, and Takeout archives are never written to.**
+  If no pairing rung yields exactly one sidecar match, `pairing.sidecar_for`
+  returns `None` and the member is ingested from EXIF and its filename alone —
+  a fully correct outcome. A *wrong* pairing writes another photo's capture date
+  into this photo's name and folder, which is exactly the quiet corruption the
+  SHA-256 discipline exists to prevent. Separately: archives are opened `'r'`
+  only, and Google's `creationTime` must never reach `resolve_date`.
 - **The 43-char digest is located by counting back from the end of the stem, NOT by
   splitting on the last `_`.** Base64url legitimately contains `_`, so a naive rsplit
   corrupts parsing. This logic is duplicated in `hashing.extract_digest_from_stem`

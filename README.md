@@ -15,7 +15,11 @@ Organizing is split into two independent passes:
   resolves a capture date and a descriptor from facts alone (EXIF and the
   original filename — never AI), copies, verifies, and catalogs. It makes **no
   AI calls and requires no AI backend**. A run with the AI backend permanently
-  offline is a *finished* run, not a degraded one.
+  offline is a *finished* run, not a degraded one. Google Takeout `.zip` exports
+  are ingested with `imageharbor takeout ingest`, which walks the archives
+  read-only and feeds each member through the same facts pass — Google's
+  `photoTakenTime` supplies a capture date when EXIF has none. Videos are
+  inventoried for a later project but not copied.
 - **Enrichment pass** (`imageharbor enrich`) — reads the organized copies (the
   source volume need not even be mounted), describes each image with a pluggable
   AI backend, and classifies it against a self-extending PCS taxonomy. It only
@@ -51,6 +55,8 @@ image's JSON sidecar, not in the path or filename.
 |---|---|
 | `imageharbor process --source SRC --dest DEST` | Organize a library (facts pass, no AI). |
 | `imageharbor enrich --dest DEST --ai openai` | Describe/classify already-organized images. |
+| `imageharbor takeout ingest --archives DIR --dest DEST` | Ingest Google Takeout archives. |
+| `imageharbor takeout status --catalog DEST/catalog.db` | Report Takeout ingestion progress. |
 | `imageharbor watch --source SRC --dest DEST` | Continuously run both passes on an interval. |
 | `imageharbor verify DEST` | Re-verify every organized file's digest against its filename. |
 
