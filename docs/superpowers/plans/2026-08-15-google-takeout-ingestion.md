@@ -72,7 +72,7 @@ second also produces `2015-03-09-2015-03-09_<digest>.jpg`, stating the date twic
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `resolve_descriptor(source_path: Path, *, original_name: str | None = None, date_str: str | None = None) -> ResolvedDescriptor`. Both new parameters are keyword-only and default to `None`, so the existing one-argument call in `enrich.py` and every existing test keep working.
+- Produces: `resolve_descriptor(source_path: Path, *, original_name: str | None = None, date_str: str | None = None) -> ResolvedDescriptor`. Both new parameters are keyword-only and default to `None`, so every existing test keeps working. The only production call sites are the two in `pipeline.py` updated by Step 5 — `enrich.py` does not call `resolve_descriptor` at all (it imports `date_from_row` only, and never re-resolves a descriptor from a filename).
 
 - [ ] **Step 1: Write the failing tests**
 
