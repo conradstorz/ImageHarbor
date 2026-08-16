@@ -555,6 +555,36 @@ def test_consume_source_defaults_to_copying(
     assert result.organized_path.exists()
 
 
+def test_consume_source_falls_back_to_copy_across_filesystems(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """EXDEV must degrade to copy-then-delete, not fail every member of the run.
+
+    No filesystem available to the test suite produces a genuine cross-device
+    rename, so the error is injected. Without this the fallback branch -- and
+    specifically its post-verification unlink -- is unreachable code that no
+    mutation can be caught by.
+    """
+    import os as _os
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    def _exdev(src, dst):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(_os, "replace", _exdev)
+
+    result = Pipeline(
+        tmp_path, organized_dir, catalog, consume_source=True
+    ).process_file(staged)
+
+    assert result.status == "copied"
+    assert result.organized_path.exists()
+    assert verify_pcs_file(result.organized_path)
+    # The fallback must still consume the source, and only after verifying.
+    assert not staged.exists()
+
+
 def test_source_label_is_what_gets_recorded(
     tmp_path: Path, organized_dir: Path, catalog: Catalog
 ) -> None:
