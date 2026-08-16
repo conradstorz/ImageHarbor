@@ -3110,6 +3110,45 @@ def test_the_same_photo_in_two_archives_yields_one_file_and_two_sources(
 # --- the late-sidecar case: the heart of the design ------------------------
 
 
+def test_a_complete_archive_is_reopened_only_when_metadata_actually_arrives(
+    dirs, catalog: Catalog, monkeypatch
+) -> None:
+    """The reopen is targeted, not a blanket re-scan of every complete archive.
+
+    This is what bounds the cost of the second survey pass. An archive whose
+    members gained nothing must stay skipped and extract nothing -- otherwise
+    every run would re-extract the entire library, and the four idempotency
+    layers would be decorative.
+    """
+    archives, dest = dirs
+    _zip(
+        archives / "paired.zip",
+        {
+            f"{D}/a.jpg": _jpeg(20),
+            f"{D}/a.jpg.json": _sidecar("a.jpg", 1425905792),
+        },
+    )
+    # No sidecar exists for this one anywhere, so it can never become pairable.
+    _zip(archives / "unpaired.zip", {f"{D}/b.jpg": _jpeg(21)})
+
+    first = ingest_archives(archives, dest, catalog)
+    assert first.ingested == 2
+    assert first.archives_reopened == 0
+
+    calls: list[str] = []
+    real = archive_mod.extract_to
+    monkeypatch.setattr(
+        archive_mod, "extract_to",
+        lambda zf, m, s: (calls.append(m.path), real(zf, m, s))[1],
+    )
+    second = ingest_archives(archives, dest, catalog)
+
+    assert calls == []                      # nothing re-extracted
+    assert second.archives_reopened == 0
+    assert second.archives_skipped == 2
+    assert second.ingested == 0
+
+
 def test_a_sidecar_arriving_in_a_later_part_relocates_the_photo(
     dirs, catalog: Catalog
 ) -> None:
@@ -3194,7 +3233,8 @@ class IngestStats:
     """Aggregated outcome of one ingest run."""
 
     archives_seen: int = 0
-    archives_skipped: int = 0     # already complete
+    archives_skipped: int = 0     # already complete, nothing new to do
+    archives_reopened: int = 0    # were complete; new work appeared (see _survey)
     archives_corrupt: int = 0
     ingested: int = 0
     duplicates: int = 0
@@ -3279,6 +3319,9 @@ class _Ingestor:
         """
         todo: list[tuple[archive.ArchiveIdentity, list[archive.MemberInfo]]] = []
         all_members: list[str] = []
+        # Archives already complete, held back until the index exists so the
+        # second pass below can tell whether new metadata reached them.
+        completed: list[tuple[archive.ArchiveIdentity, list]] = []
 
         for path in sorted(p for p in self.archives_dir.glob("*.zip") if p.is_file()):
             self.stats.archives_seen += 1
@@ -3295,18 +3338,18 @@ class _Ingestor:
                         self.catalog.takeout_archive_set_status(
                             identity.archive_id, "partial"
                         )
+                        self.stats.archives_reopened += 1
                         reopened = True
                 if not reopened:
                     # A complete archive still contributes its member paths to
-                    # the pairing index. Skipping it outright would hide the
-                    # sidecars of an archive ingested BEFORE the part holding
-                    # the photos they describe -- the late-sidecar case, in
-                    # reverse. Member paths come from the catalog, so no zip is
-                    # opened and nothing is decompressed.
-                    self.stats.archives_skipped += 1
-                    for member in self.catalog.takeout_members_all(identity.archive_id):
+                    # the pairing index, and is re-examined in the second pass
+                    # below once the index exists. Member paths come from the
+                    # catalog, so no zip is opened and nothing is decompressed.
+                    rows = self.catalog.takeout_members_all(identity.archive_id)
+                    for member in rows:
                         all_members.append(member["member_path"])
                         self.owner[member["member_path"]] = path
+                    completed.append((identity, rows))
                     continue
 
             try:
@@ -3358,6 +3401,65 @@ class _Ingestor:
         # routinely land in different parts; a per-archive index would silently
         # lose metadata at every part boundary.
         self.pairing_index = pairing.build_index(all_members)
+
+        # SECOND PASS -- the late-sidecar case, and the reason the survey has
+        # two passes at all.
+        #
+        # Contributing a complete archive's member paths to the index (above)
+        # only solves ONE ordering: sidecars ingested first, the photos they
+        # describe arriving later. The opposite order is the common one -- you
+        # download part 1, ingest it, and its photos land in Undated/ because
+        # their sidecars are in part 2 which you have not downloaded yet. When
+        # part 2 arrives, part 1 is `complete`, so without this pass nothing
+        # would ever revisit those photos and they would stay Undated/ forever.
+        #
+        # A member is reopened only when it demonstrably gained something: it
+        # is an image or a video, it has no sidecar on record, and the index
+        # NOW resolves one for it. Re-ingesting it makes its bytes hash as a
+        # duplicate, which routes through `_maybe_upgrade_from_duplicate` and
+        # relocates the file -- no new placement code, exactly as designed.
+        # The check is pure string work against an in-memory index, so an
+        # archive that never gains metadata costs nothing to re-examine.
+        for identity, rows in completed:
+            stale = [
+                row for row in rows
+                if row["kind"] in (archive.KIND_IMAGE, archive.KIND_VIDEO)
+                and not row["sidecar_path"]
+                and pairing.sidecar_for(row["member_path"], self.pairing_index) is not None
+            ]
+            if not stale:
+                self.stats.archives_skipped += 1
+                continue
+
+            self.stats.archives_reopened += 1
+            members = [
+                archive.MemberInfo(
+                    path=row["member_path"], size=row["size"],
+                    crc32=row["crc32"], kind=row["kind"],
+                )
+                for row in stale
+            ]
+            if self.dry_run:
+                # Report the work without performing or recording any of it.
+                todo.append((identity, members))
+                continue
+
+            for row in stale:
+                # Every field this row already holds must be passed back:
+                # `takeout_member_set` is a blind full-row UPDATE and would
+                # otherwise null what it does not receive. `sidecar_path` is
+                # deliberately left None -- re-ingesting is what establishes it.
+                self.catalog.takeout_member_set(
+                    identity.archive_id,
+                    row["member_path"],
+                    status=_PENDING,
+                    sha256_b64url=row["sha256_b64url"],
+                    taken_at=row["taken_at"],
+                    sidecar_path=None,
+                )
+            self.catalog.takeout_archive_set_status(identity.archive_id, "partial")
+            todo.append((identity, members))
+
         return todo
 
     # -- phase 2 ------------------------------------------------------------
@@ -3802,7 +3904,8 @@ def takeout_ingest(
         click.echo("[DRY-RUN] No files were extracted and nothing was recorded.")
     click.echo(
         f"archives {stats.archives_seen} "
-        f"(skipped {stats.archives_skipped}, corrupt {stats.archives_corrupt})"
+        f"(skipped {stats.archives_skipped}, reopened {stats.archives_reopened}, "
+        f"corrupt {stats.archives_corrupt})"
     )
     click.echo(
         f"ingested {stats.ingested} / duplicates {stats.duplicates} / "
