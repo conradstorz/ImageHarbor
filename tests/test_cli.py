@@ -701,6 +701,32 @@ def test_takeout_ingest(tmp_path) -> None:
     assert (dest / "2015" / "2015-03").exists()
 
 
+def test_takeout_ingest_reports_missing_metadata_neutrally(tmp_path) -> None:
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    _takeout_zip(
+        archives / "t.zip",
+        {
+            "Takeout/AlbumArchive/a/2015-03-09.jpg": b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9",
+            "Takeout/AlbumArchive/a/2015-03-09.jpg.json": json.dumps(
+                {"title": "2015-03-09.jpg",
+                 "photoTakenTime": {"timestampSeconds": "1425905792"}}
+            ).encode(),
+            "Takeout/AlbumArchive/a/no-metadata.jpg": b"\xff\xd8\xff\xe0" + b"\x05" * 16 + b"\xff\xd9",
+        },
+    )
+
+    result = CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "1 organized without Google metadata" in result.output
+    # Pins the fix rather than merely exercising the line: the old wording
+    # must not reappear.
+    assert "ingested without Google metadata" not in result.output
+
+
 def test_takeout_ingest_dry_run_writes_nothing(tmp_path) -> None:
     archives = tmp_path / "archives"
     archives.mkdir()
@@ -727,9 +753,12 @@ def test_takeout_status(tmp_path) -> None:
         archives / "t.zip",
         {"Takeout/a/x.jpg": b"\xff\xd8\xff\xe0" + b"\x02" * 16 + b"\xff\xd9"},
     )
-    CliRunner().invoke(
+    setup = CliRunner().invoke(
         main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
     )
+    # Assert the setup succeeded, so a failure here is diagnosed here rather
+    # than surfacing indirectly as a confusing assertion failure below.
+    assert setup.exit_code == 0, setup.output
 
     result = CliRunner().invoke(
         main, ["takeout", "status", "--catalog", str(dest / "catalog.db")]

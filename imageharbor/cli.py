@@ -703,7 +703,13 @@ def takeout_ingest(
         f"failed {stats.failed}"
     )
     if stats.missing_metadata:
-        click.echo(f"{stats.missing_metadata} ingested without Google metadata")
+        # Deliberately says "organized", not "ingested". The line above treats
+        # `ingested` and `duplicates` as separate categories, but this counter
+        # spans both -- and on a re-run of a multi-part export most members
+        # arrive as duplicates, so reusing "ingested" here would make an
+        # operator badly over-attribute the metadata gap to freshly-copied
+        # files.
+        click.echo(f"{stats.missing_metadata} organized without Google metadata")
 
     if stats.failed or stats.archives_corrupt:
         sys.exit(1)
