@@ -10,8 +10,10 @@ enrichment pass adds AI descriptions later.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +48,23 @@ class ProcessResult:
     status: str          # "copied" | "duplicate" | "skipped" | "error"
     organized_path: Path | None = None
     error: str = ""
+
+
+@dataclass(frozen=True)
+class ExternalEvidence:
+    """Facts about an image that are not in its bytes or its current path.
+
+    The parameter object for evidence a caller obtained elsewhere -- in
+    practice Google Takeout's per-media JSON. ``Pipeline`` unpacks it into the
+    two resolvers rather than passing it down, so neither resolver learns
+    anything about Takeout.
+
+    Google's ``creationTime`` must NEVER be placed in ``date``: it records when
+    a file was uploaded, not when the photo was taken.
+    """
+
+    date: datetime | None = None           # e.g. Google photoTakenTime
+    original_name: str | None = None       # e.g. Google `title`, pre-truncation
 
 
 @dataclass
@@ -94,6 +113,11 @@ class Pipeline:
         Whether to write a JSON sidecar alongside each organized image.
     dry_run:
         When True, no files are written and the catalog is not updated.
+    consume_source:
+        When True the source file is MOVED into the organized tree rather than
+        copied, because the caller created it as disposable staging. Ordering
+        becomes rename -> verify -> catalog; verification still reads the file
+        at its destination, so nothing enters the catalog unverified.
 
     This pass makes no AI calls: it decides placement (date) and naming
     (descriptor) purely from EXIF and the original filename. A separate
@@ -108,6 +132,7 @@ class Pipeline:
         duplicates_dir: Path | None = None,
         write_sidecars: bool = False,
         dry_run: bool = False,
+        consume_source: bool = False,
     ) -> None:
         self.source_dir = source_dir
         self.organized_dir = organized_dir
@@ -115,6 +140,13 @@ class Pipeline:
         self.duplicates_dir = duplicates_dir
         self.write_sidecars = write_sidecars
         self.dry_run = dry_run
+        # When True the "source" is a disposable staging file this process
+        # created and owns, so the copy step MOVES instead of copying -- half
+        # the write I/O, which is material at 60 GB per export over a NAS
+        # mount. The guarded invariant is untouched: the original is the zip,
+        # which is never opened for writing; a staging file is not an original.
+        # `process` and `watch` never set this.
+        self.consume_source = consume_source
         # Tracks content digests seen during a dry run, so intra-run duplicates
         # are detected even though the catalog is never written in dry_run mode.
         self._dry_run_seen: set[str] = set()
@@ -137,9 +169,26 @@ class Pipeline:
             _log_result(result)
         return stats
 
-    def process_file(self, image_path: Path) -> ProcessResult:
-        """Process a single image file and return its result."""
-        result = self._process_one(image_path)
+    def process_file(
+        self,
+        image_path: Path,
+        *,
+        source_label: str | None = None,
+        evidence: ExternalEvidence | None = None,
+    ) -> ProcessResult:
+        """Process a single image file and return its result.
+
+        *source_label* is the LOGICAL source recorded in `sources` and
+        `photos.original_path`, when that differs from where the bytes
+        currently sit -- e.g. ``/nas/t1.zip!Takeout/.../2015-03-09.jpg`` for a
+        member staged out of an archive. It is stable across runs and across
+        machines that mount the archive at the same path, so the back-pointer
+        set stays meaningful after the staging file is gone.
+
+        *evidence* supplies facts from outside the file's bytes and path; see
+        :class:`ExternalEvidence`.
+        """
+        result = self._process_one(image_path, source_label=source_label, evidence=evidence)
         _log_result(result)
         return result
 
@@ -147,9 +196,15 @@ class Pipeline:
     # Internal
     # ------------------------------------------------------------------
 
-    def _process_one(self, source_path: Path) -> ProcessResult:
+    def _process_one(
+        self,
+        source_path: Path,
+        *,
+        source_label: str | None = None,
+        evidence: ExternalEvidence | None = None,
+    ) -> ProcessResult:
         try:
-            return self._do_process(source_path)
+            return self._do_process(source_path, source_label=source_label, evidence=evidence)
         except Exception as exc:
             logger.exception("Unexpected error processing %s", source_path)
             return ProcessResult(
@@ -159,7 +214,17 @@ class Pipeline:
                 error=str(exc),
             )
 
-    def _do_process(self, source_path: Path) -> ProcessResult:
+    def _do_process(
+        self,
+        source_path: Path,
+        *,
+        source_label: str | None = None,
+        evidence: ExternalEvidence | None = None,
+    ) -> ProcessResult:
+        # The logical identity of these bytes, which may outlive the path they
+        # currently sit at.
+        label = source_label or str(source_path)
+
         # Step 1: hash original
         sha256_b64url = compute_sha256_b64url(source_path)
         stat = source_path.stat()
@@ -171,11 +236,13 @@ class Pipeline:
             self.dry_run and sha256_b64url in self._dry_run_seen
         ):
             if not self.dry_run:
-                self.catalog.mark_duplicate(sha256_b64url, str(source_path))
+                self.catalog.mark_duplicate(sha256_b64url, label)
                 self.catalog.record_source(
-                    sha256_b64url, str(source_path), stat.st_size, stat.st_mtime_ns
+                    sha256_b64url, label, stat.st_size, stat.st_mtime_ns
                 )
-                self._maybe_upgrade_from_duplicate(source_path, sha256_b64url)
+                self._maybe_upgrade_from_duplicate(
+                    source_path, sha256_b64url, evidence=evidence
+                )
                 if self.duplicates_dir:
                     self._copy_to_duplicates(source_path, sha256_b64url)
             return ProcessResult(
@@ -197,8 +264,14 @@ class Pipeline:
         exif_data = read_exif(source_path)
 
         # Step 4: facts -- date decides the folder, descriptor decides the name.
-        date = resolve_date(source_path, exif_data)
-        descriptor = resolve_descriptor(source_path, date_str=date.date_str)
+        date = resolve_date(
+            source_path, exif_data, external_date=evidence.date if evidence else None
+        )
+        descriptor = resolve_descriptor(
+            source_path,
+            original_name=evidence.original_name if evidence else None,
+            date_str=date.date_str,
+        )
 
         # Step 5: destination
         extension = source_path.suffix.lstrip(".").lower()
@@ -206,17 +279,24 @@ class Pipeline:
             self.organized_dir, date, descriptor.value, sha256_b64url, extension
         )
 
-        # Step 6: copy
+        # Step 6: copy (or MOVE, when the source is disposable staging)
         organized_path.parent.mkdir(parents=True, exist_ok=True)
         if organized_path.exists() and verify_file(organized_path, sha256_b64url):
             logger.debug(
                 "Destination already present and verified, skipping copy: %s",
                 organized_path,
             )
+            if self.consume_source:
+                source_path.unlink(missing_ok=True)
         else:
-            shutil.copy2(str(source_path), str(organized_path))
+            if self.consume_source:
+                os.replace(str(source_path), str(organized_path))
+            else:
+                shutil.copy2(str(source_path), str(organized_path))
 
-            # Step 7: verify before anything is recorded
+            # Step 7: verify before anything is recorded. This reads the file
+            # at its DESTINATION either way, so the move path is verified
+            # exactly as strictly as the copy path.
             if not verify_file(organized_path, sha256_b64url):
                 organized_path.unlink(missing_ok=True)
                 raise RuntimeError(
@@ -226,7 +306,7 @@ class Pipeline:
         # Step 8: catalog
         self.catalog.upsert(
             sha256_b64url=sha256_b64url,
-            original_path=str(source_path),
+            original_path=label,
             organized_path=str(organized_path),
             exif=exif_data,
             date_value=date.date_str,
@@ -238,13 +318,13 @@ class Pipeline:
             processing_history=[
                 {
                     "event": "facts",
-                    "source": str(source_path),
+                    "source": label,
                     "destination": str(organized_path),
                 }
             ],
         )
         self.catalog.record_source(
-            sha256_b64url, str(source_path), stat.st_size, stat.st_mtime_ns
+            sha256_b64url, label, stat.st_size, stat.st_mtime_ns
         )
 
         # Step 9: optional sidecar. A sidecar failure must never fail an image
@@ -270,20 +350,32 @@ class Pipeline:
         )
 
     def _maybe_upgrade_from_duplicate(
-        self, source_path: Path, sha256_b64url: str
+        self,
+        source_path: Path,
+        sha256_b64url: str,
+        *,
+        evidence: ExternalEvidence | None = None,
     ) -> None:
         """Re-evaluate a known file's tiers against a newly-seen source path.
 
         Identical bytes mean identical EXIF, but not identical filenames: the
         same photo found at a better-named path can supply a date or a
-        descriptor the first copy lacked.
+        descriptor the first copy lacked.  *evidence* is the same channel for
+        facts that live outside the file entirely -- a Takeout sidecar that
+        only arrived in a later archive part.
         """
         row = self.catalog.get_by_sha256(sha256_b64url)
         if row is None or not row["organized_path"]:
             return
 
-        date = resolve_date(source_path, {})
-        descriptor = resolve_descriptor(source_path, date_str=date.date_str)
+        date = resolve_date(
+            source_path, {}, external_date=evidence.date if evidence else None
+        )
+        descriptor = resolve_descriptor(
+            source_path,
+            original_name=evidence.original_name if evidence else None,
+            date_str=date.date_str,
+        )
         old = (row["date_tier"] or 0, row["descriptor_tier"] or 0)
         new = (max(old[0], date.tier), max(old[1], descriptor.tier))
         if not tiers.is_upgrade(old, new):

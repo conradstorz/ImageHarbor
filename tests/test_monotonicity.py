@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from imageharbor.ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from imageharbor.catalog import Catalog
 from imageharbor.enrich import enrich_library
@@ -13,6 +15,25 @@ from imageharbor.tiers import (
     DESC_HUMAN_FILENAME,
     DESC_NONE,
 )
+
+
+# ---------------------------------------------------------------------------
+# Fixtures (copied from tests/test_pipeline.py -- not previously defined here)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def organized_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "organized"
+    d.mkdir()
+    return d
+
+
+@pytest.fixture()
+def catalog(tmp_path: Path) -> Catalog:
+    cat = Catalog(tmp_path / "catalog.db")
+    yield cat
+    cat.close()
 
 
 class Fixed(StubClassifier):
@@ -386,3 +407,57 @@ def test_a_human_named_duplicate_displaces_an_ai_name(tmp_path):
         final_row = cat.get_by_sha256(digest)
         assert Path(final_row["organized_path"]) == upgraded_path
         assert upgraded_path.exists()
+
+
+def test_late_evidence_upgrades_a_duplicate_out_of_undated(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The late-arriving-sidecar case, at the pipeline level.
+
+    Part 1 ingests with no Google date -> Undated/. Part 2 arrives carrying the
+    sidecar, the bytes hash as a duplicate, and the EXISTING monotonic upgrade
+    machinery relocates the file. No new code path is needed for this --
+    only that `_maybe_upgrade_from_duplicate` is given the evidence.
+    """
+    from datetime import datetime
+
+    from imageharbor.pipeline import ExternalEvidence, Pipeline
+
+    staged = tmp_path / "IMG_1234.jpg"
+    staged.write_bytes(b"\xff\xd8\xff\xe0" + b"\x07" * 16 + b"\xff\xd9")
+
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    first = pipeline.process_file(staged)
+    assert first.organized_path.parent == organized_dir / "Undated"
+
+    second = pipeline.process_file(
+        staged, evidence=ExternalEvidence(date=datetime(2015, 3, 9, 12, 56, 32))
+    )
+    assert second.status == "duplicate"
+
+    row = catalog.get_by_sha256(first.sha256_b64url)
+    assert Path(row["organized_path"]).parent == organized_dir / "2015" / "2015-03"
+    assert Path(row["organized_path"]).exists()
+    assert not first.organized_path.exists()
+
+
+def test_re_ingesting_the_same_evidence_is_a_rename_no_op(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    from datetime import datetime
+
+    from imageharbor.pipeline import ExternalEvidence, Pipeline
+
+    staged = tmp_path / "IMG_1234.jpg"
+    staged.write_bytes(b"\xff\xd8\xff\xe0" + b"\x08" * 16 + b"\xff\xd9")
+    evidence = ExternalEvidence(date=datetime(2015, 3, 9))
+
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    first = pipeline.process_file(staged, evidence=evidence)
+    before = catalog.get_by_sha256(first.sha256_b64url)["organized_path"]
+
+    pipeline.process_file(staged, evidence=evidence)
+    after = catalog.get_by_sha256(first.sha256_b64url)["organized_path"]
+
+    assert before == after
+    assert Path(after).exists()

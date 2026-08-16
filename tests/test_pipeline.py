@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 from imageharbor import tiers
 from imageharbor.catalog import Catalog
 from imageharbor.hashing import verify_pcs_file
-from imageharbor.pipeline import Pipeline
+from imageharbor.pipeline import ExternalEvidence, Pipeline
 
 
 # ---------------------------------------------------------------------------
@@ -525,3 +526,84 @@ def test_sidecar_records_facts_and_sources(tmp_path):
     assert data["date"]["source"] == "none"
     assert len(data["sources"]) == 1
     assert "classification" not in data
+
+
+def test_consume_source_moves_instead_of_copying(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    staged = _make_jpeg(staging / "beach.jpg")
+
+    pipeline = Pipeline(staging, organized_dir, catalog, consume_source=True)
+    result = pipeline.process_file(staged)
+
+    assert result.status == "copied"
+    assert not staged.exists()                      # consumed
+    assert result.organized_path.exists()
+    assert verify_pcs_file(result.organized_path)   # verified AFTER the move
+
+
+def test_consume_source_defaults_to_copying(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    original = source_dir / "beach_photo.jpg"
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    result = pipeline.process_file(original)
+
+    assert original.exists()                        # untouched
+    assert result.organized_path.exists()
+
+
+def test_source_label_is_what_gets_recorded(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The staging path is disposable; the logical source is the archive member."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    staged = _make_jpeg(staging / "beach.jpg")
+    label = "/nas/takeout/t1.zip!Takeout/AlbumArchive/a/beach.jpg"
+
+    pipeline = Pipeline(staging, organized_dir, catalog)
+    result = pipeline.process_file(staged, source_label=label)
+
+    row = catalog.get_by_sha256(result.sha256_b64url)
+    assert row["original_path"] == label
+    assert [r["source_path"] for r in catalog.sources_for(result.sha256_b64url)] == [label]
+
+
+def test_evidence_date_places_the_file(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    staged = _make_jpeg(tmp_path / "IMG_1234.jpg")
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    result = pipeline.process_file(
+        staged, evidence=ExternalEvidence(date=datetime(2015, 3, 9, 12, 56, 32))
+    )
+
+    assert result.organized_path.parent == organized_dir / "2015" / "2015-03"
+    row = catalog.get_by_sha256(result.sha256_b64url)
+    assert row["date_tier"] == tiers.DATE_EXTERNAL_SIDECAR
+    assert row["date_source"] == "external_sidecar"
+
+
+def test_evidence_original_name_names_the_file(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    staged = _make_jpeg(tmp_path / "truncated-stem.jpg")
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    result = pipeline.process_file(
+        staged, evidence=ExternalEvidence(original_name="emma birthday party.jpg")
+    )
+
+    assert "emma-birthday-party" in result.organized_path.name
+    row = catalog.get_by_sha256(result.sha256_b64url)
+    assert row["descriptor_tier"] == tiers.DESC_HUMAN_FILENAME
+
+
+def test_evidence_none_leaves_behavior_unchanged(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    with_none = pipeline.process_file(source_dir / "beach_photo.jpg", evidence=None)
+    assert with_none.organized_path.parent == organized_dir / "Undated"
