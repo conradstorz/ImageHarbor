@@ -13,6 +13,7 @@ from .catalog import Catalog
 from .enrich import enrich_library
 from .hashing import extract_digest_from_stem, verify_pcs_file
 from .pipeline import Pipeline
+from .takeout.ingest import ingest_archives
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +598,145 @@ def verify(path: Path) -> None:
         sys.exit(1)
     if fail_count:
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# takeout
+# ---------------------------------------------------------------------------
+
+
+@click.group()
+def takeout_cmd() -> None:
+    """Ingest Google Takeout archives.
+
+    Archives are opened read-only and are never modified. Ingestion is a
+    hand-run verb: `watch` does not drive it.
+    """
+
+
+@takeout_cmd.command(name="ingest")
+@click.option(
+    "--archives",
+    "archives_dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Directory holding Google Takeout .zip archives (read-only).",
+)
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Root directory for the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog.  Defaults to <dest>/catalog.db.",
+)
+@click.option(
+    "--sidecar/--no-sidecar",
+    default=False,
+    show_default=True,
+    help="Write a JSON sidecar alongside each organized image.",
+)
+@click.option(
+    "--include-trash",
+    is_flag=True,
+    default=False,
+    help="Also ingest members under a Trash/ tree (skipped by default).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Survey the archives and report, without extracting or writing anything.",
+)
+def takeout_ingest(
+    archives_dir: Path,
+    dest: Path,
+    catalog_path: Path | None,
+    sidecar: bool,
+    include_trash: bool,
+    dry_run: bool,
+) -> None:
+    """Ingest Google Takeout archives from ARCHIVES into DEST.
+
+    This is a facts pass: it makes no AI calls and requires no AI backend. Run
+    `enrich` afterwards to describe and classify the organized copies.
+    """
+    _guard_dest_not_inside_source(archives_dir, dest)
+
+    if catalog_path is None:
+        catalog_path = dest / "catalog.db"
+
+    if dry_run:
+        # Nothing may touch the disk: no dest tree, no catalog file. The
+        # in-memory catalog reads empty, so every archive reports as new --
+        # which is the honest answer for a run that will not record anything.
+        catalog_target = Path(":memory:")
+    else:
+        dest.mkdir(parents=True, exist_ok=True)
+        catalog_target = catalog_path
+
+    with Catalog(catalog_target) as catalog:
+        stats = ingest_archives(
+            archives_dir,
+            dest,
+            catalog,
+            include_trash=include_trash,
+            write_sidecars=sidecar,
+            dry_run=dry_run,
+        )
+
+    if dry_run:
+        click.echo("[DRY-RUN] No files were extracted and nothing was recorded.")
+    click.echo(
+        f"archives {stats.archives_seen} "
+        f"(skipped {stats.archives_skipped}, reopened {stats.archives_reopened}, "
+        f"corrupt {stats.archives_corrupt})"
+    )
+    click.echo(
+        f"ingested {stats.ingested} / duplicates {stats.duplicates} / "
+        f"deferred {stats.deferred} / trash {stats.skipped_trash} / "
+        f"failed {stats.failed}"
+    )
+    if stats.missing_metadata:
+        click.echo(f"{stats.missing_metadata} ingested without Google metadata")
+
+    if stats.failed or stats.archives_corrupt:
+        sys.exit(1)
+
+
+@takeout_cmd.command(name="status")
+@click.option(
+    "--catalog",
+    "catalog_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog.",
+)
+def takeout_status(catalog_path: Path) -> None:
+    """Report Takeout ingestion progress."""
+    with Catalog(catalog_path) as cat:
+        counts = cat.takeout_status_counts()
+
+    archives = counts["archives"]
+    total = sum(archives.values())
+    detail = ", ".join(f"{n} {status}" for status, n in sorted(archives.items()))
+    click.echo(f"{total} archive{'s' if total != 1 else ''}: {detail or 'none'}")
+
+    members = counts["members"]
+    member_detail = ", ".join(f"{n} {status}" for status, n in sorted(members.items()))
+    click.echo(f"members: {member_detail or 'none'}")
+
+    if counts["missing_metadata"]:
+        click.echo(f"{counts['missing_metadata']} members missing Google metadata")
+
+
+# Alias so `imageharbor takeout ingest` works
+main.add_command(takeout_cmd, name="takeout")
 
 
 # ---------------------------------------------------------------------------

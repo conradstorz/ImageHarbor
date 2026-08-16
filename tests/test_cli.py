@@ -8,6 +8,7 @@ throughout so no network access is required.
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -663,3 +664,81 @@ def test_enrich_command_aborts_and_reports_when_backend_down(tmp_path, monkeypat
     )
     assert result.exit_code == 1
     assert "backend appears down" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# takeout ingest / status
+# ---------------------------------------------------------------------------
+
+
+def _takeout_zip(path, entries):
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return path
+
+
+def test_takeout_ingest(tmp_path) -> None:
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    _takeout_zip(
+        archives / "t.zip",
+        {
+            "Takeout/AlbumArchive/a/2015-03-09.jpg": b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9",
+            "Takeout/AlbumArchive/a/2015-03-09.jpg.json": json.dumps(
+                {"title": "2015-03-09.jpg",
+                 "photoTakenTime": {"timestampSeconds": "1425905792"}}
+            ).encode(),
+        },
+    )
+
+    result = CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "ingested 1" in result.output
+    assert (dest / "2015" / "2015-03").exists()
+
+
+def test_takeout_ingest_dry_run_writes_nothing(tmp_path) -> None:
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    _takeout_zip(
+        archives / "t.zip",
+        {"Takeout/a/x.jpg": b"\xff\xd8\xff\xe0" + b"\x01" * 16 + b"\xff\xd9"},
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest), "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "[DRY-RUN]" in result.output
+    assert not (dest / "catalog.db").exists()
+
+
+def test_takeout_status(tmp_path) -> None:
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    _takeout_zip(
+        archives / "t.zip",
+        {"Takeout/a/x.jpg": b"\xff\xd8\xff\xe0" + b"\x02" * 16 + b"\xff\xd9"},
+    )
+    CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+
+    result = CliRunner().invoke(
+        main, ["takeout", "status", "--catalog", str(dest / "catalog.db")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "1 archive" in result.output
+
+
+def test_takeout_group_has_no_default_subcommand() -> None:
+    result = CliRunner().invoke(main, ["takeout"])
+    assert "ingest" in result.output
+    assert "status" in result.output
