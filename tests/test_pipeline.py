@@ -585,6 +585,39 @@ def test_consume_source_falls_back_to_copy_across_filesystems(
     assert not staged.exists()
 
 
+def test_fallback_keeps_the_staging_file_when_verification_fails(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """The ordering guarantee: unlink happens only AFTER the destination verifies.
+
+    Forces both halves of the hazard at once -- a cross-device rename (so the
+    copy fallback runs) and a failed integrity check. The staging bytes must
+    survive, because on this path they are the only recoverable copy and the
+    caller has to be able to retry. Inverting verify and unlink would destroy
+    them and leave nothing to retry from, which no other test would catch.
+    """
+    import os as _os
+
+    from imageharbor import pipeline as pipeline_mod
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    def _exdev(src, dst):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(_os, "replace", _exdev)
+    monkeypatch.setattr(pipeline_mod, "verify_file", lambda path, digest: False)
+
+    result = Pipeline(
+        tmp_path, organized_dir, catalog, consume_source=True
+    ).process_file(staged)
+
+    assert result.status == "error"
+    assert staged.exists()                              # recoverable
+    assert list(organized_dir.rglob("*.jpg")) == []     # no unverified file left
+    assert catalog.count() == 0                         # nothing catalogued
+
+
 def test_source_label_is_what_gets_recorded(
     tmp_path: Path, organized_dir: Path, catalog: Catalog
 ) -> None:
