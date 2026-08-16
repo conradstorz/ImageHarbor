@@ -198,7 +198,7 @@ class Pipeline:
 
         # Step 4: facts -- date decides the folder, descriptor decides the name.
         date = resolve_date(source_path, exif_data)
-        descriptor = resolve_descriptor(source_path)
+        descriptor = resolve_descriptor(source_path, date_str=date.date_str)
 
         # Step 5: destination
         extension = source_path.suffix.lstrip(".").lower()
@@ -283,7 +283,7 @@ class Pipeline:
             return
 
         date = resolve_date(source_path, {})
-        descriptor = resolve_descriptor(source_path)
+        descriptor = resolve_descriptor(source_path, date_str=date.date_str)
         old = (row["date_tier"] or 0, row["descriptor_tier"] or 0)
         new = (max(old[0], date.tier), max(old[1], descriptor.tier))
         if not tiers.is_upgrade(old, new):
