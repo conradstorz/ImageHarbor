@@ -74,12 +74,26 @@ EMPTY_ALBUM = AlbumMetadata()
 
 
 def _load(raw: bytes) -> dict[str, Any] | None:
-    """Decode *raw* into a JSON object, or None if it is not one."""
+    """Decode *raw* into a JSON object, or None if it is not one.
+
+    The `except Exception` is deliberate and is scoped to the single decode
+    call. This module's contract is absolute -- it NEVER raises -- and any
+    explicit exception tuple is a standing guess about what `json.loads` can
+    throw. That guess was already wrong once: a tuple of
+    `(JSONDecodeError, UnicodeError, ValueError)` does not catch the
+    `RecursionError` that deeply nested input raises (`b"[" * 200000`), which
+    a corrupted or partially-rewritten sidecar can easily produce. A sidecar
+    is supplementary evidence; a bad one must degrade a photo to "no Google
+    metadata", never fail it, and never take down a 100k-member ingest.
+
+    `exif_reader.read_exif` catches broadly for exactly this reason. Keep the
+    two consistent.
+    """
     if not raw:
         return None
     try:
         data = json.loads(raw.decode("utf-8", "replace"))
-    except (json.JSONDecodeError, UnicodeError, ValueError) as exc:
+    except Exception as exc:
         logger.debug("Unparseable Takeout sidecar (%s); treating as absent", exc)
         return None
     return data if isinstance(data, dict) else None

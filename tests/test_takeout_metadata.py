@@ -131,3 +131,40 @@ def test_parse_album_metadata() -> None:
 
 def test_parse_album_metadata_never_raises() -> None:
     assert parse_album_metadata(b"{{{").title is None
+
+
+def test_deeply_nested_array_never_raises() -> None:
+    """Adversarial input, not fuzzing -- this pins the never-raise contract.
+
+    `json.loads` on deeply nested input raises `RecursionError`, which is a
+    `RuntimeError` subclass, not a `ValueError`/`JSONDecodeError`/
+    `UnicodeError`. A corrupted or partially-rewritten sidecar can plausibly
+    produce this shape. If this test is ever deleted because it "looks like
+    arbitrary fuzzing," the module's absolute never-raise contract is no
+    longer verified against the exact input that once defeated it.
+    """
+    meta = parse_photo_metadata(b"[" * 200000)
+    assert meta == EMPTY
+
+
+def test_deeply_nested_object_never_raises_for_album_metadata() -> None:
+    """Same contract as above, exercised through the object-decoding path.
+
+    Adversarial input, not fuzzing -- do not delete this thinking it is a
+    stray fuzz test. `parse_album_metadata` shares `_load` with
+    `parse_photo_metadata`; this pins the object-nesting form of the same
+    `RecursionError` hole (the array form is covered separately).
+    """
+    raw = b'{"a":' * 200000 + b"1" + b"}" * 200000
+    album = parse_album_metadata(raw)
+    assert album.title is None
+    assert album.description is None
+
+
+def test_geodata_with_only_latitude_is_treated_as_absent() -> None:
+    """A partial geoData block (latitude without longitude) must not leak a
+    half-populated coordinate -- both fields resolve to None together."""
+    raw = json.dumps({"geoData": {"latitude": 38.2768361}}).encode()
+    meta = parse_photo_metadata(raw)
+    assert meta.latitude is None
+    assert meta.longitude is None
