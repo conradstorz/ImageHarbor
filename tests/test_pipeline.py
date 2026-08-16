@@ -689,12 +689,20 @@ def test_evidence_original_name_names_the_file(
 def test_omitting_the_new_arguments_reproduces_todays_behavior(
     tmp_path: Path, organized_dir: Path
 ) -> None:
-    """The regression surface: `process`/`watch` must be byte-for-byte unchanged.
+    """Passing the new arguments explicitly as None is equivalent to omitting them.
 
     Runs identical bytes through two independent libraries -- one calling
     `process_file(path)` exactly as `watcher.py` does, one passing the new
     arguments explicitly as None -- and compares every field that decides
     placement, naming, and identity.
+
+    This does NOT pin `process`/`watch` as byte-for-byte unchanged overall --
+    this branch intentionally changed plain `process` behavior for two
+    descriptor shapes (a bare `YYYY.MM.DD` stem, and a Google-Photos-style
+    `..._account_id=N` stem), both improvements, pinned separately in
+    `tests/test_descriptor.py`. The filename used here ("beach photo.jpg") is
+    unaffected by either change, which is exactly why it isolates the
+    None-vs-omitted question this test actually asks.
     """
     src = tmp_path / "src"
     src.mkdir()

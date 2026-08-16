@@ -5,7 +5,10 @@ place of an archive -- the zip IS the original, and originals are read-only.
 
 Enumeration reads only the central directory, so surveying a 60 GB export
 costs a seek, not a decompression pass. Extraction is per member, on demand,
-into a staging directory the caller owns.
+into a staging directory the caller owns. `identify` is the exception: on a
+stat miss (a path/size/mtime the catalog has not seen before) it hashes the
+entire archive to key it, which IS a full read of the file's bytes -- not
+merely a seek.
 """
 
 from __future__ import annotations

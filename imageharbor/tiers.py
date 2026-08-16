@@ -11,7 +11,7 @@ from __future__ import annotations
 
 # --- Date tier: decides placement -----------------------------------------
 DATE_EXIF_ORIGINAL = 40      # EXIF DateTimeOriginal
-DATE_EXTERNAL_SIDECAR = 30   # reserved: Google Takeout photoTakenTime
+DATE_EXTERNAL_SIDECAR = 30   # Google Takeout photoTakenTime, via ExternalEvidence.date
 DATE_EXIF_OTHER = 20         # DateTimeDigitized, DateTime
 DATE_FILENAME_PATTERN = 10   # date parsed out of the original filename
 DATE_NONE = 0                # no trustworthy date -> Undated/

@@ -114,6 +114,12 @@ class _Ingestor:
         # read without re-surveying.
         self.owner: dict[str, Path] = {}
         self.pairing_index = pairing.PairingIndex()
+        # Open zip handles, cached for the lifetime of run(). Re-opening a zip
+        # re-parses its whole central directory (~91ms measured on a
+        # 20,000-member archive), and every paired member triggers a
+        # `_read_sidecar` call, so without caching a 100k-member batch spends
+        # hours in pure re-parsing. Closed in run()'s `finally`.
+        self._open_zips: dict[Path, zipfile.ZipFile] = {}
         self.pipeline = Pipeline(
             source_dir=self.staging_dir,
             organized_dir=organized_dir,
@@ -289,13 +295,27 @@ class _Ingestor:
 
     # -- phase 2 ------------------------------------------------------------
 
+    def _zip_for(self, path: Path) -> zipfile.ZipFile:
+        """Return a cached, open handle for *path*, opening it on first use.
+
+        Every paired member calls `_read_sidecar`, which without caching
+        reopened the owning zip -- and re-parsed its whole central directory
+        -- per call. Cached for the lifetime of `run()`; closed in its
+        `finally`.
+        """
+        zf = self._open_zips.get(path)
+        if zf is None:
+            zf = zipfile.ZipFile(path, "r")
+            self._open_zips[path] = zf
+        return zf
+
     def _read_sidecar(self, sidecar_member: str) -> metadata.TakeoutMetadata:
         owner = self.owner.get(sidecar_member)
         if owner is None:
             return metadata.EMPTY
         try:
-            with zipfile.ZipFile(owner, "r") as zf:
-                return metadata.parse_photo_metadata(archive.read_member(zf, sidecar_member))
+            zf = self._zip_for(owner)
+            return metadata.parse_photo_metadata(archive.read_member(zf, sidecar_member))
         except (zipfile.BadZipFile, KeyError, OSError) as exc:
             logger.warning("Unreadable sidecar %s (%s); ingesting without it",
                            sidecar_member, exc)
@@ -542,6 +562,11 @@ class _Ingestor:
             return self.stats
 
         self.staging_dir.mkdir(parents=True, exist_ok=True)
-        for identity, _members in todo:
-            self._ingest_archive(identity)
+        try:
+            for identity, _members in todo:
+                self._ingest_archive(identity)
+        finally:
+            for zf in self._open_zips.values():
+                zf.close()
+            self._open_zips.clear()
         return self.stats
