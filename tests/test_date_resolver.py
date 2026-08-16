@@ -118,3 +118,51 @@ def test_undated_folder(tmp_path):
     resolved = resolve_date(_p(tmp_path, "IMG_1234.jpg"), {})
     assert resolved.folder == UNDATED_FOLDER
     assert resolved.date_str is None
+
+
+# --- external sidecar rung -------------------------------------------------
+
+def test_exif_original_outranks_external_sidecar(tmp_path) -> None:
+    exif = {"DateTimeOriginal": "2019:07:04 12:33:11"}
+    resolved = resolve_date(
+        _p(tmp_path, "IMG_1234.jpg"), exif, external_date=datetime(2015, 3, 9, 12, 56, 32)
+    )
+    assert resolved.tier == tiers.DATE_EXIF_ORIGINAL
+    assert resolved.value == datetime(2019, 7, 4, 12, 33, 11)
+
+
+def test_external_sidecar_outranks_exif_digitized(tmp_path) -> None:
+    exif = {"DateTimeDigitized": "2019:07:04 12:33:11"}
+    resolved = resolve_date(
+        _p(tmp_path, "IMG_1234.jpg"), exif, external_date=datetime(2015, 3, 9, 12, 56, 32)
+    )
+    assert resolved.tier == tiers.DATE_EXTERNAL_SIDECAR
+    assert resolved.source == "external_sidecar"
+    assert resolved.value == datetime(2015, 3, 9, 12, 56, 32)
+    assert resolved.folder == "2015/2015-03"
+
+
+def test_external_sidecar_outranks_a_filename_pattern(tmp_path) -> None:
+    resolved = resolve_date(
+        _p(tmp_path, "IMG_20190704_123456.jpg"), {}, external_date=datetime(2015, 3, 9)
+    )
+    assert resolved.tier == tiers.DATE_EXTERNAL_SIDECAR
+    assert resolved.value == datetime(2015, 3, 9)
+
+
+def test_external_sidecar_is_used_when_there_is_nothing_else(tmp_path) -> None:
+    resolved = resolve_date(_p(tmp_path, "photo.jpg"), {}, external_date=datetime(2015, 3, 9))
+    assert resolved.tier == tiers.DATE_EXTERNAL_SIDECAR
+
+
+def test_implausible_external_date_is_ignored(tmp_path) -> None:
+    """An out-of-range external date must fall through, not be asserted."""
+    resolved = resolve_date(_p(tmp_path, "photo.jpg"), {}, external_date=datetime(1600, 1, 1))
+    assert resolved.tier == tiers.DATE_NONE
+    assert resolved.folder == UNDATED_FOLDER
+
+
+def test_external_date_none_leaves_the_ladder_unchanged(tmp_path) -> None:
+    exif = {"DateTimeDigitized": "2019:07:04 12:33:11"}
+    resolved = resolve_date(_p(tmp_path, "IMG_1234.jpg"), exif, external_date=None)
+    assert resolved.tier == tiers.DATE_EXIF_OTHER

@@ -32,12 +32,12 @@ _EXIF_FORMAT = "%Y:%m:%d %H:%M:%S"
 _MIN_YEAR = 1826
 _MAX_YEAR = 2100
 
-# EXIF fields in ladder order: (field name, tier).
-_EXIF_FIELDS: tuple[tuple[str, int], ...] = (
-    ("DateTimeOriginal", tiers.DATE_EXIF_ORIGINAL),
-    ("DateTimeDigitized", tiers.DATE_EXIF_OTHER),
-    ("DateTime", tiers.DATE_EXIF_OTHER),
-)
+# The top EXIF rung, kept separate because the external-sidecar rung sits
+# between it and the rest of the ladder.
+_EXIF_PRIMARY_FIELD = "DateTimeOriginal"
+
+# The remaining EXIF fields, all at the same lower tier.
+_EXIF_OTHER_FIELDS: tuple[str, ...] = ("DateTimeDigitized", "DateTime")
 
 # Filename date patterns, most specific first. Each yields named groups.
 # A bare epoch is deliberately NOT decoded: it is indistinguishable from an
@@ -161,16 +161,52 @@ def date_from_filename(stem: str) -> datetime | None:
     return None
 
 
-def resolve_date(source_path: Path, exif_data: dict[str, Any]) -> ResolvedDate:
-    """Resolve *source_path*'s capture date from EXIF, then from its filename.
+def resolve_date(
+    source_path: Path,
+    exif_data: dict[str, Any],
+    *,
+    external_date: datetime | None = None,
+) -> ResolvedDate:
+    """Resolve *source_path*'s capture date from EXIF, an external sidecar, then
+    its filename.
 
     Rungs are tried highest-first and the first plausible hit wins.  File mtime
     is never consulted.
+
+    *external_date* is a capture date asserted by a trustworthy source outside
+    the file's own bytes and path -- in practice Google Takeout's
+    ``photoTakenTime``.  It sits below EXIF ``DateTimeOriginal``, which is the
+    camera's own record, and above ``DateTimeDigitized``/``DateTime``, which
+    frequently record a scan or an edit rather than the capture.  An
+    implausible value is ignored rather than asserted, exactly like an
+    implausible EXIF value.
+
+    Google's ``creationTime`` must NEVER be passed here: it records when a file
+    was uploaded, which is the same category of claim as file mtime.
     """
-    for field, tier in _EXIF_FIELDS:
+    dt = _parse_exif_datetime(exif_data.get(_EXIF_PRIMARY_FIELD))
+    if dt is not None:
+        return ResolvedDate(
+            value=dt,
+            tier=tiers.DATE_EXIF_ORIGINAL,
+            source=tiers.DATE_SOURCE_NAMES[tiers.DATE_EXIF_ORIGINAL],
+        )
+
+    if external_date is not None and _plausible(external_date):
+        return ResolvedDate(
+            value=external_date,
+            tier=tiers.DATE_EXTERNAL_SIDECAR,
+            source=tiers.DATE_SOURCE_NAMES[tiers.DATE_EXTERNAL_SIDECAR],
+        )
+
+    for field in _EXIF_OTHER_FIELDS:
         dt = _parse_exif_datetime(exif_data.get(field))
         if dt is not None:
-            return ResolvedDate(value=dt, tier=tier, source=tiers.DATE_SOURCE_NAMES[tier])
+            return ResolvedDate(
+                value=dt,
+                tier=tiers.DATE_EXIF_OTHER,
+                source=tiers.DATE_SOURCE_NAMES[tiers.DATE_EXIF_OTHER],
+            )
 
     dt = date_from_filename(source_path.stem)
     if dt is not None:
