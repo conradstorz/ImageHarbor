@@ -825,14 +825,25 @@ class Catalog:
         )
 
     def takeout_members_unskip_trash(self, archive_id: str) -> int:
-        """Return trash members to the work queue; returns how many moved.
+        """Restore each trash member to the status its KIND warrants; returns
+        how many moved.
 
         Called only when --include-trash is passed, so a user who changes their
         mind is not blocked by the terminal status recorded on an earlier run.
+        Only image/video rows are work items -- resetting a metadata or album
+        row to 'pending' would strand it in a queue nothing drains (only
+        `_ingest_archive` drains 'pending', and it only ever looks at
+        image/video rows), so those kinds go back to their own terminal
+        status ('parsed') instead, and anything else goes back to 'ignored'.
         """
         cur = self._conn.execute(
             """
-            UPDATE takeout_members SET status = 'pending', updated_at = ?
+            UPDATE takeout_members SET status = CASE
+                WHEN kind IN ('image', 'video')    THEN 'pending'
+                WHEN kind IN ('metadata', 'album') THEN 'parsed'
+                ELSE 'ignored'
+            END,
+            updated_at = ?
             WHERE archive_id = ? AND status = 'skipped_trash'
             """,
             (_now_iso(), archive_id),

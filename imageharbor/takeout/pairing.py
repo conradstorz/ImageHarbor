@@ -73,6 +73,12 @@ class PairingIndex:
     # Sidecars already matched exactly (rungs 1-5) by some media member.
     # Truncation recovery must never steal one of these.
     claimed: frozenset[str] = frozenset()
+    # Media paths that occur more than once across the batch. The index is
+    # keyed on bare member paths with no archive dimension, so two archives
+    # sharing a media path are indistinguishable here -- `sidecar_for` refuses
+    # to pair any of them rather than risk dating one archive's bytes with
+    # another archive's sidecar.
+    ambiguous_media: frozenset[str] = frozenset()
 
 
 def _split(member_path: str) -> tuple[str, str]:
@@ -192,12 +198,31 @@ def build_index(members: Iterable[str]) -> PairingIndex:
         if (match := _exact_match(media_path, partial)) is not None
     }
     partial.claimed = frozenset(claimed)
+
+    # A media path occurring in more than one archive cannot be paired: the
+    # index is keyed on bare member paths, so two exports sharing a path are
+    # indistinguishable here, and pairing one archive's sidecar to another
+    # archive's bytes is precisely the silent misfiling this module exists to
+    # refuse. Declining costs those members their Google metadata and nothing
+    # else -- they still organize from EXIF and filename, and `missing_metadata`
+    # makes the gap visible.
+    seen: set[str] = set()
+    ambiguous: set[str] = set()
+    for m in media:
+        if m in seen:
+            ambiguous.add(m)
+        else:
+            seen.add(m)
+    partial.ambiguous_media = frozenset(ambiguous)
+
     return partial
 
 
 def sidecar_for(media_path: str, index: PairingIndex) -> str | None:
     """Return *media_path*'s sidecar member path, or None if none is certain."""
     if _is_sidecar(media_path):
+        return None
+    if media_path in index.ambiguous_media:
         return None
     exact = _exact_match(media_path, index)
     if exact is not None:

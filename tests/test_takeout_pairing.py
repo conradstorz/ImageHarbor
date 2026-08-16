@@ -173,3 +173,18 @@ def test_index_is_global_across_archives() -> None:
     index = build_index(["d/a.jpg", "d/b.jpg", "d/a.jpg.json", "d/b.jpg.json"])
     assert sidecar_for("d/a.jpg", index) == "d/a.jpg.json"
     assert sidecar_for("d/b.jpg", index) == "d/b.jpg.json"
+
+
+def test_a_media_path_shared_by_two_archives_is_never_paired() -> None:
+    """Two exports sharing a member path is a natural user action.
+
+    The index is keyed on bare member-path strings with no archive dimension,
+    so a path present twice in the batch is indistinguishable from itself --
+    pairing it would risk dating one archive's bytes with the OTHER archive's
+    sidecar, silently. Declining is the only safe answer, even though one of
+    the two occurrences here does have a sidecar.
+    """
+    members = ["d/a.jpg", "d/a.jpg", "d/a.jpg.json"]
+    index = build_index(members)
+    assert "d/a.jpg" in index.ambiguous_media
+    assert sidecar_for("d/a.jpg", index) is None

@@ -770,6 +770,27 @@ def test_takeout_members_unskip_trash(tmp_path) -> None:
         assert cat.takeout_members_pending("A" * 43)[0]["member_path"] == "Trash/x.jpg"
 
 
+def test_takeout_members_unskip_trash_is_kind_aware(tmp_path) -> None:
+    """A trash image goes back to 'pending' (a work item); a trash sidecar
+    goes back to 'parsed', never 'pending' -- nothing drains a pending
+    metadata/album row, so resetting it that way would strand it in the
+    queue forever and the archive would never reach 'complete'.
+    """
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.takeout_member_add(
+            archive_id="A" * 43, member_path="Trash/x.jpg", kind="image",
+            size=1, crc32=1, status="skipped_trash",
+        )
+        cat.takeout_member_add(
+            archive_id="A" * 43, member_path="Trash/x.jpg.json", kind="metadata",
+            size=1, crc32=1, status="skipped_trash",
+        )
+        assert cat.takeout_members_unskip_trash("A" * 43) == 2
+        rows = {r["member_path"]: r["status"] for r in cat.takeout_members_all("A" * 43)}
+        assert rows["Trash/x.jpg"] == "pending"
+        assert rows["Trash/x.jpg.json"] == "parsed"
+
+
 def test_takeout_status_counts(tmp_path) -> None:
     with Catalog(tmp_path / "c.db") as cat:
         cat.takeout_archive_upsert(

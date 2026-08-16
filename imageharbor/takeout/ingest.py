@@ -238,6 +238,16 @@ class _Ingestor:
             stale = [
                 row for row in rows
                 if row["kind"] in (archive.KIND_IMAGE, archive.KIND_VIDEO)
+                # Whitelist, not a blacklist. Only a member whose media work
+                # actually COMPLETED may be reopened. `skipped_trash` is the
+                # case that makes this load-bearing: real exports give trash
+                # items sidecars, so a trash member is pairable, and without
+                # this clause the second run of the very same command would
+                # pour the deleted-photos tree into the library -- bypassing
+                # --include-trash entirely and reporting nothing. `parsed`,
+                # `ignored`, `pending`, and `failed` are excluded for the same
+                # reason: none of them means "organized, but missing metadata".
+                and row["status"] in (_INGESTED, _DUPLICATE, _DEFERRED)
                 and not row["sidecar_path"]
                 and pairing.sidecar_for(row["member_path"], self.pairing_index) is not None
             ]
@@ -381,9 +391,24 @@ class _Ingestor:
             sidecar_path=sidecar_member,
         )
 
-        if self.write_sidecars and result.organized_path is not None:
-            self._merge_takeout_sidecar(result.organized_path, identity, member_path,
-                                        sidecar_member, meta)
+        if self.write_sidecars:
+            # A duplicate leaves `result.organized_path` None -- the file it
+            # matched already lives somewhere else, and the pipeline does not
+            # repeat that path back on the duplicate branch. The late-sidecar
+            # reopen (this module's headline case) IS a duplicate branch: the
+            # member re-ingests, hashes as a duplicate of itself, and
+            # `_maybe_upgrade_from_duplicate` relocates it -- so without this
+            # fallback the photo gets relocated but its Google provenance is
+            # silently never recorded. The catalog is the source of truth for
+            # where a digest actually lives, duplicate or not.
+            organized_path = result.organized_path
+            if organized_path is None:
+                row = self.catalog.get_by_sha256(result.sha256_b64url)
+                if row is not None and row["organized_path"] is not None:
+                    organized_path = Path(row["organized_path"])
+            if organized_path is not None:
+                self._merge_takeout_sidecar(organized_path, identity, member_path,
+                                            sidecar_member, meta)
 
     def _merge_takeout_sidecar(
         self, organized_path: Path, identity, member_path: str,

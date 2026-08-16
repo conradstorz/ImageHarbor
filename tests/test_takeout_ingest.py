@@ -257,6 +257,72 @@ def test_include_trash_ingests_previously_skipped_trash(dirs, catalog: Catalog) 
     assert len(list(dest.rglob("*.jpg"))) == 1
 
 
+def test_include_trash_run_reaches_complete_and_stays_skipped_after(
+    dirs, catalog: Catalog
+) -> None:
+    """A trash sidecar must not strand the archive in 'partial' forever.
+
+    `takeout_members_unskip_trash` restores a trash image to 'pending' (a
+    work item) but a trash metadata row to 'parsed' -- if it were reset to
+    'pending' instead, nothing would ever drain it and the archive could
+    never reach 'complete', so every future run would re-examine it and
+    `takeout status` would permanently misreport pending work.
+    """
+    archives, dest = dirs
+    _zip(
+        archives / "t.zip",
+        {
+            "Takeout/Google Photos/Trash/deleted.jpg": _jpeg(12),
+            "Takeout/Google Photos/Trash/deleted.jpg.json": _sidecar("deleted.jpg", 1425905792),
+        },
+    )
+
+    ingest_archives(archives, dest, catalog)
+    identity = catalog.takeout_archives_all()[0]["archive_id"]
+    assert catalog.takeout_archive_get(identity)["status"] == "complete"
+
+    second = ingest_archives(archives, dest, catalog, include_trash=True)
+    assert second.ingested == 1
+    assert catalog.takeout_archive_get(identity)["status"] == "complete"
+
+    third = ingest_archives(archives, dest, catalog)
+    assert third.ingested == 0
+    assert third.archives_skipped == 1
+    assert third.archives_reopened == 0
+
+
+def test_trash_is_not_resurrected_by_the_reopen_pass(dirs, catalog: Catalog) -> None:
+    """A second run of the SAME command must not ingest what the first skipped.
+
+    Real exports give trash items sidecars, so a trash member is pairable --
+    which made it eligible for the reopen pass until the status whitelist was
+    added. The bug poured the entire deleted-photos tree into the library on
+    the operator's second invocation.
+    """
+    archives, dest = dirs
+    _zip(
+        archives / "t.zip",
+        {
+            "Takeout/Google Photos/Trash/deleted.jpg": _jpeg(30),
+            "Takeout/Google Photos/Trash/deleted.jpg.json": _sidecar("deleted.jpg", 1425905792),
+        },
+    )
+
+    first = ingest_archives(archives, dest, catalog)
+    assert first.ingested == 0
+    assert list(dest.rglob("*.jpg")) == []
+
+    second = ingest_archives(archives, dest, catalog)
+    assert second.ingested == 0
+    assert second.archives_reopened == 0
+    assert list(dest.rglob("*.jpg")) == []
+
+    # And --include-trash still works, so this is a targeted exclusion.
+    third = ingest_archives(archives, dest, catalog, include_trash=True)
+    assert third.ingested == 1
+    assert len(list(dest.rglob("*.jpg"))) == 1
+
+
 def test_the_same_photo_in_two_archives_yields_one_file_and_two_sources(
     dirs, catalog: Catalog
 ) -> None:
@@ -343,6 +409,38 @@ def test_a_sidecar_arriving_in_a_later_part_relocates_the_photo(
 
     assert list((dest / "Undated").glob("*.jpg")) == []
     assert len(list((dest / "2015" / "2015-03").glob("*.jpg"))) == 1
+
+
+def test_a_late_sidecar_relocation_still_records_takeout_provenance(
+    dirs, catalog: Catalog
+) -> None:
+    """The late-sidecar reopen is a DUPLICATE branch, which must not lose the sidecar.
+
+    `Pipeline.process_file` leaves `result.organized_path` None on the
+    duplicate branch -- the file already lives wherever the first ingest put
+    it. `_merge_takeout_sidecar` was guarded on that field being non-None, so
+    the branch that is this module's headline case (a sidecar arriving in a
+    later part, relocating an already-organized photo) relocated the bytes
+    but silently never wrote the `takeout` sidecar block explaining why.
+    """
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {f"{D}/IMG_1234.jpg": _jpeg(15)})
+
+    ingest_archives(archives, dest, catalog, write_sidecars=True)
+
+    _zip(
+        archives / "takeout-002.zip",
+        {f"{D}/IMG_1234.jpg.json": _sidecar("IMG_1234.jpg", 1425905792)},
+    )
+    second = ingest_archives(archives, dest, catalog, write_sidecars=True)
+    assert second.archives_reopened == 1
+
+    organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
+    sidecar = organized.with_name(f"{organized.stem}.json")
+    assert sidecar.exists()
+    payload = json.loads(sidecar.read_text())
+    assert payload["takeout"]["archive"] == "takeout-001.zip"
+    assert payload["takeout"]["sidecar"] == f"{D}/IMG_1234.jpg.json"
 
 
 def test_a_failed_retry_keeps_what_the_member_already_knew(
