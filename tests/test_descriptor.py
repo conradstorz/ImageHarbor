@@ -190,3 +190,41 @@ def test_original_name_that_is_camera_generated_still_yields_none(tmp_path: Path
 def test_blank_original_name_falls_back_to_the_member_stem(tmp_path: Path) -> None:
     path = tmp_path / "beach trip.jpg"
     assert resolve_descriptor(path, original_name="  ").value == "beach-trip"
+
+
+def test_a_google_title_cannot_launder_a_machine_generated_name(tmp_path: Path) -> None:
+    """`original_name` supplies a better spelling, never a human-authorship vote.
+
+    Google's `title` keeps characters the zip member name had to sanitize, so
+    the two differ in exactly the characters a camera pattern anchors on. In
+    the calibrating export every Hangouts row id is `...?account_id=1` in the
+    title and `..._account_id=1` in the member name; letting the title win
+    locked 42 of 52 organized files to a row id at DESC_HUMAN_FILENAME, where
+    the monotonic tier gate means no later pass could ever rename them.
+    """
+    member = tmp_path / "5150546031975411401_account_id=1.jpg"
+    assert resolve_descriptor(member).tier == tiers.DESC_NONE
+    assert resolve_descriptor(
+        member, original_name="5150546031975411401?account_id=1"
+    ).tier == tiers.DESC_NONE
+
+
+def test_both_account_id_separators_are_recognised(tmp_path: Path) -> None:
+    assert is_camera_generated("5150546031975411401_account_id=1") is True
+    assert is_camera_generated("5150546031975411401?account_id=1") is True
+
+
+def test_a_machine_member_stem_suppresses_a_human_title(tmp_path: Path) -> None:
+    """The suppression is symmetric: a camera verdict from EITHER name wins."""
+    member = tmp_path / "IMG_1234.jpg"
+    assert resolve_descriptor(member, original_name="Emma's graduation.jpg").tier == tiers.DESC_NONE
+
+
+def test_a_human_title_still_wins_over_a_truncated_human_stem(tmp_path: Path) -> None:
+    """The original purpose of `original_name` must survive the fix."""
+    member = tmp_path / "emma-graduation-ceremony-at-the-high-scho.jpg"
+    resolved = resolve_descriptor(
+        member, original_name="emma graduation ceremony at the high school.jpg"
+    )
+    assert resolved.tier == tiers.DESC_HUMAN_FILENAME
+    assert resolved.value == "emma-graduation-ceremony"

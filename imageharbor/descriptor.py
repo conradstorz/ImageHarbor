@@ -53,7 +53,12 @@ CAMERA_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\d{9,13}$"),                                 # bare epoch seconds/ms
     # Hangouts / AlbumArchive row ids, present at volume in Google Takeout
     # exports: 865948477697870747_account_id=1.jpg
-    re.compile(r"^\d{10,}_account_id=\d+$", re.I),
+    #
+    # The separators are deliberately loose: the zip member name reads
+    # `..._account_id=1` because the filesystem cannot hold the `?` that
+    # Google's own `title` field preserves (`...?account_id=1`). Anchoring on
+    # one spelling would match only one of the two names the resolver sees.
+    re.compile(r"^\d{10,}[\W_]?account[\W_]?id[\W_]?\d+$", re.I),
     # A BARE date, with or without Google's (N) copy suffix. A date is not a
     # description -- the date ladder already captured it, and keeping it here
     # would state the same fact twice in one filename. A date followed by
@@ -97,25 +102,32 @@ def resolve_descriptor(
     original_name:
         A filename known to be closer to the original than *source_path*'s own
         -- Google Takeout's ``title``, which is the pre-truncation name of a
-        member whose stem the export truncated. When supplied and non-blank it
-        REPLACES the path's stem as the evidence, because it is strictly the
-        better source. It does not create a new tier: a human-authored
-        ``title`` lands at ``DESC_HUMAN_FILENAME`` like any other, and a
-        camera-generated one is discarded like any other.
+        member whose stem the export truncated.
+
+        It supplies a BETTER SPELLING of the name; it is not a vote that the
+        name is human-authored. A camera verdict from EITHER name therefore
+        wins. This is load-bearing: Google's ``title`` keeps characters the zip
+        member name had to sanitize for the filesystem, so the two can differ
+        in exactly the characters a pattern anchors on. In the calibrating
+        export every Hangouts row id reads ``...?account_id=1`` in the title but
+        ``..._account_id=1`` in the member name -- and letting the title win
+        would lock 42 of 52 files to a row id at tier 30, where no later pass
+        could ever rename them.
     date_str:
         The ``YYYY-MM-DD`` the date ladder actually resolved for this file, when
         the caller already knows it. A descriptor that merely restates the date
         carries no information beyond what the folder and the filename's date
         prefix already say, so it is discarded as ``DESC_NONE``.
     """
-    stem = source_path.stem
-    if original_name:
-        candidate = Path(original_name.strip()).stem
-        if candidate:
-            stem = candidate
+    path_stem = source_path.stem
+    title_stem = Path(original_name.strip()).stem if original_name else ""
 
-    if not stem or is_camera_generated(stem):
+    if not path_stem and not title_stem:
         return _NONE
+    if is_camera_generated(path_stem) or (title_stem and is_camera_generated(title_stem)):
+        return _NONE
+
+    stem = title_stem or path_stem
 
     normalized = normalize_descriptor(stem)
     # normalize_descriptor falls back to "photo" for input with no usable
