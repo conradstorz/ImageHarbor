@@ -3167,7 +3167,11 @@ def test_a_sidecar_arriving_in_a_later_part_relocates_the_photo(
         archives / "takeout-002.zip",
         {f"{D}/IMG_1234.jpg.json": _sidecar("IMG_1234.jpg", 1425905792)},
     )
-    ingest_archives(archives, dest, catalog)
+    second = ingest_archives(archives, dest, catalog)
+
+    # The stat must report that the reopen mechanism actually fired -- the
+    # relocation below proves the effect, this proves the cause.
+    assert second.archives_reopened == 1
 
     assert list((dest / "Undated").glob("*.jpg")) == []
     assert len(list((dest / "2015" / "2015-03").glob("*.jpg"))) == 1
@@ -3241,7 +3245,10 @@ class IngestStats:
     deferred: int = 0             # videos: enumerated and dated, never copied
     skipped_trash: int = 0
     failed: int = 0
-    missing_metadata: int = 0     # ingested, but no sidecar could be paired
+    # Counted for duplicates as well as fresh ingests: the fact worth
+    # reporting is "this member had no Google metadata", not how its bytes
+    # happened to reach the library.
+    missing_metadata: int = 0     # organized, but no sidecar could be paired
     per_archive: list[dict] = field(default_factory=list)
 
 
@@ -3456,6 +3463,7 @@ class _Ingestor:
                     sha256_b64url=row["sha256_b64url"],
                     taken_at=row["taken_at"],
                     sidecar_path=None,
+                    last_error=row["last_error"],
                 )
             self.catalog.takeout_archive_set_status(identity.archive_id, "partial")
             todo.append((identity, members))
@@ -3478,6 +3486,27 @@ class _Ingestor:
 
     def _label(self, archive_path: Path, member_path: str) -> str:
         return f"{archive_path}!{member_path}"
+
+    def _mark_failed(self, identity: archive.ArchiveIdentity, row, error: str) -> None:
+        """Record a member as failed WITHOUT discarding what it already knew.
+
+        `takeout_member_set` is a blind full-row UPDATE, so a failure branch
+        that passes only `status` and `last_error` nulls `sha256_b64url`,
+        `taken_at`, and `sidecar_path`. That matters most for a member the
+        second survey pass just reopened: the reopen deliberately carried
+        those values forward, and a failed retry would silently throw them
+        away. The values self-heal on the next successful attempt, but a
+        `failed` row should still describe what is actually known.
+        """
+        self.catalog.takeout_member_set(
+            identity.archive_id,
+            row["member_path"],
+            status=_FAILED,
+            sha256_b64url=row["sha256_b64url"],
+            taken_at=row["taken_at"],
+            sidecar_path=row["sidecar_path"],
+            last_error=error,
+        )
 
     def _ingest_image(
         self,
@@ -3505,9 +3534,7 @@ class _Ingestor:
         except Exception as exc:  # a member failure never fails the archive
             logger.warning("Failed to ingest %s: %s", member_path, exc, exc_info=True)
             self.stats.failed += 1
-            self.catalog.takeout_member_set(
-                identity.archive_id, member_path, status=_FAILED, last_error=str(exc)
-            )
+            self._mark_failed(identity, row, str(exc))
             return
         finally:
             if staged is not None:
@@ -3515,9 +3542,7 @@ class _Ingestor:
 
         if result.status == "error":
             self.stats.failed += 1
-            self.catalog.takeout_member_set(
-                identity.archive_id, member_path, status=_FAILED, last_error=result.error
-            )
+            self._mark_failed(identity, row, result.error)
             return
 
         status = _DUPLICATE if result.status == "duplicate" else _INGESTED
@@ -3592,17 +3617,31 @@ class _Ingestor:
             )
 
     def _defer_video(self, identity: archive.ArchiveIdentity, row) -> None:
-        """Record a video with its capture date. No bytes are copied."""
+        """Record a video with its capture date. No bytes are copied.
+
+        Wrapped in the same isolation the image path gets. The work here is
+        local -- an index lookup, a sidecar parse that cannot raise, and one
+        catalog write -- so a failure is unlikely, but "unlikely" is not the
+        contract: a member exception must fail that member and let the loop
+        continue, never abort the batch.
+        """
         member_path = row["member_path"]
-        sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
-        meta = self._read_sidecar(sidecar_member) if sidecar_member else metadata.EMPTY
-        self.catalog.takeout_member_set(
-            identity.archive_id,
-            member_path,
-            status=_DEFERRED,
-            taken_at=meta.photo_taken_at.isoformat() if meta.photo_taken_at else None,
-            sidecar_path=sidecar_member,
-        )
+        try:
+            sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
+            meta = self._read_sidecar(sidecar_member) if sidecar_member else metadata.EMPTY
+            self.catalog.takeout_member_set(
+                identity.archive_id,
+                member_path,
+                status=_DEFERRED,
+                sha256_b64url=row["sha256_b64url"],
+                taken_at=meta.photo_taken_at.isoformat() if meta.photo_taken_at else None,
+                sidecar_path=sidecar_member,
+            )
+        except Exception as exc:
+            logger.warning("Failed to defer %s: %s", member_path, exc, exc_info=True)
+            self.stats.failed += 1
+            self._mark_failed(identity, row, str(exc))
+            return
         self.stats.deferred += 1
 
     def _ingest_archive(self, identity: archive.ArchiveIdentity) -> None:
