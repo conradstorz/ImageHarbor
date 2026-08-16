@@ -4162,18 +4162,22 @@ Run against the real export, which is already on disk at
 `imageharbor/takeout-20230618T004316Z-001.zip` (79 MB, 196 members, gitignored).
 Copy it to a scratch directory first so the archives directory holds only it:
 
+Use the session scratchpad rather than `/tmp` (this is Windows; `/tmp` under Git
+Bash is not a stable location, and the organized tree must not land in the repo):
+
 ```bash
-mkdir -p /tmp/ih-takeout/archives
-cp imageharbor/takeout-20230618T004316Z-001.zip /tmp/ih-takeout/archives/
-uv run imageharbor takeout ingest --archives /tmp/ih-takeout/archives --dest /tmp/ih-takeout/organized --sidecar
+SCRATCH="C:/Users/Conrad/AppData/Local/Temp/claude/D--Users-Conrad-Documents-programming-ImageHarbor/cc6a84f0-dc8d-4d50-8b62-f3d3e74d5d71/scratchpad/ih-takeout"
+mkdir -p "$SCRATCH/archives"
+cp imageharbor/takeout-20230618T004316Z-001.zip "$SCRATCH/archives/"
+uv run imageharbor takeout ingest --archives "$SCRATCH/archives" --dest "$SCRATCH/organized" --sidecar
 ```
 
 Expected: exits 0, reports non-zero `ingested`, `failed 0`. Then verify the
 integrity of every organized copy and confirm re-running changes nothing:
 
 ```bash
-uv run imageharbor verify /tmp/ih-takeout/organized
-uv run imageharbor takeout ingest --archives /tmp/ih-takeout/archives --dest /tmp/ih-takeout/organized --sidecar
+uv run imageharbor verify "$SCRATCH/organized"
+uv run imageharbor takeout ingest --archives "$SCRATCH/archives" --dest "$SCRATCH/organized" --sidecar
 ```
 
 Expected: `verify` reports zero failures; the second ingest reports
@@ -4182,7 +4186,7 @@ Expected: `verify` reports zero failures; the second ingest reports
 Confirm the archive was not modified:
 
 ```bash
-sha256sum imageharbor/takeout-20230618T004316Z-001.zip /tmp/ih-takeout/archives/takeout-20230618T004316Z-001.zip
+sha256sum imageharbor/takeout-20230618T004316Z-001.zip "$SCRATCH/archives/takeout-20230618T004316Z-001.zip"
 ```
 
 Expected: identical digests.
