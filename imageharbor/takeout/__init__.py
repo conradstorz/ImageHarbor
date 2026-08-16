@@ -11,3 +11,7 @@ it never consults or feeds the circuit breaker.
 """
 
 from __future__ import annotations
+
+from .ingest import IngestStats, ingest_archives
+
+__all__ = ["IngestStats", "ingest_archives"]
