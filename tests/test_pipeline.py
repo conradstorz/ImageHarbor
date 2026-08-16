@@ -601,9 +601,99 @@ def test_evidence_original_name_names_the_file(
     assert row["descriptor_tier"] == tiers.DESC_HUMAN_FILENAME
 
 
-def test_evidence_none_leaves_behavior_unchanged(
-    source_dir: Path, organized_dir: Path, catalog: Catalog
+def test_omitting_the_new_arguments_reproduces_todays_behavior(
+    tmp_path: Path, organized_dir: Path
 ) -> None:
-    pipeline = Pipeline(source_dir, organized_dir, catalog)
-    with_none = pipeline.process_file(source_dir / "beach_photo.jpg", evidence=None)
-    assert with_none.organized_path.parent == organized_dir / "Undated"
+    """The regression surface: `process`/`watch` must be byte-for-byte unchanged.
+
+    Runs identical bytes through two independent libraries -- one calling
+    `process_file(path)` exactly as `watcher.py` does, one passing the new
+    arguments explicitly as None -- and compares every field that decides
+    placement, naming, and identity.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_jpeg(src / "beach photo.jpg")
+
+    def _run(root: str, **kwargs) -> tuple:
+        dest = organized_dir / root
+        dest.mkdir()
+        with Catalog(tmp_path / f"{root}.db") as cat:
+            result = Pipeline(src, dest, cat).process_file(src / "beach photo.jpg", **kwargs)
+            row = cat.get_by_sha256(result.sha256_b64url)
+            return (
+                result.status,
+                result.organized_path.relative_to(dest).as_posix(),
+                row["original_path"],
+                row["date_tier"], row["date_source"], row["date_value"],
+                row["descriptor_tier"], row["descriptor_source"], row["descriptor_value"],
+                [r["source_path"] for r in cat.sources_for(result.sha256_b64url)],
+            )
+
+    omitted = _run("a")
+    explicit_none = _run("b", source_label=None, evidence=None)
+    assert omitted == explicit_none
+
+
+def test_evidence_none_on_the_duplicate_branch_is_safe(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The duplicate branch dereferences `evidence`; None must not reach it raw."""
+    staged = _make_jpeg(tmp_path / "beach photo.jpg")
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    first = pipeline.process_file(staged)
+    second = pipeline.process_file(staged, evidence=None)
+
+    assert second.status == "duplicate"
+    row = catalog.get_by_sha256(first.sha256_b64url)
+    assert row["organized_path"] == str(first.organized_path)
+
+
+def test_result_source_path_is_the_real_path_not_the_label(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """`source_label` replaces the recorded IDENTITY, never the path read from."""
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+    label = "/nas/takeout/t1.zip!Takeout/AlbumArchive/a/beach.jpg"
+
+    result = Pipeline(tmp_path, organized_dir, catalog).process_file(
+        staged, source_label=label
+    )
+
+    assert result.source_path == staged
+    assert str(result.source_path) != label
+
+
+def test_consume_source_cleans_up_when_the_destination_already_exists(
+    tmp_path: Path, organized_dir: Path
+) -> None:
+    """The already-present-and-verified branch must still consume the source.
+
+    Reaching that branch requires a destination that exists and verifies while
+    the digest is UNKNOWN to the catalog -- a rebuilt catalog over a surviving
+    tree, or a crash between the copy and the catalog upsert. A known digest
+    would take the duplicate branch and return long before the copy step, so a
+    second run against the SAME catalog would not exercise this at all.
+    """
+    first_staging = tmp_path / "s1"
+    first_staging.mkdir()
+    staged_once = _make_jpeg(first_staging / "beach.jpg")
+    with Catalog(tmp_path / "first.db") as cat:
+        first = Pipeline(
+            first_staging, organized_dir, cat, consume_source=True
+        ).process_file(staged_once)
+    assert first.organized_path.exists()
+
+    # Fresh catalog, surviving tree: the digest is unknown but the file is there.
+    second_staging = tmp_path / "s2"
+    second_staging.mkdir()
+    staged_twice = _make_jpeg(second_staging / "beach.jpg")
+    with Catalog(tmp_path / "second.db") as cat:
+        assert not cat.is_known(first.sha256_b64url)
+        second = Pipeline(
+            second_staging, organized_dir, cat, consume_source=True
+        ).process_file(staged_twice)
+
+    assert second.status == "copied"
+    assert not staged_twice.exists()      # consumed, not leaked
+    assert first.organized_path.exists()  # destination untouched

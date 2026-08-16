@@ -289,8 +289,25 @@ class Pipeline:
             if self.consume_source:
                 source_path.unlink(missing_ok=True)
         else:
+            # True when the "consume" degraded to a copy and the source still
+            # has to be removed after verification.
+            consumed_by_copy = False
             if self.consume_source:
-                os.replace(str(source_path), str(organized_path))
+                try:
+                    os.replace(str(source_path), str(organized_path))
+                except OSError:
+                    # Staging normally lives at <dest>/.takeout-staging/, so it
+                    # is the same filesystem as the destination by construction
+                    # and this never fires. A mount point between the two makes
+                    # os.replace raise EXDEV, and without this fallback EVERY
+                    # member of that run degrades to status="error".
+                    #
+                    # Copy-then-delete is strictly safer than the move it
+                    # replaces: the staging bytes survive until the destination
+                    # has been verified, so a verification failure here is
+                    # recoverable without re-extracting from the archive.
+                    shutil.copy2(str(source_path), str(organized_path))
+                    consumed_by_copy = True
             else:
                 shutil.copy2(str(source_path), str(organized_path))
 
@@ -299,9 +316,19 @@ class Pipeline:
             # exactly as strictly as the copy path.
             if not verify_file(organized_path, sha256_b64url):
                 organized_path.unlink(missing_ok=True)
+                # On the os.replace path the staging bytes are already gone at
+                # this point, so a caller seeing this error must re-stage from
+                # the archive rather than inspect the staging floor. That is
+                # safe precisely because the caller owns the staging file and
+                # the true original -- the zip -- was never touched.
                 raise RuntimeError(
                     f"Integrity check failed after copying {source_path} -> {organized_path}"
                 )
+
+            # The destination is verified; only now is it safe to drop a source
+            # the copy fallback left behind.
+            if consumed_by_copy:
+                source_path.unlink(missing_ok=True)
 
         # Step 8: catalog
         self.catalog.upsert(
