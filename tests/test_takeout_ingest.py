@@ -14,6 +14,7 @@ import pytest
 
 from imageharbor.catalog import Catalog
 from imageharbor.takeout import archive as archive_mod
+from imageharbor.takeout import ingest as ingest_mod
 from imageharbor.takeout.ingest import ingest_archives
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9"
@@ -188,6 +189,46 @@ def test_videos_are_deferred_with_a_date_and_no_bytes_copied(dirs, catalog: Cata
     assert row["taken_at"].startswith("2015-03-09")
 
 
+def test_a_video_failure_does_not_abort_the_batch(dirs, catalog: Catalog, monkeypatch) -> None:
+    """A video-processing failure must fail only that member, not the batch.
+
+    `_defer_video` sits outside the image loop's isolation, so an unwrapped
+    exception there would previously abort the whole archive. The injection
+    point (`pairing.sidecar_for`) is also called from the image path, so the
+    fake only raises for the video's member path -- this fixture's image has
+    no sidecar of its own, so its (real) call to `sidecar_for` must keep
+    succeeding for this test to prove isolation rather than a blanket outage.
+    """
+    archives, dest = dirs
+    _zip(
+        archives / "t.zip",
+        {
+            f"{D}/photo.jpg": _jpeg(30),
+            f"{D}/clip.mp4": b"not really an mp4",
+        },
+    )
+
+    real_sidecar_for = ingest_mod.pairing.sidecar_for
+
+    def _boom(member_path, index):
+        if member_path.endswith(".mp4"):
+            raise RuntimeError("simulated video-path failure")
+        return real_sidecar_for(member_path, index)
+
+    monkeypatch.setattr(ingest_mod.pairing, "sidecar_for", _boom)
+
+    stats = ingest_archives(archives, dest, catalog)
+
+    assert stats.ingested == 1
+    assert stats.deferred == 0
+    assert stats.failed == 1
+    assert len(list((dest / "Undated").glob("*.jpg"))) == 1
+
+    identity = catalog.takeout_archives_all()[0]["archive_id"]
+    rows = {m["member_path"]: m for m in catalog.takeout_members_all(identity)}
+    assert rows[f"{D}/clip.mp4"]["status"] == "failed"
+
+
 def test_trash_is_enumerated_but_not_ingested(dirs, catalog: Catalog) -> None:
     archives, dest = dirs
     _zip(
@@ -294,7 +335,62 @@ def test_a_sidecar_arriving_in_a_later_part_relocates_the_photo(
         archives / "takeout-002.zip",
         {f"{D}/IMG_1234.jpg.json": _sidecar("IMG_1234.jpg", 1425905792)},
     )
-    ingest_archives(archives, dest, catalog)
+    second = ingest_archives(archives, dest, catalog)
+
+    # The stat must report that the reopen mechanism actually fired -- the
+    # relocation below proves the effect, this proves the cause.
+    assert second.archives_reopened == 1
 
     assert list((dest / "Undated").glob("*.jpg")) == []
     assert len(list((dest / "2015" / "2015-03").glob("*.jpg"))) == 1
+
+
+def test_a_failed_retry_keeps_what_the_member_already_knew(
+    dirs, catalog: Catalog, monkeypatch
+) -> None:
+    """A reopened member's failed retry must not null out what the reopen preserved.
+
+    `takeout_member_set` is a blind full-row UPDATE. The second survey pass
+    carries `sha256_b64url` forward when it resets a stale member to
+    `pending`; if a failure branch then wrote only `status`/`last_error`, that
+    carried-forward digest would be wiped out by the very retry meant to
+    upgrade it. This pins `_mark_failed` against that regression.
+    """
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {f"{D}/IMG_1234.jpg": _jpeg(14)})
+
+    ingest_archives(archives, dest, catalog)
+
+    identity = catalog.takeout_archives_all()[0]["archive_id"]
+    first_row = [
+        m for m in catalog.takeout_members_all(identity)
+        if m["member_path"] == f"{D}/IMG_1234.jpg"
+    ][0]
+    assert first_row["sha256_b64url"] is not None
+    original_digest = first_row["sha256_b64url"]
+
+    _zip(
+        archives / "takeout-002.zip",
+        {f"{D}/IMG_1234.jpg.json": _sidecar("IMG_1234.jpg", 1425905792)},
+    )
+
+    real = archive_mod.extract_to
+
+    def _boom(zf, member, staging):
+        if member.path == f"{D}/IMG_1234.jpg":
+            raise RuntimeError("simulated retry failure")
+        return real(zf, member, staging)
+
+    monkeypatch.setattr(archive_mod, "extract_to", _boom)
+
+    stats = ingest_archives(archives, dest, catalog)
+
+    assert stats.archives_reopened == 1
+    assert stats.failed == 1
+
+    retried_row = [
+        m for m in catalog.takeout_members_all(identity)
+        if m["member_path"] == f"{D}/IMG_1234.jpg"
+    ][0]
+    assert retried_row["status"] == "failed"
+    assert retried_row["sha256_b64url"] == original_digest
