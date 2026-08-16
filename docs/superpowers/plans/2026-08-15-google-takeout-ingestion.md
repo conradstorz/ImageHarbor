@@ -2337,12 +2337,132 @@ def test_evidence_original_name_names_the_file(
     assert row["descriptor_tier"] == tiers.DESC_HUMAN_FILENAME
 
 
-def test_evidence_none_leaves_behavior_unchanged(
-    source_dir: Path, organized_dir: Path, catalog: Catalog
+def test_omitting_the_new_arguments_reproduces_todays_behavior(
+    tmp_path: Path, organized_dir: Path
 ) -> None:
-    pipeline = Pipeline(source_dir, organized_dir, catalog)
-    with_none = pipeline.process_file(source_dir / "beach_photo.jpg", evidence=None)
-    assert with_none.organized_path.parent == organized_dir / "Undated"
+    """The regression surface: `process`/`watch` must be byte-for-byte unchanged.
+
+    Runs identical bytes through two independent libraries -- one calling
+    `process_file(path)` exactly as `watcher.py` does, one passing the new
+    arguments explicitly as None -- and compares every field that decides
+    placement, naming, and identity.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_jpeg(src / "beach photo.jpg")
+
+    def _run(root: str, **kwargs) -> tuple:
+        dest = organized_dir / root
+        dest.mkdir()
+        with Catalog(tmp_path / f"{root}.db") as cat:
+            result = Pipeline(src, dest, cat).process_file(src / "beach photo.jpg", **kwargs)
+            row = cat.get_by_sha256(result.sha256_b64url)
+            return (
+                result.status,
+                result.organized_path.relative_to(dest).as_posix(),
+                row["original_path"],
+                row["date_tier"], row["date_source"], row["date_value"],
+                row["descriptor_tier"], row["descriptor_source"], row["descriptor_value"],
+                [r["source_path"] for r in cat.sources_for(result.sha256_b64url)],
+            )
+
+    omitted = _run("a")
+    explicit_none = _run("b", source_label=None, evidence=None)
+    assert omitted == explicit_none
+
+
+def test_evidence_none_on_the_duplicate_branch_is_safe(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The duplicate branch dereferences `evidence`; None must not reach it raw."""
+    staged = _make_jpeg(tmp_path / "beach photo.jpg")
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    first = pipeline.process_file(staged)
+    second = pipeline.process_file(staged, evidence=None)
+
+    assert second.status == "duplicate"
+    row = catalog.get_by_sha256(first.sha256_b64url)
+    assert row["organized_path"] == str(first.organized_path)
+
+
+def test_result_source_path_is_the_real_path_not_the_label(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """`source_label` replaces the recorded IDENTITY, never the path read from."""
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+    label = "/nas/takeout/t1.zip!Takeout/AlbumArchive/a/beach.jpg"
+
+    result = Pipeline(tmp_path, organized_dir, catalog).process_file(
+        staged, source_label=label
+    )
+
+    assert result.source_path == staged
+    assert str(result.source_path) != label
+
+
+def test_consume_source_falls_back_to_copy_across_filesystems(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """EXDEV must degrade to copy-then-delete, not fail every member of the run.
+
+    No filesystem available to the test suite produces a genuine cross-device
+    rename, so the error is injected. Without this the fallback branch -- and
+    specifically its post-verification unlink -- is unreachable code that no
+    mutation can be caught by.
+    """
+    import os as _os
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    def _exdev(src, dst):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(_os, "replace", _exdev)
+
+    result = Pipeline(
+        tmp_path, organized_dir, catalog, consume_source=True
+    ).process_file(staged)
+
+    assert result.status == "copied"
+    assert result.organized_path.exists()
+    assert verify_pcs_file(result.organized_path)
+    # The fallback must still consume the source, and only after verifying.
+    assert not staged.exists()
+
+
+def test_consume_source_cleans_up_when_the_destination_already_exists(
+    tmp_path: Path, organized_dir: Path
+) -> None:
+    """The already-present-and-verified branch must still consume the source.
+
+    Reaching that branch requires a destination that exists and verifies while
+    the digest is UNKNOWN to the catalog -- a rebuilt catalog over a surviving
+    tree, or a crash between the copy and the catalog upsert. A known digest
+    would take the duplicate branch and return long before the copy step, so a
+    second run against the SAME catalog would not exercise this at all.
+    """
+    first_staging = tmp_path / "s1"
+    first_staging.mkdir()
+    staged_once = _make_jpeg(first_staging / "beach.jpg")
+    with Catalog(tmp_path / "first.db") as cat:
+        first = Pipeline(
+            first_staging, organized_dir, cat, consume_source=True
+        ).process_file(staged_once)
+    assert first.organized_path.exists()
+
+    # Fresh catalog, surviving tree: the digest is unknown but the file is there.
+    second_staging = tmp_path / "s2"
+    second_staging.mkdir()
+    staged_twice = _make_jpeg(second_staging / "beach.jpg")
+    with Catalog(tmp_path / "second.db") as cat:
+        assert not cat.is_known(first.sha256_b64url)
+        second = Pipeline(
+            second_staging, organized_dir, cat, consume_source=True
+        ).process_file(staged_twice)
+
+    assert second.status == "copied"
+    assert not staged_twice.exists()      # consumed, not leaked
+    assert first.organized_path.exists()  # destination untouched
 ```
 
 Add to `tests/test_monotonicity.py`:
@@ -2573,8 +2693,25 @@ Replace the copy step (Step 6/7):
             if self.consume_source:
                 source_path.unlink(missing_ok=True)
         else:
+            # True when the "consume" degraded to a copy and the source still
+            # has to be removed after verification.
+            consumed_by_copy = False
             if self.consume_source:
-                os.replace(str(source_path), str(organized_path))
+                try:
+                    os.replace(str(source_path), str(organized_path))
+                except OSError:
+                    # Staging normally lives at <dest>/.takeout-staging/, so it
+                    # is the same filesystem as the destination by construction
+                    # and this never fires. A mount point between the two makes
+                    # os.replace raise EXDEV, and without this fallback EVERY
+                    # member of that run degrades to status="error".
+                    #
+                    # Copy-then-delete is strictly safer than the move it
+                    # replaces: the staging bytes survive until the destination
+                    # has been verified, so a verification failure here is
+                    # recoverable without re-extracting from the archive.
+                    shutil.copy2(str(source_path), str(organized_path))
+                    consumed_by_copy = True
             else:
                 shutil.copy2(str(source_path), str(organized_path))
 
@@ -2583,9 +2720,19 @@ Replace the copy step (Step 6/7):
             # exactly as strictly as the copy path.
             if not verify_file(organized_path, sha256_b64url):
                 organized_path.unlink(missing_ok=True)
+                # On the os.replace path the staging bytes are already gone at
+                # this point, so a caller seeing this error must re-stage from
+                # the archive rather than inspect the staging floor. That is
+                # safe precisely because the caller owns the staging file and
+                # the true original -- the zip -- was never touched.
                 raise RuntimeError(
                     f"Integrity check failed after copying {source_path} -> {organized_path}"
                 )
+
+            # The destination is verified; only now is it safe to drop a source
+            # the copy fallback left behind.
+            if consumed_by_copy:
+                source_path.unlink(missing_ok=True)
 ```
 
 Replace the catalog step's identity fields:
