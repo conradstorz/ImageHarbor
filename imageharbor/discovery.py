@@ -31,6 +31,23 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
+# Video extensions, for CLASSIFICATION ONLY. `discover_images` still yields
+# images and nothing else -- video ingestion is a separate, later project.
+# Takeout ingestion enumerates videos and records them as `deferred` with
+# their capture date, so that project starts from a complete work queue rather
+# than from zero, but no video bytes are ever copied.
+VIDEO_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".mp4",
+        ".mov",
+        ".m4v",
+        ".3gp",
+        ".avi",
+        ".mkv",
+        ".webm",
+    }
+)
+
 
 def discover_images(source: Path, recursive: bool = True) -> Iterator[Path]:
     """Yield all supported image files under *source*.
