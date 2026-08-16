@@ -137,6 +137,18 @@ def test_bare_date_pattern_does_not_over_match(tmp_path: Path) -> None:
     assert resolved.value == "2015-03-09"
 
 
+def test_account_id_pattern_does_not_over_match(tmp_path: Path) -> None:
+    """The account-id pattern is anchored: a row id PLUS words is not a match.
+
+    `is_camera_generated` uses `.match()`, not `.fullmatch()`, so the trailing
+    `$` is the only thing preventing a human-authored suffix from being
+    discarded along with the machine-generated prefix.
+    """
+    assert is_camera_generated("865948477697870747_account_id=1") is True
+    assert is_camera_generated("865948477697870747_account_id=1 vacation") is False
+    assert resolve_descriptor(tmp_path / "865948477697870747_account_id=1 vacation.jpg").tier == tiers.DESC_HUMAN_FILENAME
+
+
 def test_a_date_only_descriptor_yields_to_the_enrichment_pass(tmp_path: Path) -> None:
     """The accepted consequence of the above, pinned deliberately.
 

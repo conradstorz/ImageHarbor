@@ -304,6 +304,13 @@ class _Ingestor:
         those values forward, and a failed retry would silently throw them
         away. The values self-heal on the next successful attempt, but a
         `failed` row should still describe what is actually known.
+
+        A failure of THIS write is deliberately left to propagate. The catalog
+        is the work queue, so a catalog that cannot be written means every
+        subsequent member would do work that can never be recorded or resumed
+        -- aborting loudly is the honest outcome, and swallowing it would let a
+        run appear to succeed while recording nothing. It is stated here
+        because the abort would otherwise look accidental.
         """
         self.catalog.takeout_member_set(
             identity.archive_id,
@@ -363,6 +370,8 @@ class _Ingestor:
         # The member is marked terminal only AFTER process_file returned a
         # non-error result, so the copy -> verify -> catalog ordering remains
         # the sole arbiter of truth and takeout_members can only lag it.
+        # `last_error` is deliberately omitted: this member just succeeded,
+        # so clearing any error from a previous attempt is correct.
         self.catalog.takeout_member_set(
             identity.archive_id,
             member_path,
@@ -436,10 +445,15 @@ class _Ingestor:
         try:
             sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
             meta = self._read_sidecar(sidecar_member) if sidecar_member else metadata.EMPTY
+            # `last_error` is deliberately omitted: this member just succeeded,
+            # so clearing any error from a previous attempt is correct.
             self.catalog.takeout_member_set(
                 identity.archive_id,
                 member_path,
                 status=_DEFERRED,
+                # Always None in practice -- nothing hashes or copies a video. Passed
+                # for call-site symmetry with `_mark_failed`, so every write to this
+                # table visibly accounts for every field it could null.
                 sha256_b64url=row["sha256_b64url"],
                 taken_at=meta.photo_taken_at.isoformat() if meta.photo_taken_at else None,
                 sidecar_path=sidecar_member,

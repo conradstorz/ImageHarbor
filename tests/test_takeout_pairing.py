@@ -128,7 +128,7 @@ def test_truncation_recovery_never_steals_a_claimed_sidecar() -> None:
 
     # Preconditions, asserted so a future edit to the fixture cannot silently
     # make this test vacuous again.
-    assert len("photograph-of-a-sunset.jpg") >= _MIN_TRUNCATION_PREFIX
+    assert len(owner.rsplit("/", 1)[-1]) >= _MIN_TRUNCATION_PREFIX
     assert thief.startswith(owner)
     assert sidecar in index.claimed
 

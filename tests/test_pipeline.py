@@ -585,6 +585,28 @@ def test_consume_source_falls_back_to_copy_across_filesystems(
     assert not staged.exists()
 
 
+def test_a_non_exdev_oserror_is_not_swallowed_as_a_cross_device_move(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """Only EXDEV degrades to a copy; any other OSError is a real fault."""
+    import errno as _errno
+    import os as _os
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    def _denied(src, dst):
+        raise OSError(_errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(_os, "replace", _denied)
+
+    result = Pipeline(
+        tmp_path, organized_dir, catalog, consume_source=True
+    ).process_file(staged)
+
+    assert result.status == "error"
+    assert "Permission denied" in result.error
+
+
 def test_fallback_keeps_the_staging_file_when_verification_fails(
     tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
 ) -> None:

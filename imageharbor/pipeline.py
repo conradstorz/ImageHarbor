@@ -9,6 +9,7 @@ enrichment pass adds AI descriptions later.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
@@ -295,7 +296,9 @@ class Pipeline:
             if self.consume_source:
                 try:
                     os.replace(str(source_path), str(organized_path))
-                except OSError:
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV:
+                        raise
                     # Staging normally lives at <dest>/.takeout-staging/, so it
                     # is the same filesystem as the destination by construction
                     # and this never fires. A mount point between the two makes
@@ -305,7 +308,10 @@ class Pipeline:
                     # Copy-then-delete is strictly safer than the move it
                     # replaces: the staging bytes survive until the destination
                     # has been verified, so a verification failure here is
-                    # recoverable without re-extracting from the archive.
+                    # recoverable without re-extracting from the archive. Any
+                    # other OSError (e.g. a permissions fault on the
+                    # destination) is a real fault and must surface rather
+                    # than masquerade as a cross-device move.
                     shutil.copy2(str(source_path), str(organized_path))
                     consumed_by_copy = True
             else:

@@ -67,6 +67,12 @@ class TakeoutMetadata:
     # camera data left, when Google's export pipeline stripped the original.
     google_exif: dict[str, Any] = field(default_factory=dict)
 
+    # Explicitly unhashable. frozen=True + eq=True would otherwise autogenerate
+    # a __hash__ that raises TypeError at call time, because `google_exif` is a
+    # dict -- a landmine for the first caller to put one of these in a set or
+    # use it as a dict key. Equality still works and is what the tests use.
+    __hash__ = None
+
 
 @dataclass(frozen=True)
 class AlbumMetadata:
