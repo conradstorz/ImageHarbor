@@ -670,3 +670,120 @@ def test_reopening_a_v2_catalog_is_a_noop(tmp_path):
         ).fetchall()
         assert len(rows) == 1
         assert rows[0]["value"] == SCHEMA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Google Takeout ingestion tables
+# ---------------------------------------------------------------------------
+
+
+def test_takeout_archive_roundtrip(tmp_path) -> None:
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.takeout_archive_upsert(
+            archive_id="A" * 43, last_path="/nas/t1.zip", size=79, mtime_ns=1, member_count=196
+        )
+        row = cat.takeout_archive_get("A" * 43)
+        assert row["status"] == "partial"
+        assert row["member_count"] == 196
+        assert row["last_path"] == "/nas/t1.zip"
+
+
+def test_takeout_archive_stat_fast_path(tmp_path) -> None:
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.takeout_archive_upsert(
+            archive_id="A" * 43, last_path="/nas/t1.zip", size=79, mtime_ns=1
+        )
+        assert cat.takeout_archive_get_by_stat("/nas/t1.zip", 79, 1)["archive_id"] == "A" * 43
+        assert cat.takeout_archive_get_by_stat("/nas/t1.zip", 79, 2) is None
+        assert cat.takeout_archive_get_by_stat("/other.zip", 79, 1) is None
+
+
+def test_takeout_archive_upsert_updates_location_not_identity(tmp_path) -> None:
+    """A moved archive keeps its id; only where it lives changes."""
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.takeout_archive_upsert(
+            archive_id="A" * 43, last_path="/old/t1.zip", size=79, mtime_ns=1
+        )
+        cat.takeout_archive_upsert(
+            archive_id="A" * 43, last_path="/new/t1.zip", size=79, mtime_ns=9
+        )
+        assert len(cat.takeout_archives_all()) == 1
+        assert cat.takeout_archive_get("A" * 43)["last_path"] == "/new/t1.zip"
+
+
+def test_takeout_member_add_never_resets_a_terminal_status(tmp_path) -> None:
+    """Re-surveying an archive must not drag ingested members back to pending."""
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.takeout_member_add(
+            archive_id="A" * 43, member_path="a/b.jpg", kind="image",
+            size=10, crc32=1, status="pending",
+        )
+        cat.takeout_member_set("A" * 43, "a/b.jpg", status="ingested", sha256_b64url="D" * 43)
+        cat.takeout_member_add(
+            archive_id="A" * 43, member_path="a/b.jpg", kind="image",
+            size=10, crc32=1, status="pending",
+        )
+        rows = cat.takeout_members_all("A" * 43)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "ingested"
+        assert rows[0]["sha256_b64url"] == "D" * 43
+
+
+def test_takeout_members_pending_returns_pending_and_failed_only(tmp_path) -> None:
+    with Catalog(tmp_path / "c.db") as cat:
+        for name, status in (
+            ("p.jpg", "pending"), ("f.jpg", "failed"), ("i.jpg", "ingested"),
+            ("d.jpg", "duplicate"), ("v.mp4", "deferred"), ("m.json", "parsed"),
+            ("o.txt", "ignored"), ("t.jpg", "skipped_trash"),
+        ):
+            cat.takeout_member_add(
+                archive_id="A" * 43, member_path=name, kind="image",
+                size=1, crc32=1, status=status,
+            )
+        assert {r["member_path"] for r in cat.takeout_members_pending("A" * 43)} == {
+            "p.jpg", "f.jpg",
+        }
+
+
+def test_takeout_members_unskip_trash(tmp_path) -> None:
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.takeout_member_add(
+            archive_id="A" * 43, member_path="Trash/x.jpg", kind="image",
+            size=1, crc32=1, status="skipped_trash",
+        )
+        assert cat.takeout_members_unskip_trash("A" * 43) == 1
+        assert cat.takeout_members_pending("A" * 43)[0]["member_path"] == "Trash/x.jpg"
+
+
+def test_takeout_status_counts(tmp_path) -> None:
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.takeout_archive_upsert(
+            archive_id="A" * 43, last_path="/t1.zip", size=1, mtime_ns=1, status="complete"
+        )
+        cat.takeout_member_add(
+            archive_id="A" * 43, member_path="a.jpg", kind="image",
+            size=1, crc32=1, status="ingested",
+        )
+        cat.takeout_member_add(
+            archive_id="A" * 43, member_path="b.mp4", kind="video",
+            size=1, crc32=1, status="deferred",
+        )
+        counts = cat.takeout_status_counts()
+        assert counts["archives"]["complete"] == 1
+        assert counts["members"]["ingested"] == 1
+        assert counts["members"]["deferred"] == 1
+        # a.jpg was ingested with no sidecar recorded
+        assert counts["missing_metadata"] == 1
+
+
+def test_takeout_tables_do_not_bump_the_schema_version(tmp_path) -> None:
+    from imageharbor.catalog import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == "2"
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.takeout_archive_upsert(
+            archive_id="A" * 43, last_path="/t.zip", size=1, mtime_ns=1
+        )
+    # Reopening must not raise LegacyCatalogError or lose the row.
+    with Catalog(tmp_path / "c.db") as cat:
+        assert cat.takeout_archive_get("A" * 43) is not None
