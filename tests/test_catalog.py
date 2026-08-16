@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from imageharbor import catalog as catalog_module
 from imageharbor.catalog import Catalog, _from_json
 
 
@@ -698,17 +699,31 @@ def test_takeout_archive_stat_fast_path(tmp_path) -> None:
         assert cat.takeout_archive_get_by_stat("/other.zip", 79, 1) is None
 
 
-def test_takeout_archive_upsert_updates_location_not_identity(tmp_path) -> None:
-    """A moved archive keeps its id; only where it lives changes."""
+def test_takeout_archive_upsert_updates_location_not_identity(tmp_path, monkeypatch) -> None:
+    """A moved archive keeps its id; only where it lives changes.
+
+    The two upserts below run back-to-back in the same process, microseconds
+    apart, so a real wall-clock read could plausibly land on the same string
+    twice -- which would let a broken `first_seen_at = excluded.first_seen_at`
+    slip past an equality assertion by accident. `_now_iso` is patched to
+    return two distinct, known timestamps so the `first_seen_at`/`last_seen_at`
+    assertions below are genuinely discriminating rather than clock-luck.
+    """
+    timestamps = iter(["2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"])
+    monkeypatch.setattr(catalog_module, "_now_iso", lambda: next(timestamps))
     with Catalog(tmp_path / "c.db") as cat:
         cat.takeout_archive_upsert(
             archive_id="A" * 43, last_path="/old/t1.zip", size=79, mtime_ns=1
         )
+        first_seen_at = cat.takeout_archive_get("A" * 43)["first_seen_at"]
         cat.takeout_archive_upsert(
             archive_id="A" * 43, last_path="/new/t1.zip", size=79, mtime_ns=9
         )
         assert len(cat.takeout_archives_all()) == 1
-        assert cat.takeout_archive_get("A" * 43)["last_path"] == "/new/t1.zip"
+        row = cat.takeout_archive_get("A" * 43)
+        assert row["last_path"] == "/new/t1.zip"
+        assert row["first_seen_at"] == first_seen_at
+        assert row["last_seen_at"] != first_seen_at
 
 
 def test_takeout_member_add_never_resets_a_terminal_status(tmp_path) -> None:

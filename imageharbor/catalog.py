@@ -686,10 +686,11 @@ class Catalog:
     ) -> None:
         """Record an archive, keyed by the digest of its own bytes.
 
-        `last_path` and `mtime_ns` move on conflict -- the same archive may be
-        copied or re-downloaded elsewhere -- but `archive_id` never does, so a
-        renamed archive is recognised rather than re-ingested. `first_seen_at`
-        is written once.
+        `last_path`, `mtime_ns`, `member_count`, `status`, `last_error`, and
+        `last_seen_at` all move on conflict -- the same archive may be copied
+        or re-downloaded elsewhere, re-surveyed, or re-tried -- but
+        `archive_id` never does, so a renamed archive is recognised rather
+        than re-ingested. `first_seen_at` is written once.
         """
         now = _now_iso()
         self._conn.execute(
@@ -767,7 +768,22 @@ class Catalog:
         sidecar_path: str | None = None,
         last_error: str = "",
     ) -> None:
-        """Record the outcome of ingesting one member."""
+        """Record the outcome of ingesting one member.
+
+        This is a blind full-row overwrite: `sha256_b64url`, `taken_at`, and
+        `sidecar_path` are always written, so a caller that omits any of them
+        clobbers the stored value with NULL rather than leaving it untouched.
+        There is no COALESCE-style "only overwrite what's given" behaviour
+        here -- a caller must pass every field it wants preserved. This is
+        acceptable because each member is finalized exactly once from
+        'pending' (a straight-line write with nothing yet to preserve), and a
+        'failed' member's retry re-supplies every field from scratch rather
+        than layering onto the failed attempt. A future caller that updates a
+        member twice with different field subsets -- e.g. finalizing a
+        previously-'deferred' video to 'ingested' without re-passing an
+        already-recorded `taken_at` -- would silently null it out; such a
+        caller must re-read and re-pass the existing value itself.
+        """
         self._conn.execute(
             """
             UPDATE takeout_members SET
