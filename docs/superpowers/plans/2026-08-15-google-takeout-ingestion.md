@@ -521,16 +521,26 @@ def test_takeout_archive_stat_fast_path(tmp_path) -> None:
 
 
 def test_takeout_archive_upsert_updates_location_not_identity(tmp_path) -> None:
-    """A moved archive keeps its id; only where it lives changes."""
+    """A moved archive keeps its id and its first-seen time; only location moves.
+
+    The `first_seen_at` assertion is the load-bearing one: it is the only thing
+    that would fail if someone later added `first_seen_at = excluded.first_seen_at`
+    to the DO UPDATE SET clause.
+    """
     with Catalog(tmp_path / "c.db") as cat:
         cat.takeout_archive_upsert(
             archive_id="A" * 43, last_path="/old/t1.zip", size=79, mtime_ns=1
         )
+        first = cat.takeout_archive_get("A" * 43)
         cat.takeout_archive_upsert(
             archive_id="A" * 43, last_path="/new/t1.zip", size=79, mtime_ns=9
         )
+        second = cat.takeout_archive_get("A" * 43)
+
         assert len(cat.takeout_archives_all()) == 1
-        assert cat.takeout_archive_get("A" * 43)["last_path"] == "/new/t1.zip"
+        assert second["last_path"] == "/new/t1.zip"
+        assert second["mtime_ns"] == 9
+        assert second["first_seen_at"] == first["first_seen_at"]
 
 
 def test_takeout_member_add_never_resets_a_terminal_status(tmp_path) -> None:
@@ -712,10 +722,15 @@ In `imageharbor/catalog.py`, insert this block immediately before the
     ) -> None:
         """Record an archive, keyed by the digest of its own bytes.
 
-        `last_path` and `mtime_ns` move on conflict -- the same archive may be
-        copied or re-downloaded elsewhere -- but `archive_id` never does, so a
-        renamed archive is recognised rather than re-ingested. `first_seen_at`
-        is written once.
+        On conflict, everything that describes the archive's current state
+        moves: `last_path`, `mtime_ns`, `member_count`, `status`, `last_error`,
+        `last_seen_at` -- the same archive may be copied or re-downloaded
+        elsewhere, and its ingest status changes as work proceeds.
+
+        Exactly two columns never move: `archive_id`, so a renamed archive is
+        recognised rather than re-ingested, and `first_seen_at`, so the record
+        of when this archive first entered the library survives every
+        re-observation.
         """
         now = _now_iso()
         self._conn.execute(
@@ -793,7 +808,21 @@ In `imageharbor/catalog.py`, insert this block immediately before the
         sidecar_path: str | None = None,
         last_error: str = "",
     ) -> None:
-        """Record the outcome of ingesting one member."""
+        """Record the outcome of ingesting one member.
+
+        This is a blind full-row UPDATE: `sha256_b64url`, `taken_at`, and
+        `sidecar_path` are written unconditionally, so a caller that omits one
+        overwrites the stored value with NULL. A caller must pass every field
+        it wants preserved.
+
+        That is acceptable because each member is finalized exactly once from
+        `pending`, and a `failed` member's retry re-supplies every field. It
+        would become a data-loss trap for a future caller that updates a member
+        twice with different field subsets -- finalizing a previously-`deferred`
+        video to `ingested` without re-passing its recorded `taken_at`, say. Add
+        COALESCE semantics only when such a caller actually exists; explicit
+        full-overwrite is easier to reason about until then.
+        """
         self._conn.execute(
             """
             UPDATE takeout_members SET
