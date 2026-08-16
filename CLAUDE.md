@@ -155,15 +155,20 @@ Module responsibilities:
   20). `resolve_descriptor` takes two optional keyword parameters for callers
   with better evidence than the path itself: `original_name` (e.g. Google
   Takeout's `title`, the pre-truncation name of a member whose stem the export
-  truncated) REPLACES the path's stem as the evidence when supplied and
-  non-blank; `date_str` (the `YYYY-MM-DD` the date ladder actually resolved) is
-  compared against the normalized descriptor, and a descriptor that merely
-  restates the date is discarded as `DESC_NONE` — the folder and the filename's
-  date prefix already say it, so keeping it would state the same fact twice.
-  `CAMERA_PATTERNS` gained two entries for the Takeout branch: a bare
-  `YYYY-MM-DD(N)?` date (a date is not a description) and a Hangouts/
-  AlbumArchive row id of the form `\d{10,}_account_id=\d+` (a Google Takeout
-  filename shape, not human intent).
+  truncated) supplies a **better spelling** of the name, not a vote that a
+  human authored it — a camera verdict from **either** name wins, and the
+  title's spelling is preferred only once both names have passed the camera
+  check. This matters because Google's `title` keeps characters the zip
+  member name had to sanitize for the filesystem, so the two can differ in
+  exactly the characters a pattern anchors on; `date_str` (the `YYYY-MM-DD`
+  the date ladder actually resolved) is compared against the normalized
+  descriptor, and a descriptor that merely restates the date is discarded as
+  `DESC_NONE` — the folder and the filename's date prefix already say it, so
+  keeping it would state the same fact twice. `CAMERA_PATTERNS` gained two
+  entries for the Takeout branch: a bare `YYYY-MM-DD(N)?` date (a date is not
+  a description) and a Hangouts/AlbumArchive row id of the form
+  `\d{10,}[\W_]?account[\W_]?id[\W_]?\d+` (a Google Takeout filename shape,
+  not human intent).
 - **`relocate.py`** — target-path computation (`target_path`) and safe
   in-tree relocation (`apply_relocation`, filesystem first then caller updates the
   catalog) plus digest-based self-healing (`find_by_digest`,

@@ -698,9 +698,12 @@ def test_omitting_the_new_arguments_reproduces_todays_behavior(
 
     This does NOT pin `process`/`watch` as byte-for-byte unchanged overall --
     this branch intentionally changed plain `process` behavior for two
-    descriptor shapes (a bare `YYYY.MM.DD` stem, and a Google-Photos-style
-    `..._account_id=N` stem), both improvements, pinned separately in
-    `tests/test_descriptor.py`. The filename used here ("beach photo.jpg") is
+    descriptor shapes, both improvements, pinned separately in
+    `tests/test_descriptor.py`: a `YYYY.MM.DD` stem that normalizes to the
+    SAME date the ladder resolved (not a `CAMERA_PATTERNS` match -- the
+    bare-date pattern is hyphens-only -- but discarded via the separate
+    `date_str` guard once the two agree), and a Google-Photos-style
+    `..._account_id=N` stem. The filename used here ("beach photo.jpg") is
     unaffected by either change, which is exactly why it isolates the
     None-vs-omitted question this test actually asks.
     """

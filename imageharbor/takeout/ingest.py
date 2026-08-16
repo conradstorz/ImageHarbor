@@ -119,6 +119,14 @@ class _Ingestor:
         # 20,000-member archive), and every paired member triggers a
         # `_read_sidecar` call, so without caching a 100k-member batch spends
         # hours in pure re-parsing. Closed in run()'s `finally`.
+        #
+        # Unbounded: never evicted for the lifetime of run(). Measured at
+        # ~11.8 MB resident per open ZipFile over a 20,000-member archive, so
+        # a 25-part batch holds ~295 MB -- correct as written, and far better
+        # than the re-parsing it replaces, but grows linearly with archive
+        # count. An LRU cap is the obvious next step if batch sizes grow; not
+        # implemented here because it is not needed at the sizes this ships
+        # for and would add eviction logic nobody has a test for.
         self._open_zips: dict[Path, zipfile.ZipFile] = {}
         self.pipeline = Pipeline(
             source_dir=self.staging_dir,
@@ -142,10 +150,31 @@ class _Ingestor:
         # Archives already complete, held back until the index exists so the
         # second pass below can tell whether new metadata reached them.
         completed: list[tuple[archive.ArchiveIdentity, list]] = []
+        # Archive identities already surveyed this run. A kept re-download --
+        # the same bytes reachable at two paths, e.g. "takeout-001.zip" and
+        # "takeout-001 (1).zip" -- must be surveyed once, not once per path.
+        seen_archive_ids: set[str] = set()
 
         for path in sorted(p for p in self.archives_dir.glob("*.zip") if p.is_file()):
             self.stats.archives_seen += 1
             identity = archive.identify(path, self.catalog)
+
+            if identity.archive_id in seen_archive_ids:
+                # The same archive reachable at two paths -- a kept
+                # re-download, typically. Surveying it twice would append its
+                # member list to `all_members` a second time, and
+                # `pairing.build_index` cannot tell "same archive, listed
+                # twice" from "two archives sharing a path": it would flag
+                # every media path as ambiguous and decline to pair ANY of
+                # them, dropping the whole batch into Undated/.
+                logger.info(
+                    "Skipping %s: same archive already surveyed at another path",
+                    path.name,
+                )
+                self.stats.archives_skipped += 1
+                continue
+            seen_archive_ids.add(identity.archive_id)
+
             row = self.catalog.takeout_archive_get(identity.archive_id)
 
             if row is not None and row["status"] == "complete":
@@ -423,9 +452,9 @@ class _Ingestor:
             # where a digest actually lives, duplicate or not.
             organized_path = result.organized_path
             if organized_path is None:
-                row = self.catalog.get_by_sha256(result.sha256_b64url)
-                if row is not None and row["organized_path"] is not None:
-                    organized_path = Path(row["organized_path"])
+                photo_row = self.catalog.get_by_sha256(result.sha256_b64url)
+                if photo_row is not None and photo_row["organized_path"] is not None:
+                    organized_path = Path(photo_row["organized_path"])
             if organized_path is not None:
                 self._merge_takeout_sidecar(organized_path, identity, member_path,
                                             sidecar_member, meta)
@@ -490,6 +519,8 @@ class _Ingestor:
         try:
             sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
             meta = self._read_sidecar(sidecar_member) if sidecar_member else metadata.EMPTY
+            if sidecar_member is None:
+                self.stats.missing_metadata += 1
             # `last_error` is deliberately omitted: this member just succeeded,
             # so clearing any error from a previous attempt is correct.
             self.catalog.takeout_member_set(

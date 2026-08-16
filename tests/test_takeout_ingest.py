@@ -341,6 +341,63 @@ def test_the_same_photo_in_two_archives_yields_one_file_and_two_sources(
     assert all("!" in r["source_path"] for r in catalog.sources_for(row["sha256_b64url"]))
 
 
+def test_the_same_archive_at_two_paths_does_not_defeat_pairing(
+    dirs, catalog: Catalog
+) -> None:
+    """A kept re-download must not collapse the batch's pairing.
+
+    `ambiguous_media` exists to refuse a pairing when two DIFFERENT archives
+    share a member path. It cannot see archive identity, so without a
+    seen-identity guard in the survey, one archive listed twice looks exactly
+    like that case and every photo in the batch loses its Google date.
+    """
+    import shutil
+
+    archives, dest = dirs
+    original = _zip(
+        archives / "takeout-001.zip",
+        {
+            f"{D}/vacation.jpg": _jpeg(40),
+            f"{D}/vacation.jpg.json": _sidecar("vacation.jpg", 1425905792),
+        },
+    )
+    shutil.copy(original, archives / "takeout-001 (1).zip")
+
+    stats = ingest_archives(archives, dest, catalog)
+
+    assert stats.ingested == 1
+    assert stats.missing_metadata == 0
+    assert len(list((dest / "2015" / "2015-03").glob("*.jpg"))) == 1
+    assert list((dest / "Undated").glob("*.jpg")) == []
+
+
+def test_two_different_archives_sharing_a_member_path_still_declines_pairing(
+    dirs, catalog: Catalog
+) -> None:
+    """Two DIFFERENT archives that happen to share a member path is the real
+    case `ambiguous_media` protects against, and the seen-identity guard added
+    for the kept-re-download regression must not weaken it: these two zips
+    have different bytes, so they get different `archive_id`s and are both
+    surveyed and both contribute their member path to the index.
+    """
+    archives, dest = dirs
+    _zip(
+        archives / "takeout-001.zip",
+        {
+            f"{D}/dup.jpg": _jpeg(50),
+            f"{D}/dup.jpg.json": _sidecar("dup.jpg", 1425905792),
+        },
+    )
+    _zip(archives / "takeout-002.zip", {f"{D}/dup.jpg": _jpeg(51)})
+
+    stats = ingest_archives(archives, dest, catalog)
+
+    assert stats.ingested == 2
+    assert stats.missing_metadata == 2
+    assert list((dest / "2015" / "2015-03").glob("*.jpg")) == []
+    assert len(list((dest / "Undated").glob("*.jpg"))) == 2
+
+
 # --- the late-sidecar case: the heart of the design ------------------------
 
 
