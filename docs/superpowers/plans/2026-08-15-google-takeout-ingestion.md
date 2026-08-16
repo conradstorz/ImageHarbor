@@ -110,12 +110,34 @@ def test_bare_date_with_copy_suffix_is_not_a_descriptor(tmp_path: Path) -> None:
     assert resolve_descriptor(path).tier == tiers.DESC_NONE
 
 
-def test_date_shaped_stem_with_words_survives(tmp_path: Path) -> None:
-    """Only a BARE date is discarded; a date plus human words is information."""
+def test_bare_date_pattern_does_not_over_match(tmp_path: Path) -> None:
+    """The new bare-date pattern is anchored: a date PLUS words is not a match.
+
+    `normalize_descriptor` then reduces this to the date alone, because its
+    three-word cap is entirely consumed by the date's own three numeric
+    tokens (2015, 03, 09). That is pre-existing, deliberately frozen behavior
+    (see tests/test_filename.py) and is NOT changed here -- the point of this
+    test is only that `is_camera_generated` leaves the stem alive.
+    """
     path = tmp_path / "2015-03-09 emma birthday.jpg"
+    assert is_camera_generated("2015-03-09 emma birthday") is False
     resolved = resolve_descriptor(path)
     assert resolved.tier == tiers.DESC_HUMAN_FILENAME
-    assert resolved.value == "2015-03-09-emma"
+    assert resolved.value == "2015-03-09"
+
+
+def test_a_date_only_descriptor_yields_to_the_enrichment_pass(tmp_path: Path) -> None:
+    """The accepted consequence of the above, pinned deliberately.
+
+    Once the pipeline supplies the date it actually resolved, a descriptor that
+    reduced to nothing but that same date is discarded -- which is the RIGHT
+    outcome: it leaves descriptor_tier at 0, so the enrichment pass can later
+    supply a real subject at DESC_AI_SUBJECT (20). The alternative is locking
+    the file at tier 30 with a filename that states the date twice and says
+    nothing else, which no later pass could ever improve.
+    """
+    path = tmp_path / "2015-03-09 emma birthday.jpg"
+    assert resolve_descriptor(path, date_str="2015-03-09").tier == tiers.DESC_NONE
 
 
 def test_descriptor_equal_to_resolved_date_is_discarded(tmp_path: Path) -> None:
