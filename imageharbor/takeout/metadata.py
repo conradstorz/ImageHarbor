@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -59,6 +59,13 @@ class TakeoutMetadata:
     people: tuple[str, ...] = ()
     favorited: bool = False
     size_bytes: int | None = None
+    # Google's own EXIF summary (apertureFNumber, cameraModel, exposureTime,
+    # focalLength, isoEquivalent). Passed through verbatim and never parsed
+    # for meaning -- it is recorded provenance, exactly like geo and people,
+    # and cannot move or rename a file. Usually redundant with the real EXIF
+    # `exif_reader` reads from the image bytes; occasionally it is the only
+    # camera data left, when Google's export pipeline stripped the original.
+    google_exif: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -133,12 +140,20 @@ def _timestamp(block: Any) -> datetime | None:
 
 
 def _geo(block: Any) -> tuple[float | None, float | None]:
+    # OverflowError is in the tuple because `float()` raises it for a Python
+    # int too large for a C double, and a bare (unquoted) 400-digit JSON
+    # integer literal survives json.loads to reach exactly that call. Unlike
+    # `_load`'s unknowable surface, this one IS bounded and enumerable: the
+    # input is a json.loads product, so `float()` can see only dict/list/None
+    # (TypeError), a non-numeric str (ValueError), or an oversized int
+    # (OverflowError). A complete narrow tuple is therefore correct here --
+    # but it must actually be complete.
     if not isinstance(block, dict):
         return (None, None)
     try:
         lat = float(block["latitude"])
         lon = float(block["longitude"])
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
         return (None, None)
     if (lat, lon) == _NULL_ISLAND:
         return (None, None)
@@ -178,6 +193,10 @@ def parse_photo_metadata(raw: bytes) -> TakeoutMetadata:
     if latitude is None:
         latitude, longitude = _geo(data.get("geoDataExif"))
 
+    google_exif = data.get("exif")
+    if not isinstance(google_exif, dict):
+        google_exif = {}
+
     return TakeoutMetadata(
         title=_text(data.get("title")),
         description=_text(data.get("description")),
@@ -188,6 +207,7 @@ def parse_photo_metadata(raw: bytes) -> TakeoutMetadata:
         people=_people(data.get("people")),
         favorited=data.get("favorited") is True,
         size_bytes=_int(data.get("sizeBytes")),
+        google_exif=google_exif,
     )
 
 

@@ -37,6 +37,8 @@ def test_parses_the_real_album_archive_payload() -> None:
     assert meta.latitude == pytest.approx(38.2768361)
     assert meta.longitude == pytest.approx(-85.73573890000002)
     assert meta.size_bytes == 3698139
+    assert meta.google_exif["cameraModel"] == "XT1056"
+    assert meta.google_exif["isoEquivalent"] == 640
     # Absent in this schema; every field is optional.
     assert meta.description is None
     assert meta.people == ()
@@ -120,6 +122,7 @@ def test_empty_singleton_is_all_defaults() -> None:
     assert EMPTY.photo_taken_at is None
     assert EMPTY.people == ()
     assert EMPTY.favorited is False
+    assert EMPTY.google_exif == {}
 
 
 def test_parse_album_metadata() -> None:
@@ -168,3 +171,36 @@ def test_geodata_with_only_latitude_is_treated_as_absent() -> None:
     meta = parse_photo_metadata(raw)
     assert meta.latitude is None
     assert meta.longitude is None
+
+
+def test_oversized_latitude_never_raises() -> None:
+    """Adversarial input, not fuzzing -- pins the never-raise contract.
+
+    `float()` raises `OverflowError` (not `ValueError`/`TypeError`) for a
+    Python int too large for a C double, and a bare (unquoted) 400-digit JSON
+    integer literal survives `json.loads` to reach exactly that call. If this
+    test is ever deleted as arbitrary fuzzing, this exact escape from the
+    module's absolute never-raise contract is no longer verified.
+    """
+    raw = b'{"geoData": {"latitude": ' + str(10**400).encode() + b', "longitude": 1}}'
+    meta = parse_photo_metadata(raw)
+    assert meta.latitude is None
+    assert meta.longitude is None
+
+
+def test_oversized_longitude_never_raises() -> None:
+    """Same escape as above, exercised through `longitude` instead of
+    `latitude` -- both operands of `_geo`'s `float()` calls are reachable by
+    this class of oversized-int input, so both are pinned."""
+    raw = b'{"geoData": {"latitude": 1, "longitude": ' + str(10**400).encode() + b"}}"
+    meta = parse_photo_metadata(raw)
+    assert meta.latitude is None
+    assert meta.longitude is None
+
+
+def test_non_dict_exif_block_yields_empty_google_exif() -> None:
+    """A malformed `exif` value must degrade to `{}`, not raise and not
+    store a non-dict value."""
+    raw = json.dumps({"exif": "not a dict"}).encode()
+    meta = parse_photo_metadata(raw)
+    assert meta.google_exif == {}
