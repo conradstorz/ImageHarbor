@@ -1394,7 +1394,7 @@ from __future__ import annotations
 
 import pytest
 
-from imageharbor.takeout.pairing import build_index, sidecar_for
+from imageharbor.takeout.pairing import _MIN_TRUNCATION_PREFIX, build_index, sidecar_for
 
 D = "Takeout/AlbumArchive/Hangouts/album"
 
@@ -1489,9 +1489,47 @@ def test_truncation_recovery_refuses_an_ambiguous_prefix() -> None:
 
 
 def test_truncation_recovery_never_steals_a_claimed_sidecar() -> None:
-    """A sidecar that exactly pairs with another member is off limits."""
-    index = build_index(["d/photo.jpg", "d/photo.jpg.json", "d/photo.jpg-extra.jpg"])
-    assert sidecar_for("d/photo.jpg-extra.jpg", index) is None
+    """A sidecar that exactly pairs with another member is off limits.
+
+    The names are deliberately contrived so this test isolates the claimed-set
+    guard and nothing else. Two conditions have to hold at once or the test is
+    vacuous, which an earlier version of it was:
+
+    * the sidecar's media-part must be at least ``_MIN_TRUNCATION_PREFIX``
+      characters, or the length floor rejects the candidate first and the
+      claimed-set guard is never reached;
+    * the would-be thief's name must literally start with that whole
+      media-part, extension included, or the prefix test fails first.
+
+    With both satisfied, the ONLY thing returning ``None`` is the claimed-set
+    exclusion -- so deleting that clause makes this test fail, which is the
+    entire point of it.
+    """
+    owner = "d/photograph-of-a-sunset.jpg"
+    sidecar = "d/photograph-of-a-sunset.jpg.json"
+    thief = "d/photograph-of-a-sunset.jpg-extra.jpg"
+    index = build_index([owner, sidecar, thief])
+
+    # Preconditions, asserted so a future edit to the fixture cannot silently
+    # make this test vacuous again.
+    assert len("photograph-of-a-sunset.jpg") >= _MIN_TRUNCATION_PREFIX
+    assert thief.startswith(owner)
+    assert sidecar in index.claimed
+
+    assert sidecar_for(owner, index) == sidecar
+    assert sidecar_for(thief, index) is None
+
+
+def test_case_colliding_sidecars_are_not_matched() -> None:
+    """Two sidecars differing only in case make a case-insensitive hit a guess.
+
+    Rung 5 exists to recover an exact match whose extension case differs. When
+    two real members collide under lowercasing there is no longer one obvious
+    answer, so the index poisons that key and the lookup must decline.
+    """
+    index = build_index(["d/PHOTO.JPG", "d/photo.jpg.json", "d/PHOTO.JPG.json"])
+    assert index.sidecars_ci["d/photo.jpg.json"] is None
+    assert sidecar_for("d/PHOTO.jpg", index) is None
 
 
 def test_truncation_recovery_ignores_a_too_short_prefix() -> None:
