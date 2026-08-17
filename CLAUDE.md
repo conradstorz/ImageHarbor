@@ -42,6 +42,8 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 | Run the CLI | `uv run imageharbor --help` |
 | Organize a library (facts pass, no AI) | `uv run imageharbor process --source SRC --dest DEST` |
 | Describe/classify the organized copies | `uv run imageharbor enrich --dest DEST --ai openai` |
+| Ingest Google Takeout archives | `uv run imageharbor takeout ingest --archives DIR --dest DEST` |
+| Report Takeout ingestion progress | `uv run imageharbor takeout status --catalog DEST/catalog.db` |
 | Re-verify integrity | `uv run imageharbor verify DEST` |
 | Watch a library continuously (both passes) | `uv run imageharbor watch --source SRC --dest DEST` |
 | Build the Docker image | `docker build -t imageharbor:latest .` |
@@ -88,7 +90,46 @@ Module responsibilities:
   verifies, upserts the catalog, records the source, and optionally merges a
   sidecar. Owns the `PipelineStats`/`ProcessResult` result types. If a post-copy
   integrity check fails, the copy is deleted and an error is raised — nothing
-  enters the catalog unverified.
+  enters the catalog unverified. `process_file`'s `source_label` overrides what
+  gets recorded as the logical source in `sources` (Takeout ingestion passes
+  `"<archive>!<member path>"`, since the real source is a zip member, not the
+  staged file's own path). `ExternalEvidence` (`date`, `original_name`) is the
+  parameter object for facts a caller obtained elsewhere — in practice Google
+  Takeout's per-media JSON — that `Pipeline` unpacks into the two resolvers
+  rather than passing down, so neither resolver learns anything about Takeout;
+  `date` feeds `date_resolver.resolve_date`'s `external_date` and
+  `original_name` feeds `descriptor.resolve_descriptor`'s `original_name`.
+  Google's `creationTime` must never be placed in `ExternalEvidence.date` — it
+  is upload time, not capture time. `consume_source=True` (used only by
+  Takeout ingestion, on a staging file the caller owns and considers
+  disposable) changes the copy → verify → catalog ordering described under
+  "Critical invariants" below to rename → verify → catalog — verification still
+  reads the file at its destination, so nothing enters the catalog unverified
+  either way.
+- **`takeout/`** — Google Takeout archive ingestion, a third entry point into the
+  facts pass (`imageharbor takeout ingest`). Two phases: a **survey** that reads
+  only zip central directories (no decompression) and builds ONE pairing index
+  across every archive in the batch, then a resumable **ingest** that extracts
+  one member at a time into `<dest>/.takeout-staging/` and hands it to
+  `Pipeline.process_file`. The survey itself is two passes: pass one records
+  every `complete` archive's member paths from `takeout_members` (no zip
+  reopened) so a batch that already finished still contributes to the pairing
+  index; pass two then reopens a `complete` archive — and only that archive —
+  when the freshly-built index newly resolves a sidecar for one of its members
+  (an image/video with no `sidecar_path` on record), returning that member to
+  `pending` so it re-ingests as a duplicate through
+  `_maybe_upgrade_from_duplicate` and upgrades in place, handling the
+  photos-first-then-sidecars-later ordering with no new placement code. Four
+  modules: `metadata.py` (pure Google-JSON parser, never raises), `pairing.py`
+  (pure media→sidecar matcher that returns `None` rather than guess),
+  `archive.py` (identity, enumeration, classification, extraction), `ingest.py`
+  (the only module with side effects). Archives are opened `'r'` only and are
+  never modified. Makes **no AI calls**, so — exactly like the facts pass — it
+  never consults or feeds the circuit breaker. Videos are enumerated and
+  recorded as `deferred` with their capture date but no bytes are copied; video
+  ingestion is a deliberate later project. The global (not per-archive) pairing
+  index is load-bearing: Google's multi-part zips split by size across the file
+  list, so a photo and its `.json` routinely land in different parts.
 - **`tiers.py`** — pure, I/O-free module defining the two independent quality
   ladders (`DATE_*`, `DESC_*`) and the single predicate `is_upgrade(old, new)` that
   governs every rename in the system: a proposed `(date_tier, descriptor_tier)`
@@ -101,13 +142,33 @@ Module responsibilities:
   absent from the ladder because it records when a file was copied, not when a
   photo was taken. `date_from_row` rebuilds a `ResolvedDate` from stored catalog
   columns so both passes can compare a freshly-resolved date against the one on
-  record.
+  record. `resolve_date`'s `external_date` keyword populates the
+  `DATE_EXTERNAL_SIDECAR` (30) rung, which sits below EXIF `DateTimeOriginal` and
+  above `DateTimeDigitized`/`DateTime` — in practice Google Takeout's
+  `photoTakenTime`. Google's `creationTime` is deliberately excluded for the
+  same reason mtime is: it records upload time, not capture time.
 - **`descriptor.py`** — resolves a `ResolvedDescriptor` from the original
   filename's stem: a stem that doesn't match a `CAMERA_PATTERNS` entry (IMG_1234,
   DSC0042, Screenshot_…, WhatsApp Image …, etc.) is human-authored and gets
   `DESC_HUMAN_FILENAME` (tier 30); a camera-generated stem gets `DESC_NONE` (tier
   0) and waits for the AI enrichment pass to fill it at `DESC_AI_SUBJECT` (tier
-  20).
+  20). `resolve_descriptor` takes two optional keyword parameters for callers
+  with better evidence than the path itself: `original_name` (e.g. Google
+  Takeout's `title`, the pre-truncation name of a member whose stem the export
+  truncated) supplies a **better spelling** of the name, not a vote that a
+  human authored it — a camera verdict from **either** name wins, and the
+  title's spelling is preferred only once both names have passed the camera
+  check. This matters because Google's `title` keeps characters the zip
+  member name had to sanitize for the filesystem, so the two can differ in
+  exactly the characters a pattern anchors on; `date_str` (the `YYYY-MM-DD`
+  the date ladder actually resolved) is compared against the normalized
+  descriptor, and a descriptor that merely restates the date is discarded as
+  `DESC_NONE` — the folder and the filename's date prefix already say it, so
+  keeping it would state the same fact twice. `CAMERA_PATTERNS` gained two
+  entries for the Takeout branch: a bare `YYYY-MM-DD(N)?` date (a date is not
+  a description) and a Hangouts/AlbumArchive row id of the form
+  `\d{10,}[\W_]?account[\W_]?id[\W_]?\d+` (a Google Takeout filename shape,
+  not human intent).
 - **`relocate.py`** — target-path computation (`target_path`) and safe
   in-tree relocation (`apply_relocation`, filesystem first then caller updates the
   catalog) plus digest-based self-healing (`find_by_digest`,
@@ -243,8 +304,21 @@ Module responsibilities:
   good files. Quarantine requires a *healthy* pass to observe the failure —
   see "Known limitations" below for the accepted boundary this creates when
   poison files constitute the entire remaining queue.
+  A `takeout_archives` table (`archive_id` = SHA-256 of the zip's own bytes,
+  `status` partial|complete|corrupt) and a `takeout_members` table
+  (`(archive_id, member_path)`, with terminal statuses `ingested`/`duplicate`/
+  `deferred`/`parsed`/`ignored`/`skipped_trash` and non-terminal `pending`/
+  `failed`) back Takeout ingestion's four idempotency layers. Both are purely
+  additive, so `SCHEMA_VERSION` stays `"2"` and an existing catalog upgrades in
+  place.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
+  Also defines `VIDEO_EXTENSIONS`, for **classification only** — `discover_images`
+  still yields images and nothing else; video ingestion is a separate, later
+  project. Takeout ingestion (`takeout/archive.py`) uses `VIDEO_EXTENSIONS` to
+  enumerate videos and record them as `deferred` with a capture date, so that
+  later project starts from a complete work queue rather than from zero, but no
+  video bytes are ever copied by any current code path.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
   rather than raising on any failure.
 - **`sidecar.py`** — optional, per-image `.json` metadata file (via `--sidecar`),
@@ -257,7 +331,7 @@ Module responsibilities:
   `descriptor`/`exif`; the enrichment pass later merges `classification`. There is
   no standalone `write_sidecar` anymore — `merge_sidecar` is the only entry point.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
-  `catalog list/get`).
+  `catalog list/get`, `takeout ingest/status`).
 
 ## Critical invariants — do not break these
 
@@ -308,6 +382,13 @@ Module responsibilities:
   never reads `stat().st_mtime`: mtime records when a file was copied, not when a
   photo was taken, and asserting a date we can't support is exactly the quiet
   corruption the project's SHA-256 discipline exists to prevent.
+- **Takeout pairing never guesses, and Takeout archives are never written to.**
+  If no pairing rung yields exactly one sidecar match, `pairing.sidecar_for`
+  returns `None` and the member is ingested from EXIF and its filename alone —
+  a fully correct outcome. A *wrong* pairing writes another photo's capture date
+  into this photo's name and folder, which is exactly the quiet corruption the
+  SHA-256 discipline exists to prevent. Separately: archives are opened `'r'`
+  only, and Google's `creationTime` must never reach `resolve_date`.
 - **The 43-char digest is located by counting back from the end of the stem, NOT by
   splitting on the last `_`.** Base64url legitimately contains `_`, so a naive rsplit
   corrupts parsing. This logic is duplicated in `hashing.extract_digest_from_stem`
@@ -326,7 +407,12 @@ Module responsibilities:
   (streamed in 64 KiB chunks). Changing the hash algorithm, the Base64url encoding,
   or the 43-char length assumption breaks every existing filename and catalog key.
 - **Originals are read-only; the organized copy is verified before it is cataloged.**
-  Preserve this copy → verify → catalog ordering when editing the pipeline.
+  Preserve this copy → verify → catalog ordering when editing the pipeline. The
+  one exception is `consume_source=True` (used only by Takeout ingestion, on a
+  staging file the caller owns and created as disposable, never a real
+  original): the ordering becomes rename → verify → catalog, with verification
+  still reading the destination — nothing enters the catalog unverified either
+  way.
 - **Runtime output directories are git-ignored, not source** (`Photos-Organized/`,
   `Review/`, `Duplicates/`, `Logs/`, `catalog.db`, etc. in `.gitignore`).
 

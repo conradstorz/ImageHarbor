@@ -33,3 +33,8 @@ Duplicates/
 Logs/
 Manifests/
 catalog.db
+
+# Google Takeout archives and ingest staging (never source)
+*.zip
+*.tgz
+.takeout-staging/

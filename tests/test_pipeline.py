@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 from imageharbor import tiers
 from imageharbor.catalog import Catalog
 from imageharbor.hashing import verify_pcs_file
-from imageharbor.pipeline import Pipeline
+from imageharbor.pipeline import ExternalEvidence, Pipeline
 
 
 # ---------------------------------------------------------------------------
@@ -525,3 +526,270 @@ def test_sidecar_records_facts_and_sources(tmp_path):
     assert data["date"]["source"] == "none"
     assert len(data["sources"]) == 1
     assert "classification" not in data
+
+
+def test_consume_source_moves_instead_of_copying(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    staged = _make_jpeg(staging / "beach.jpg")
+
+    pipeline = Pipeline(staging, organized_dir, catalog, consume_source=True)
+    result = pipeline.process_file(staged)
+
+    assert result.status == "copied"
+    assert not staged.exists()                      # consumed
+    assert result.organized_path.exists()
+    assert verify_pcs_file(result.organized_path)   # verified AFTER the move
+
+
+def test_consume_source_defaults_to_copying(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    original = source_dir / "beach_photo.jpg"
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    result = pipeline.process_file(original)
+
+    assert original.exists()                        # untouched
+    assert result.organized_path.exists()
+
+
+def test_consume_source_falls_back_to_copy_across_filesystems(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """EXDEV must degrade to copy-then-delete, not fail every member of the run.
+
+    No filesystem available to the test suite produces a genuine cross-device
+    rename, so the error is injected. Without this the fallback branch -- and
+    specifically its post-verification unlink -- is unreachable code that no
+    mutation can be caught by.
+    """
+    import os as _os
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    def _exdev(src, dst):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(_os, "replace", _exdev)
+
+    result = Pipeline(
+        tmp_path, organized_dir, catalog, consume_source=True
+    ).process_file(staged)
+
+    assert result.status == "copied"
+    assert result.organized_path.exists()
+    assert verify_pcs_file(result.organized_path)
+    # The fallback must still consume the source, and only after verifying.
+    assert not staged.exists()
+
+
+def test_a_non_exdev_oserror_is_not_swallowed_as_a_cross_device_move(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """Only EXDEV degrades to a copy; any other OSError is a real fault."""
+    import errno as _errno
+    import os as _os
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    def _denied(src, dst):
+        raise OSError(_errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(_os, "replace", _denied)
+
+    result = Pipeline(
+        tmp_path, organized_dir, catalog, consume_source=True
+    ).process_file(staged)
+
+    assert result.status == "error"
+    assert "Permission denied" in result.error
+
+
+def test_fallback_keeps_the_staging_file_when_verification_fails(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """The ordering guarantee: unlink happens only AFTER the destination verifies.
+
+    Forces both halves of the hazard at once -- a cross-device rename (so the
+    copy fallback runs) and a failed integrity check. The staging bytes must
+    survive, because on this path they are the only recoverable copy and the
+    caller has to be able to retry. Inverting verify and unlink would destroy
+    them and leave nothing to retry from, which no other test would catch.
+    """
+    import os as _os
+
+    from imageharbor import pipeline as pipeline_mod
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    def _exdev(src, dst):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(_os, "replace", _exdev)
+    monkeypatch.setattr(pipeline_mod, "verify_file", lambda path, digest: False)
+
+    result = Pipeline(
+        tmp_path, organized_dir, catalog, consume_source=True
+    ).process_file(staged)
+
+    assert result.status == "error"
+    assert staged.exists()                              # recoverable
+    assert list(organized_dir.rglob("*.jpg")) == []     # no unverified file left
+    assert catalog.count() == 0                         # nothing catalogued
+
+
+def test_source_label_is_what_gets_recorded(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The staging path is disposable; the logical source is the archive member."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    staged = _make_jpeg(staging / "beach.jpg")
+    label = "/nas/takeout/t1.zip!Takeout/AlbumArchive/a/beach.jpg"
+
+    pipeline = Pipeline(staging, organized_dir, catalog)
+    result = pipeline.process_file(staged, source_label=label)
+
+    row = catalog.get_by_sha256(result.sha256_b64url)
+    assert row["original_path"] == label
+    assert [r["source_path"] for r in catalog.sources_for(result.sha256_b64url)] == [label]
+
+
+def test_evidence_date_places_the_file(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    staged = _make_jpeg(tmp_path / "IMG_1234.jpg")
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    result = pipeline.process_file(
+        staged, evidence=ExternalEvidence(date=datetime(2015, 3, 9, 12, 56, 32))
+    )
+
+    assert result.organized_path.parent == organized_dir / "2015" / "2015-03"
+    row = catalog.get_by_sha256(result.sha256_b64url)
+    assert row["date_tier"] == tiers.DATE_EXTERNAL_SIDECAR
+    assert row["date_source"] == "external_sidecar"
+
+
+def test_evidence_original_name_names_the_file(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    staged = _make_jpeg(tmp_path / "truncated-stem.jpg")
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    result = pipeline.process_file(
+        staged, evidence=ExternalEvidence(original_name="emma birthday party.jpg")
+    )
+
+    assert "emma-birthday-party" in result.organized_path.name
+    row = catalog.get_by_sha256(result.sha256_b64url)
+    assert row["descriptor_tier"] == tiers.DESC_HUMAN_FILENAME
+
+
+def test_omitting_the_new_arguments_reproduces_todays_behavior(
+    tmp_path: Path, organized_dir: Path
+) -> None:
+    """Passing the new arguments explicitly as None is equivalent to omitting them.
+
+    Runs identical bytes through two independent libraries -- one calling
+    `process_file(path)` exactly as `watcher.py` does, one passing the new
+    arguments explicitly as None -- and compares every field that decides
+    placement, naming, and identity.
+
+    This does NOT pin `process`/`watch` as byte-for-byte unchanged overall --
+    this branch intentionally changed plain `process` behavior for two
+    descriptor shapes, both improvements, pinned separately in
+    `tests/test_descriptor.py`: a `YYYY.MM.DD` stem that normalizes to the
+    SAME date the ladder resolved (not a `CAMERA_PATTERNS` match -- the
+    bare-date pattern is hyphens-only -- but discarded via the separate
+    `date_str` guard once the two agree), and a Google-Photos-style
+    `..._account_id=N` stem. The filename used here ("beach photo.jpg") is
+    unaffected by either change, which is exactly why it isolates the
+    None-vs-omitted question this test actually asks.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_jpeg(src / "beach photo.jpg")
+
+    def _run(root: str, **kwargs) -> tuple:
+        dest = organized_dir / root
+        dest.mkdir()
+        with Catalog(tmp_path / f"{root}.db") as cat:
+            result = Pipeline(src, dest, cat).process_file(src / "beach photo.jpg", **kwargs)
+            row = cat.get_by_sha256(result.sha256_b64url)
+            return (
+                result.status,
+                result.organized_path.relative_to(dest).as_posix(),
+                row["original_path"],
+                row["date_tier"], row["date_source"], row["date_value"],
+                row["descriptor_tier"], row["descriptor_source"], row["descriptor_value"],
+                [r["source_path"] for r in cat.sources_for(result.sha256_b64url)],
+            )
+
+    omitted = _run("a")
+    explicit_none = _run("b", source_label=None, evidence=None)
+    assert omitted == explicit_none
+
+
+def test_evidence_none_on_the_duplicate_branch_is_safe(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The duplicate branch dereferences `evidence`; None must not reach it raw."""
+    staged = _make_jpeg(tmp_path / "beach photo.jpg")
+    pipeline = Pipeline(tmp_path, organized_dir, catalog)
+    first = pipeline.process_file(staged)
+    second = pipeline.process_file(staged, evidence=None)
+
+    assert second.status == "duplicate"
+    row = catalog.get_by_sha256(first.sha256_b64url)
+    assert row["organized_path"] == str(first.organized_path)
+
+
+def test_result_source_path_is_the_real_path_not_the_label(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """`source_label` replaces the recorded IDENTITY, never the path read from."""
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+    label = "/nas/takeout/t1.zip!Takeout/AlbumArchive/a/beach.jpg"
+
+    result = Pipeline(tmp_path, organized_dir, catalog).process_file(
+        staged, source_label=label
+    )
+
+    assert result.source_path == staged
+    assert str(result.source_path) != label
+
+
+def test_consume_source_cleans_up_when_the_destination_already_exists(
+    tmp_path: Path, organized_dir: Path
+) -> None:
+    """The already-present-and-verified branch must still consume the source.
+
+    Reaching that branch requires a destination that exists and verifies while
+    the digest is UNKNOWN to the catalog -- a rebuilt catalog over a surviving
+    tree, or a crash between the copy and the catalog upsert. A known digest
+    would take the duplicate branch and return long before the copy step, so a
+    second run against the SAME catalog would not exercise this at all.
+    """
+    first_staging = tmp_path / "s1"
+    first_staging.mkdir()
+    staged_once = _make_jpeg(first_staging / "beach.jpg")
+    with Catalog(tmp_path / "first.db") as cat:
+        first = Pipeline(
+            first_staging, organized_dir, cat, consume_source=True
+        ).process_file(staged_once)
+    assert first.organized_path.exists()
+
+    # Fresh catalog, surviving tree: the digest is unknown but the file is there.
+    second_staging = tmp_path / "s2"
+    second_staging.mkdir()
+    staged_twice = _make_jpeg(second_staging / "beach.jpg")
+    with Catalog(tmp_path / "second.db") as cat:
+        assert not cat.is_known(first.sha256_b64url)
+        second = Pipeline(
+            second_staging, organized_dir, cat, consume_source=True
+        ).process_file(staged_twice)
+
+    assert second.status == "copied"
+    assert not staged_twice.exists()      # consumed, not leaked
+    assert first.organized_path.exists()  # destination untouched

@@ -51,6 +51,19 @@ CAMERA_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\d{8}[-_]\d{6}$", re.I),                     # 20190704_123456
     re.compile(r"^\d{4}-\d{2}-\d{2}[ _]\d{2}\.\d{2}\.\d{2}$"), # 2019-07-04 12.33.11
     re.compile(r"^\d{9,13}$"),                                 # bare epoch seconds/ms
+    # Hangouts / AlbumArchive row ids, present at volume in Google Takeout
+    # exports: 865948477697870747_account_id=1.jpg
+    #
+    # The separators are deliberately loose: the zip member name reads
+    # `..._account_id=1` because the filesystem cannot hold the `?` that
+    # Google's own `title` field preserves (`...?account_id=1`). Anchoring on
+    # one spelling would match only one of the two names the resolver sees.
+    re.compile(r"^\d{10,}[\W_]?account[\W_]?id[\W_]?\d+$", re.I),
+    # A BARE date, with or without Google's (N) copy suffix. A date is not a
+    # description -- the date ladder already captured it, and keeping it here
+    # would state the same fact twice in one filename. A date followed by
+    # human words ("2015-03-09 emma birthday") does NOT match and survives.
+    re.compile(r"^\d{4}-\d{2}-\d{2}(\(\d+\))?$"),
 )
 
 
@@ -72,21 +85,57 @@ def is_camera_generated(stem: str) -> bool:
     return any(pattern.match(candidate) for pattern in CAMERA_PATTERNS)
 
 
-def resolve_descriptor(source_path: Path) -> ResolvedDescriptor:
+def resolve_descriptor(
+    source_path: Path,
+    *,
+    original_name: str | None = None,
+    date_str: str | None = None,
+) -> ResolvedDescriptor:
     """Derive a descriptor from *source_path*'s original filename.
 
     Returns tier ``DESC_HUMAN_FILENAME`` when the stem carries human intent,
     and ``DESC_NONE`` when it does not -- leaving the slot open for the AI
     enrichment pass to fill at the lower ``DESC_AI_SUBJECT`` tier.
+
+    Parameters
+    ----------
+    original_name:
+        A filename known to be closer to the original than *source_path*'s own
+        -- Google Takeout's ``title``, which is the pre-truncation name of a
+        member whose stem the export truncated.
+
+        It supplies a BETTER SPELLING of the name; it is not a vote that the
+        name is human-authored. A camera verdict from EITHER name therefore
+        wins. This is load-bearing: Google's ``title`` keeps characters the zip
+        member name had to sanitize for the filesystem, so the two can differ
+        in exactly the characters a pattern anchors on. In the calibrating
+        export every Hangouts row id reads ``...?account_id=1`` in the title but
+        ``..._account_id=1`` in the member name -- and letting the title win
+        would lock 42 of 52 files to a row id at tier 30, where no later pass
+        could ever rename them.
+    date_str:
+        The ``YYYY-MM-DD`` the date ladder actually resolved for this file, when
+        the caller already knows it. A descriptor that merely restates the date
+        carries no information beyond what the folder and the filename's date
+        prefix already say, so it is discarded as ``DESC_NONE``.
     """
-    stem = source_path.stem
-    if not stem or is_camera_generated(stem):
+    path_stem = source_path.stem
+    title_stem = Path(original_name.strip()).stem if original_name else ""
+
+    if not path_stem and not title_stem:
         return _NONE
+    if is_camera_generated(path_stem) or (title_stem and is_camera_generated(title_stem)):
+        return _NONE
+
+    stem = title_stem or path_stem
 
     normalized = normalize_descriptor(stem)
     # normalize_descriptor falls back to "photo" for input with no usable
     # characters; that is not information, so treat it as absent.
     if not normalized or normalized == "photo":
+        return _NONE
+
+    if date_str and normalized == date_str:
         return _NONE
 
     return ResolvedDescriptor(
