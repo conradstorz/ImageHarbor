@@ -188,3 +188,28 @@ def test_a_media_path_shared_by_two_archives_is_never_paired() -> None:
     index = build_index(members)
     assert "d/a.jpg" in index.ambiguous_media
     assert sidecar_for("d/a.jpg", index) is None
+
+
+def test_a_sidecar_path_shared_by_two_archives_is_never_paired() -> None:
+    """A duplicated SIDECAR path is as ambiguous as a duplicated media path.
+
+    The index has no archive dimension and the ingest layer's owner map is
+    last-writer-wins, so a sidecar path present in two archives can hand a
+    photo the wrong archive's bytes -- silently dating it from metadata that
+    does not describe it. Declining costs only the Google metadata; a wrong
+    date is permanent.
+    """
+    media = "d/IMG_1234.jpg"
+    sidecar = "d/IMG_1234.jpg.json"
+    # `sidecar` supplied twice: once by each archive in the batch.
+    index = build_index([media, sidecar, sidecar])
+
+    assert sidecar in index.ambiguous_sidecars
+    assert sidecar_for(media, index) is None
+
+
+def test_a_sidecar_appearing_once_still_pairs_normally() -> None:
+    """The exclusion must be targeted -- the ordinary case is unaffected."""
+    index = build_index(["d/IMG_1234.jpg", "d/IMG_1234.jpg.json"])
+    assert index.ambiguous_sidecars == frozenset()
+    assert sidecar_for("d/IMG_1234.jpg", index) == "d/IMG_1234.jpg.json"

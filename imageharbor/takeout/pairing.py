@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
@@ -79,6 +80,16 @@ class PairingIndex:
     # to pair any of them rather than risk dating one archive's bytes with
     # another archive's sidecar.
     ambiguous_media: frozenset[str] = frozenset()
+    # Sidecar paths that occur more than once across the batch. Same reasoning
+    # as `ambiguous_media`, mirrored onto the other side of the pairing: the
+    # index has no archive dimension, and the ingest layer's `self.owner` map
+    # (member path -> owning archive) is last-writer-wins, so a sidecar path
+    # duplicated across archives can silently hand a photo another archive's
+    # sidecar bytes. Declining costs those members only their Google metadata
+    # -- they still organize from EXIF and filename, and `missing_metadata`
+    # makes the gap visible. A wrong date is permanent and silent, which is
+    # strictly worse.
+    ambiguous_sidecars: frozenset[str] = frozenset()
 
 
 def _split(member_path: str) -> tuple[str, str]:
@@ -170,8 +181,22 @@ def build_index(members: Iterable[str]) -> PairingIndex:
     boundary.
     """
     all_members = list(members)
-    sidecars = [m for m in all_members if _is_sidecar(m)]
+    sidecars_seen = [m for m in all_members if _is_sidecar(m)]
     media = [m for m in all_members if not _is_sidecar(m)]
+
+    # A sidecar path occurring more than once across the batch is unusable,
+    # for the same reason a duplicated media path is unusable (see
+    # `ambiguous_media` below): the index is keyed on bare member paths with
+    # no archive dimension, and the ingest layer's owner map is
+    # last-writer-wins, so a duplicated sidecar path can supply another
+    # archive's bytes to a photo it was never shipped with. Partitioned out
+    # BEFORE `sidecars`/`sidecars_ci`/`by_dir` are built, so no rung --
+    # exact, case-insensitive, or truncation -- can ever match through it.
+    sidecar_counts = Counter(sidecars_seen)
+    ambiguous_sidecars = frozenset(
+        path for path, count in sidecar_counts.items() if count > 1
+    )
+    sidecars = [m for m in sidecars_seen if m not in ambiguous_sidecars]
 
     sidecar_set = frozenset(sidecars)
 
@@ -192,6 +217,13 @@ def build_index(members: Iterable[str]) -> PairingIndex:
         by_dir={k: tuple(sorted(v)) for k, v in by_dir.items()},
     )
 
+    # `_exact_match` reads only `partial.sidecars`/`sidecars_ci`, which are
+    # already built from the FILTERED list above -- an ambiguous sidecar was
+    # never added to either, so it cannot be matched here and cannot appear
+    # in `claimed`. That is deliberate: `claimed` exists solely to stop
+    # truncation recovery (rung 6) from stealing a sidecar some exact rung
+    # already used, and a sidecar that can never be returned by `sidecar_for`
+    # in the first place has nothing to protect.
     claimed = {
         match
         for media_path in media
@@ -214,6 +246,7 @@ def build_index(members: Iterable[str]) -> PairingIndex:
         else:
             seen.add(m)
     partial.ambiguous_media = frozenset(ambiguous)
+    partial.ambiguous_sidecars = ambiguous_sidecars
 
     return partial
 

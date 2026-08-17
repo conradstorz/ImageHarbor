@@ -398,6 +398,43 @@ def test_two_different_archives_sharing_a_member_path_still_declines_pairing(
     assert len(list((dest / "Undated").glob("*.jpg"))) == 2
 
 
+def test_a_sidecar_shared_by_two_archives_does_not_misdate_a_photo(
+    dirs, catalog: Catalog
+) -> None:
+    """The sidecar-side twin of the two tests above.
+
+    Archive A holds a photo and its correct 2015 sidecar. Archive B is a
+    different export that happens to carry only a sidecar at the SAME member
+    path, dated 2019. The photo exists only in archive A. `self.owner` (the
+    ingest layer's member-path -> owning-archive map) is last-writer-wins, so
+    without `ambiguous_sidecars` the index would keep one sidecar entry and
+    the photo could silently be dated from archive B's 2019 metadata, which
+    does not describe it. It must instead land in Undated/ with its Google
+    metadata reported missing -- costing only the metadata, never a wrong
+    date.
+    """
+    archives, dest = dirs
+    _zip(
+        archives / "takeout-001.zip",
+        {
+            f"{D}/IMG_1234.jpg": _jpeg(60),
+            f"{D}/IMG_1234.jpg.json": _sidecar("IMG_1234.jpg", 1425905792),  # 2015-03-09
+        },
+    )
+    _zip(
+        archives / "takeout-002.zip",
+        {f"{D}/IMG_1234.jpg.json": _sidecar("IMG_1234.jpg", 1562252400)},  # 2019-07-04
+    )
+
+    stats = ingest_archives(archives, dest, catalog)
+
+    assert stats.ingested == 1
+    assert stats.missing_metadata == 1
+    assert list((dest / "2019" / "2019-07").glob("*.jpg")) == []
+    assert list((dest / "2015" / "2015-03").glob("*.jpg")) == []
+    assert len(list((dest / "Undated").glob("*.jpg"))) == 1
+
+
 # --- the late-sidecar case: the heart of the design ------------------------
 
 
