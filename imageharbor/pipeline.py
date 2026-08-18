@@ -480,14 +480,7 @@ class Pipeline:
         # catalog update already committed, so it is logged and swallowed.
         if self.write_sidecars:
             try:
-                sources = [
-                    {
-                        "path": r["source_path"],
-                        "first_seen": r["first_seen_at"],
-                        "last_seen": r["last_seen_at"],
-                    }
-                    for r in self.catalog.sources_for(sha256_b64url)
-                ]
+                sources = [_source_entry(r) for r in self.catalog.sources_for(sha256_b64url)]
                 merge_sidecar(
                     proposed,
                     {
@@ -534,14 +527,7 @@ class Pipeline:
         descriptor: "ResolvedDescriptor",
         exif_data: dict[str, Any],
     ) -> None:
-        sources = [
-            {
-                "path": row["source_path"],
-                "first_seen": row["first_seen_at"],
-                "last_seen": row["last_seen_at"],
-            }
-            for row in self.catalog.sources_for(sha256_b64url)
-        ]
+        sources = [_source_entry(row) for row in self.catalog.sources_for(sha256_b64url)]
         merge_sidecar(
             organized_path,
             {
@@ -569,6 +555,26 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _source_entry(row) -> dict[str, Any]:
+    """A sidecar `sources[]` entry from a catalog `sources` row.
+
+    `folder` is the immediate parent of the source path -- for a Takeout
+    member that is its album directory, and for an ordinary `process` run it
+    is whatever folder the owner had the photo in. Both are facts about the
+    photo's history that the date-derived tree would otherwise erase.
+    """
+    raw = row["source_path"]
+    member = raw.rsplit("!", 1)[-1]          # Takeout labels are <zip>!<member>
+    normalized = member.replace("\\", "/")
+    folder = normalized.rsplit("/", 2)[-2] if "/" in normalized else ""
+    return {
+        "path": raw,
+        "folder": folder,
+        "first_seen": row["first_seen_at"],
+        "last_seen": row["last_seen_at"],
+    }
 
 
 def _log_result(result: ProcessResult) -> None:

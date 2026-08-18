@@ -657,6 +657,24 @@ def test_source_label_is_what_gets_recorded(
     assert [r["source_path"] for r in catalog.sources_for(result.sha256_b64url)] == [label]
 
 
+def test_sidecar_records_the_source_folder(tmp_path: Path, organized_dir: Path, catalog: Catalog) -> None:
+    """The directory a photo was found in is a fact worth keeping.
+
+    It is the only surviving trace of how the owner had organized things
+    before ImageHarbor re-organized by date.
+    """
+    src = tmp_path / "src" / "Hawaii 2019"
+    src.mkdir(parents=True)
+    photo = _make_jpeg(src / "beach.jpg")
+
+    result = Pipeline(tmp_path / "src", organized_dir, catalog, write_sidecars=True).process_file(photo)
+
+    from imageharbor.sidecar import read_sidecar
+    entry = read_sidecar(result.organized_path)["sources"][0]
+    assert entry["folder"] == "Hawaii 2019"
+    assert entry["path"] == str(photo)
+
+
 def test_evidence_date_places_the_file(
     tmp_path: Path, organized_dir: Path, catalog: Catalog
 ) -> None:
