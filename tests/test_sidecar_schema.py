@@ -45,30 +45,51 @@ def test_never_loses_a_value_over_a_random_merge_sequence() -> None:
     rng = random.Random(20260818)
     doc: dict = {}
     written: set[str] = set()
+    prev_date: dict | None = None
 
     for i in range(60):
+        date_block = {
+            "value": f"20{10 + i % 15}-03-09T12:00:00",
+            "tier": rng.choice([0, 10, 20, 30, 40]),
+            "source": rng.choice(["exif_original", "external_sidecar", "filename_pattern"]),
+        }
+        # Every third iteration, re-report the previous date block verbatim --
+        # the watch-loop case that exercises the reject-append dedup path
+        # inside a longer sequence, not just in isolation.
+        if prev_date is not None and i % 3 == 0:
+            date_block = dict(prev_date)
+        prev_date = date_block
+
         update = {
-            "date": {
-                "value": f"20{10 + i % 15}-03-09T12:00:00",
-                "tier": rng.choice([0, 10, 20, 30, 40]),
-                "source": rng.choice(["exif_original", "external_sidecar", "filename_pattern"]),
-            },
+            "date": date_block,
             "descriptor": {
                 "value": rng.choice(["", "beach-trip", "emma-birthday"]),
                 "tier": rng.choice([0, 20, 30]),
                 "source": rng.choice(["none", "ai_subject", "human_filename"]),
             },
-            "sources": [{"path": f"/src/{i}.jpg", "folder": f"folder-{i % 4}",
+            # path cycles (not strictly increasing) so the same `sources`
+            # entry is re-observed later with a different `folder`, exercising
+            # the gap-fill/relocate path for a genuinely empty recorded value.
+            "sources": [{"path": f"/src/{i % 20}.jpg",
+                         "folder": rng.choice(["", f"folder-{i % 4}"]),
                          "first_seen": T0, "last_seen": T1}],
             "albums": [{"archive_id": f"A{i % 3}", "folder": f"album-{i % 3}",
-                        "title": f"Album {i % 3}"}],
-            "people": [{"name": rng.choice(["Emma", "Sam", "Judy"])}],
+                        "title": rng.choice(["", None, f"Album {i % 3}"])}],
+            "people": [{"name": rng.choice(["", "Emma", "Sam", "Judy"])}],
             "exif": {"Make": rng.choice(["Canon", "Nikon"]), f"Tag{i % 5}": i},
             "provenance": [{"kind": "takeout_media_json", "digest": f"D{i % 7}",
                             "raw": {"title": f"t{i}.jpg", "imageViews": str(i)}}],
         }
         written |= _leaves(update)
         doc = merge(doc, update, observed_at=T1)
+
+        # Mid-sequence idempotence: re-applying the same update a second time,
+        # at various points in the sequence (not just at the very end), must
+        # never change the document.
+        if i % 5 == 0:
+            before = json.dumps(doc, sort_keys=True)
+            doc = merge(doc, update, observed_at=T1)
+            assert json.dumps(doc, sort_keys=True) == before
 
     final = _leaves(doc)
     missing = written - final
@@ -149,6 +170,26 @@ def test_an_equal_tier_with_the_same_value_adds_no_history() -> None:
     assert after["date"]["history"] == []
 
 
+def test_a_repeated_losing_observation_does_not_grow_the_history() -> None:
+    """The watch-loop case: a lower-tier source re-reporting the same fact.
+
+    A filename-derived date keeps losing to EXIF on every scan. Recording the
+    rejection is correct; recording it again on every scan is unbounded growth,
+    and it looks like it works until the second run.
+    """
+    doc = merge({}, {"date": {"value": "2015-03-09", "tier": 30, "source": "exif_original"}},
+                observed_at=T0)
+    losing = {"date": {"value": "2019-07-04", "tier": 10, "source": "filename_pattern"}}
+
+    doc = merge(doc, losing, observed_at=T1)
+    after_first = json.dumps(doc, sort_keys=True)
+    for _ in range(5):
+        doc = merge(doc, losing, observed_at=T1)
+
+    assert len(doc["date"]["history"]) == 1
+    assert json.dumps(doc, sort_keys=True) == after_first
+
+
 # --- keyed lists ---------------------------------------------------------
 
 
@@ -167,6 +208,32 @@ def test_albums_key_on_archive_and_folder() -> None:
     base = merge({}, {"albums": [{"archive_id": "A1", "folder": "2015", "title": "X"}]}, observed_at=T0)
     after = merge(base, {"albums": [{"archive_id": "A2", "folder": "2015", "title": "Y"}]}, observed_at=T1)
     assert len(after["albums"]) == 2
+
+
+def test_a_recorded_empty_value_is_relocated_not_dropped() -> None:
+    """"Recorded as empty" is not the same as "never recorded".
+
+    Google ships blank album titles; treating one as absent silently discards a
+    real observation with no trace anywhere in the document.
+    """
+    base = merge({}, {"albums": [{"archive_id": "A1", "folder": "d", "title": ""}]},
+                 observed_at=T0)
+    after = merge(base, {"albums": [{"archive_id": "A1", "folder": "d", "title": "Real Title"}]},
+                  observed_at=T1)
+
+    entry = after["albums"][0]
+    assert entry["title"] == "Real Title"
+    assert any(h.get("field") == "title" and h.get("value") == "" for h in entry["history"])
+
+
+def test_last_seen_moves_without_recording_history() -> None:
+    """The one deliberate exception, pinned so it is a choice and not a leak."""
+    u1 = {"sources": [{"path": "/a.jpg", "first_seen": T0, "last_seen": T0}]}
+    u2 = {"sources": [{"path": "/a.jpg", "first_seen": T0, "last_seen": T1}]}
+    doc = merge(merge({}, u1, observed_at=T0), u2, observed_at=T1)
+    entry = doc["sources"][0]
+    assert entry["last_seen"] == T1
+    assert not any(h.get("field") == "last_seen" for h in entry.get("history", []))
 
 
 def test_provenance_keys_on_digest() -> None:
