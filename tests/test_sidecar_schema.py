@@ -278,6 +278,20 @@ def test_a_conflicting_unknown_key_keeps_the_incumbent_and_records_the_other() -
     assert any(c["key"] == "note" and c["value"] == "theirs" for c in after["conflicts"])
 
 
+def test_a_repeated_identical_conflict_does_not_grow() -> None:
+    """The unknown-key conflict recorder is dedup-guarded like every other list.
+
+    It was the last append site outside `_relocate`, and it was safe only by
+    coincidence -- `observed_at` happened to be a stripped annotation. Routing
+    it through the helper makes that safety structural instead of lucky.
+    """
+    doc = merge({}, {"note": "mine"}, observed_at=T0)
+    for _ in range(10):
+        doc = merge(doc, {"note": "theirs"}, observed_at=T1)
+    assert doc["note"] == "mine"
+    assert len(doc["conflicts"]) == 1
+
+
 # --- migration -----------------------------------------------------------
 
 

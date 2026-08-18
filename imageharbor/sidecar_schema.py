@@ -302,8 +302,7 @@ def merge(base: Any, updates: Any, *, observed_at: str) -> dict[str, Any]:
             # than dropped. No ImageHarbor pass writes unknown keys, so this
             # is reached only by a hand edit colliding with a future field.
             core = {"key": key, "value": value}
-            if not _already_recorded(conflicts, core):
-                conflicts.append({**core, "observed_at": observed_at})
+            _relocate(conflicts, core, observed_at=observed_at)
 
     if exif_history:
         out["exif_history"] = exif_history
