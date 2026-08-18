@@ -64,3 +64,49 @@ def test_no_temp_file_is_left_behind(tmp_path: Path) -> None:
     img = _img(tmp_path)
     merge_sidecar(img, {"exif": {"Make": "Canon"}})
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_sidecar_path_appends_json_rather_than_replacing_a_suffix(tmp_path: Path) -> None:
+    """A stem containing dots must not lose part of its name."""
+    img = tmp_path / "2019-07-04-v1.2_abc.jpg"
+    assert sidecar_path_for(img).name == "2019-07-04-v1.2_abc.json"
+
+
+def test_read_of_a_missing_sidecar_is_empty(tmp_path: Path) -> None:
+    assert read_sidecar(tmp_path / "nope.jpg") == {}
+
+
+def test_bytes_valued_exif_serializes_as_text_not_python_repr(tmp_path: Path) -> None:
+    """Real EXIF carries raw bytes (ExifVersion, SceneType, MakerNote).
+
+    A bare default=str would not raise, but would write Python repr syntax
+    into the file -- "b'0230'" instead of "0230" -- and a sidecar is meant to
+    be portable and human-readable.
+    """
+    img = tmp_path / "a.jpg"
+    merge_sidecar(img, {"exif": {"ExifVersion": b"0230", "MakerNote": b"\x00\xff"}})
+    raw = sidecar_path_for(img).read_text(encoding="utf-8")
+    assert "b'" not in raw
+    assert read_sidecar(img)["exif"]["ExifVersion"] == "0230"
+
+
+def test_a_scalar_replaced_by_a_dict_does_not_corrupt(tmp_path: Path) -> None:
+    """Type mismatches between runs resolve cleanly rather than raising.
+
+    A v1 sidecar can hold a bare string where v2 expects a tiered block, so
+    this is a real migration shape, not a hypothetical one.
+
+    NOTE: the bare scalar written by the first merge is silently discarded --
+    it never appears in `history` -- because `_merge_tiered` coerces a
+    non-dict `new` value to `{}` via `_as_dict` before `_core` ever sees it.
+    That is a real "never-lose" violation, not merely a shape change; see the
+    task report for detail. This test pins the current (lossy) behavior --
+    it does not raise or corrupt the document -- without endorsing it.
+    """
+    img = tmp_path / "a.jpg"
+    merge_sidecar(img, {"date": "2019-07-04"})
+    merge_sidecar(img, {"date": {"value": "2019-07-04", "tier": 40}})
+
+    block = read_sidecar(img)["date"]
+    assert block["value"] == "2019-07-04"
+    assert block["tier"] == 40
