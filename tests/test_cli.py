@@ -159,11 +159,48 @@ def test_process_sidecar_written(runner: CliRunner, tmp_path: Path) -> None:
         assert len(data["identity"]["sha256_b64url"]) == 43
 
 
-def test_process_no_sidecar_default(runner: CliRunner, tmp_path: Path) -> None:
+def test_process_writes_a_sidecar_by_default(tmp_path: Path) -> None:
+    """The flag flip, stated as behavior rather than as a default value."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "beach.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b" " * 16 + b"\xff\xd9")
+    dest = tmp_path / "organized"
+
+    result = CliRunner().invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert result.exit_code == 0, result.output
+    assert [p for p in dest.rglob("*.json")], "no sidecar written without a flag"
+
+
+def test_no_sidecar_still_suppresses(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "beach.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b" " * 16 + b"\xff\xd9")
+    dest = tmp_path / "organized"
+
+    result = CliRunner().invoke(
+        main, ["process", "--source", str(src), "--dest", str(dest), "--no-sidecar"]
+    )
+    assert result.exit_code == 0, result.output
+    assert [p for p in dest.rglob("*.json")] == []
+
+
+def test_process_no_sidecar_flag_suppresses_for_every_file(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """--no-sidecar suppresses sidecars for every organized file, not just one.
+
+    Was `test_process_no_sidecar_default`, which asserted the OLD default (no
+    flag -> no sidecar). Sidecars are now written by default (see
+    `test_process_writes_a_sidecar_by_default` above), so this test's job
+    shifted to covering the explicit opt-out across multiple files -- the
+    new default-on behavior for a single file is already covered above.
+    """
     src = _source_with_two_jpegs(tmp_path)
     dest = tmp_path / "organized"
 
-    result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    result = runner.invoke(
+        main, ["process", "--source", str(src), "--dest", str(dest), "--no-sidecar"]
+    )
     assert result.exit_code == 0, result.output
     assert not list(dest.rglob("*.json"))
 
@@ -699,6 +736,25 @@ def test_takeout_ingest(tmp_path) -> None:
     assert result.exit_code == 0, result.output
     assert "ingested 1" in result.output
     assert (dest / "2015" / "2015-03").exists()
+
+
+def test_takeout_ingest_writes_a_sidecar_by_default(tmp_path) -> None:
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    _takeout_zip(archives / "t.zip", {
+        "Takeout/A/a.jpg": b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9",
+        "Takeout/A/a.jpg.json": json.dumps(
+            {"title": "a.jpg", "photoTakenTime": {"timestampSeconds": "1425905792"}}
+        ).encode(),
+    })
+
+    result = CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
+    assert organized.with_suffix(".json").exists()
 
 
 def test_takeout_ingest_reports_missing_metadata_neutrally(tmp_path) -> None:

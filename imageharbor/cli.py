@@ -131,9 +131,9 @@ def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
 )
 @click.option(
     "--sidecar/--no-sidecar",
-    default=False,
+    default=True,
     show_default=True,
-    help="Write a JSON sidecar alongside each organized image.",
+    help="Write a JSON sidecar alongside each organized image. Use --no-sidecar to suppress.",
 )
 @click.option(
     "--dry-run",
@@ -222,9 +222,9 @@ def process(
 @click.option(
     "--sidecar/--no-sidecar",
     envvar="IMAGEHARBOR_SIDECAR",
-    default=False,
+    default=True,
     show_default=True,
-    help="Write/update a JSON sidecar alongside each organized image.",
+    help="Write/update a JSON sidecar alongside each organized image. Use --no-sidecar to suppress.",
 )
 @click.option(
     "--ai",
@@ -383,9 +383,9 @@ def enrich(
 @click.option(
     "--sidecar/--no-sidecar",
     envvar="IMAGEHARBOR_SIDECAR",
-    default=False,
+    default=True,
     show_default=True,
-    help="Write a JSON sidecar alongside each organized image.",
+    help="Write a JSON sidecar alongside each organized image. Use --no-sidecar to suppress.",
 )
 @click.option(
     "--ai",
@@ -637,9 +637,9 @@ def takeout_cmd() -> None:
 )
 @click.option(
     "--sidecar/--no-sidecar",
-    default=False,
+    default=True,
     show_default=True,
-    help="Write a JSON sidecar alongside each organized image.",
+    help="Write a JSON sidecar alongside each organized image. Use --no-sidecar to suppress.",
 )
 @click.option(
     "--include-trash",
