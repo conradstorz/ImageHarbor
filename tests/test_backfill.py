@@ -28,6 +28,21 @@ def _make_jpeg(path: Path, content: bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 16 +
     return path
 
 
+def _make_real_exif_jpeg(path: Path) -> Path:
+    """A real JPEG carrying EXIF ``DateTime`` (a genuine time-of-day, not just
+    a date) and a bytes-valued tag (``ExifVersion``) -- the exact shape that
+    hid findings 1 and 2: every other fixture in this file is an EXIF-free
+    synthetic JPEG, which sails through both bugs undetected.
+    """
+    from PIL import Image
+
+    exif = Image.Exif()
+    exif[306] = "2019:07:04 12:00:00"  # DateTime
+    exif[36864] = b"0230"  # ExifVersion, raw bytes on real cameras
+    Image.new("RGB", (4, 4), "red").save(path, "JPEG", exif=exif.tobytes())
+    return path
+
+
 @pytest.fixture()
 def source_dir(tmp_path: Path) -> Path:
     src = tmp_path / "source"
@@ -166,6 +181,26 @@ def test_backfill_dry_run_writes_nothing_but_reports_accurate_counts(
     assert not list(organized_dir.rglob("*.json")), "dry-run must write nothing"
 
 
+def test_backfill_dry_run_does_not_quarantine_a_corrupt_sidecar(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """Finding 5: `read_sidecar` quarantines (renames aside) a file it cannot
+    parse -- correct for a real write, but a `--dry-run` caller is only
+    inspecting the existing sidecar to decide what it WOULD write, and must
+    not itself mutate the filesystem as a side effect of looking."""
+    _organize_without_sidecars(source_dir, organized_dir, catalog)
+    organized = next(organized_dir.rglob("*.jpg"))
+    sidecar = sidecar_path_for(organized)
+    sidecar.write_text("{not valid json", encoding="utf-8")
+
+    stats = backfill_sidecars(organized_dir, catalog, dry_run=True)
+
+    assert stats.failed == 0
+    assert sidecar.exists(), "dry-run must not quarantine (rename aside) a corrupt sidecar"
+    assert sidecar.read_text(encoding="utf-8") == "{not valid json"
+    assert not list(organized_dir.rglob("*.corrupt-*")), "no quarantine file must be created"
+
+
 def test_backfill_dry_run_reports_unchanged_for_an_already_backfilled_row(
     source_dir: Path, organized_dir: Path, catalog: Catalog
 ) -> None:
@@ -227,6 +262,73 @@ def test_backfill_stats_dataclass_fields() -> None:
     assert stats.written == 0
     assert stats.unchanged == 0
     assert stats.failed == 0
+
+
+# ---------------------------------------------------------------------------
+# Findings 1, 2, 7: backfill over a facts-pass-written sidecar with real EXIF
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_over_a_facts_pass_written_sidecar_with_real_exif_is_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """The gap findings 1 and 2 hid in: `write_sidecars=True` (a real,
+    first-hand sidecar already exists) plus EXIF carrying a genuine
+    time-of-day and a bytes-valued tag. `backfill_sidecars` must be a
+    complete no-op here -- it must not fabricate a midnight `date.history`
+    entry (finding 1) and must not record a false EXIF self-supersession
+    (finding 2)."""
+    src = tmp_path / "source"
+    src.mkdir()
+    _make_real_exif_jpeg(src / "photo.jpg")
+    dest = tmp_path / "organized"
+
+    with Catalog(tmp_path / "c.db") as cat:
+        pipeline = Pipeline(src, dest, cat, write_sidecars=True)
+        stats = pipeline.run()
+        assert stats.errors == 0
+
+        organized = next(dest.rglob("*.jpg"))
+        sidecar = sidecar_path_for(organized)
+        before = sidecar.read_bytes()
+
+        backfill_stats = backfill_sidecars(dest, cat)
+
+        after = sidecar.read_bytes()
+        assert before == after, "backfill must be a byte-identical no-op here"
+        assert backfill_stats.unchanged == 1
+        assert backfill_stats.written == 0
+
+        doc = read_sidecar(organized)
+        assert doc["date"]["value"] == "2019-07-04T12:00:00"
+        assert doc["date"]["history"] == [], "no fabricated midnight observation"
+        assert doc.get("exif_history", []) == [], "no false EXIF self-supersession"
+
+
+def test_backfill_onto_a_no_sidecar_library_writes_date_precision_not_a_fabricated_time(
+    tmp_path: Path,
+) -> None:
+    """Finding 1(b): when backfill DOES write a date -- no first-hand sidecar
+    exists yet, the `--no-sidecar` case this verb exists for -- it must write
+    the precision the catalog actually holds (a bare `YYYY-MM-DD`), not a
+    fabricated `T00:00:00` implying a midnight capture nothing observed."""
+    src = tmp_path / "source"
+    src.mkdir()
+    _make_real_exif_jpeg(src / "photo.jpg")
+    dest = tmp_path / "organized"
+
+    with Catalog(tmp_path / "c.db") as cat:
+        pipeline = Pipeline(src, dest, cat, write_sidecars=False)
+        stats = pipeline.run()
+        assert stats.errors == 0
+        assert not list(dest.rglob("*.json"))
+
+        backfill_sidecars(dest, cat)
+
+        organized = next(dest.rglob("*.jpg"))
+        doc = read_sidecar(organized)
+        assert doc["date"]["value"] == "2019-07-04"
+        assert doc["date"]["history"] == []
 
 
 # ---------------------------------------------------------------------------

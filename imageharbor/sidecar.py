@@ -72,12 +72,15 @@ def _quarantine(path: Path, reason: str) -> None:
         logger.error("Could not quarantine %s (%s); leaving it untouched", path, exc)
 
 
-def read_sidecar(organized_path: Path) -> dict[str, Any]:
+def read_sidecar(organized_path: Path, *, quarantine: bool = True) -> dict[str, Any]:
     """Return the existing sidecar contents, or ``{}`` if absent.
 
     An unreadable sidecar is quarantined (see :func:`_quarantine`) and reported
     as empty, so the caller proceeds with a fresh document while the original
-    bytes survive on disk.
+    bytes survive on disk. Pass ``quarantine=False`` for a read that must not
+    touch the filesystem at all -- a ``--dry-run`` caller inspecting the
+    existing sidecar before deciding what it WOULD write must not itself
+    perform a write (a corrupt-file rename) as a side effect of looking.
     """
     path = sidecar_path_for(organized_path)
     if not path.exists():
@@ -85,10 +88,22 @@ def read_sidecar(organized_path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeError) as exc:
-        _quarantine(path, str(exc))
+        if quarantine:
+            _quarantine(path, str(exc))
+        else:
+            logger.warning(
+                "Unreadable sidecar %s (%s); leaving in place (quarantine disabled)",
+                path, exc,
+            )
         return {}
     if not isinstance(data, dict):
-        _quarantine(path, "top-level value is not an object")
+        if quarantine:
+            _quarantine(path, "top-level value is not an object")
+        else:
+            logger.warning(
+                "Sidecar %s is not a JSON object; leaving in place (quarantine disabled)",
+                path,
+            )
         return {}
     return data
 

@@ -46,32 +46,66 @@ class BackfillStats:
     failed: int = 0
 
 
-def _build_updates(organized_path: Path, row) -> dict:
+def _already_recorded_at_or_above(existing: dict, key: str, catalog_tier: int) -> bool:
+    """True when *existing*'s sidecar already carries *key* at >= *catalog_tier*.
+
+    A block a first-hand read (the facts pass, or a duplicate-upgrade re-merge)
+    already wrote must never be re-asserted by backfill, which only ever
+    reconstructs from the catalog's lossy columns -- see `_build_updates`.
+    """
+    block = existing.get(key)
+    if not isinstance(block, dict):
+        return False
+    return (block.get("tier") or 0) >= catalog_tier
+
+
+def _build_updates(organized_path: Path, row, existing: dict) -> dict:
     """The same update dict the facts pass builds for a fresh sidecar,
-    rebuilt here from what the catalog and the organized copy still hold."""
+    rebuilt here from what the catalog and the organized copy still hold.
+
+    *existing* is the sidecar already on disk (possibly ``{}``). A `date` or
+    `descriptor` block it already carries at >= the catalog's tier is a
+    first-hand observation backfill must not re-assert -- see the comment on
+    the `date` block below for why re-asserting the date specifically would
+    corrupt the record.
+    """
     date = date_from_row(row)
     size = organized_path.stat().st_size
     extension = organized_path.suffix.lstrip(".").lower()
     exif_data = read_exif(organized_path)
-    return {
+    updates: dict = {
         "identity": {
             "sha256_b64url": row["sha256_b64url"],
             "size": size,
             "ext": extension,
         },
         "sources": [],  # populated by the caller, which has the catalog handle
-        "date": {
-            "value": date.value.isoformat() if date.value else None,
-            "tier": date.tier,
-            "source": date.source,
-        },
-        "descriptor": {
-            "value": row["descriptor_value"] or "",
-            "tier": row["descriptor_tier"] or 0,
-            "source": row["descriptor_source"] or "none",
-        },
         "exif": exif_data,
     }
+
+    if not _already_recorded_at_or_above(existing, "date", date.tier):
+        # The catalog stores a date STRING, so `date_from_row` reconstructs
+        # midnight for the time-of-day it never held. Writing that as an
+        # observation would assert precision nothing ever measured -- the
+        # same error the date ladder refuses when it declines to read mtime
+        # -- and history is never pruned, so it would be permanent. Backfill
+        # therefore writes the date at the precision the catalog holds, and
+        # defers entirely to any block a first-hand read already wrote.
+        updates["date"] = {
+            "value": date.date_str,
+            "tier": date.tier,
+            "source": date.source,
+        }
+
+    descriptor_tier = row["descriptor_tier"] or 0
+    if not _already_recorded_at_or_above(existing, "descriptor", descriptor_tier):
+        updates["descriptor"] = {
+            "value": row["descriptor_value"] or "",
+            "tier": descriptor_tier,
+            "source": row["descriptor_source"] or "none",
+        }
+
+    return updates
 
 
 def backfill_sidecars(
@@ -132,13 +166,16 @@ def _backfill_row(
         stats.failed += 1
         return
 
-    updates = _build_updates(actual, row)
+    # `quarantine=False` in dry-run mode: a dry run inspects the existing
+    # sidecar to decide what it WOULD write, and must not itself perform a
+    # write (a corrupt-file quarantine rename) as a side effect of looking.
+    existing = read_sidecar(actual, quarantine=not dry_run)
+    updates = _build_updates(actual, row, existing)
     updates["sources"] = [
         _source_entry(r) for r in catalog.sources_for(row["sha256_b64url"])
     ]
 
     if dry_run:
-        existing = read_sidecar(actual)
         merged = merge_documents(existing, updates, observed_at="dry-run")
         if merged == existing:
             stats.unchanged += 1

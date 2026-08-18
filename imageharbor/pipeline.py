@@ -481,25 +481,39 @@ class Pipeline:
         if self.write_sidecars:
             try:
                 sources = [_source_entry(r) for r in self.catalog.sources_for(sha256_b64url)]
-                merge_sidecar(
-                    proposed,
-                    {
-                        "sources": sources,
-                        "date": {
-                            "value": best_date.value.isoformat() if best_date.value else None,
-                            "tier": best_date.tier,
-                            "source": best_date.source,
-                        },
-                        "descriptor": {
-                            "value": best_descriptor,
-                            "tier": new[1],
-                            "source": (
-                                descriptor.source if descriptor.tier > old[1]
-                                else (row["descriptor_source"] or "none")
-                            ),
-                        },
-                    },
-                )
+                sidecar_updates: dict[str, Any] = {"sources": sources}
+
+                # Only assert a `date` block when the date dimension itself
+                # improved (`date` is the FRESH resolve_date() result here).
+                # When the incumbent's date wins instead, `best_date` is
+                # `date_from_row(row)` -- a midnight reconstruction of the
+                # date STRING the catalog holds, not an observation. Writing
+                # that would both fabricate a time-of-day nothing measured
+                # (the same error `backfill.py` guards against) and, because
+                # its ISO string would not byte-match whatever precision the
+                # incumbent sidecar block already carries, risk recording a
+                # false "rejected" supersession against the incumbent's own
+                # correct value. Omitting the block leaves that already-
+                # correct entry untouched.
+                if date.tier > old[0]:
+                    sidecar_updates["date"] = {
+                        "value": best_date.value.isoformat() if best_date.value else None,
+                        "tier": best_date.tier,
+                        "source": best_date.source,
+                    }
+
+                # Same reasoning for `descriptor`: only assert it when the
+                # descriptor dimension itself improved. `is_upgrade` (checked
+                # above) guarantees at least one of these two blocks is
+                # included.
+                if descriptor.tier > old[1]:
+                    sidecar_updates["descriptor"] = {
+                        "value": best_descriptor,
+                        "tier": new[1],
+                        "source": descriptor.source,
+                    }
+
+                merge_sidecar(proposed, sidecar_updates)
             except Exception:
                 logger.warning(
                     "Failed to update sidecar after upgrading %s; file and "
