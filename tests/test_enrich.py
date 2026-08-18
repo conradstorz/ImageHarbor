@@ -142,6 +142,26 @@ def test_enrichment_adds_classification_to_the_sidecar(tmp_path):
     cat.close()
 
 
+def test_classification_records_the_model_version(tmp_path):
+    """A classification without its model version cannot be re-evaluated later.
+
+    When a better model arrives, the sidecar's classification history has to say
+    which answer came from which model, or there is no way to tell an
+    improvement from a regression.
+    """
+    from pathlib import Path
+
+    from imageharbor.sidecar import read_sidecar
+
+    cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
+    enrich_library(cat, dest, FixedClassifier(), write_sidecars=True)
+
+    new_path = cat.get_by_sha256(result.sha256_b64url)["organized_path"]
+    data = read_sidecar(Path(new_path))
+    assert data["classification"]["model_version"]
+    cat.close()
+
+
 def test_enrichment_self_heals_a_stale_catalog_path(tmp_path):
     """Simulates a crash between the rename and the catalog update."""
     import shutil
