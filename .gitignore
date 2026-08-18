@@ -38,3 +38,4 @@ catalog.db
 *.zip
 *.tgz
 .takeout-staging/
+.takeout-provenance/

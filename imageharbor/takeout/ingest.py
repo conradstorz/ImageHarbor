@@ -6,7 +6,12 @@ unit of work, commit the outcome, continue.
 
 Phase 1 surveys every archive by reading central directories only, and builds
 ONE pairing index across the whole batch. Phase 2 ingests member by member,
-committing after each, so a ``kill -9`` costs one member's work.
+committing after each, so a ``kill -9`` costs one member's work. Phase 2 is
+also where every non-media member gets preserved verbatim into the
+``provenance`` room (see ``_preserve_provenance``): phase 1 never reopens the
+zip for an archive revived by the late-sidecar reopen (below), but phase 2
+always reopens it whenever there is pending work, so that is the one place
+guaranteed to run for every archive.
 
 This pass makes no AI calls, exactly like the facts pass, so there is nothing
 for a circuit breaker to observe and it must not touch one.
@@ -16,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,9 +31,33 @@ from ..catalog import Catalog
 from ..hashing import compute_sha256_b64url_bytes
 from ..pipeline import ExternalEvidence, Pipeline
 from ..sidecar import merge_sidecar
-from . import archive, metadata, pairing
+from . import archive, metadata, pairing, provenance
 
 logger = logging.getLogger(__name__)
+
+# A per-photo Google JSON sidecar, stripped of its .json/.supplemental-
+# metadata.json suffix and any trailing "(N)" copy suffix, so a caller can
+# tell "P1010089.JPG(1).json" (a per-photo sidecar) apart from
+# "picasa_web_album_face_tags.json" (a batch-level document with no media
+# name in it at all -- must never be routed into the provenance room's
+# orphaned/ bucket, which is reserved for the former).
+_SUPPLEMENTAL_SUFFIX = ".supplemental-metadata.json"
+_COPY_SUFFIX_RE = re.compile(r"^(.*)\(\d+\)$")
+
+
+def _looks_like_media_sidecar(member_path: str) -> bool:
+    name = member_path.rpartition("/")[2]
+    lower = name.lower()
+    if lower.endswith(_SUPPLEMENTAL_SUFFIX):
+        stem = name[: -len(_SUPPLEMENTAL_SUFFIX)]
+    elif lower.endswith(".json"):
+        stem = name[: -len(".json")]
+    else:
+        return False
+    match = _COPY_SUFFIX_RE.match(stem)
+    if match:
+        stem = match.group(1)
+    return archive.classify(stem) in (archive.KIND_IMAGE, archive.KIND_VIDEO)
 
 
 def _digest_bytes(data: bytes) -> str:
@@ -162,6 +192,14 @@ class _Ingestor:
         # `_index_albums`) rather than re-reading an Albums.json per photo.
         self._album_titles: dict[tuple[str, str], metadata.AlbumMetadata] = {}
         self._album_indexed: set[str] = set()
+        # Every sidecar path that IS some media member's paired sidecar,
+        # across the WHOLE batch (every archive/part, not just one). Built
+        # once in `_survey`, after `pairing_index` covers every member --
+        # only then can "no media member anywhere in the batch claims this
+        # JSON" be told apart from "its media sibling just hasn't been
+        # surveyed yet". Consulted by `_preserve_provenance` to route an
+        # unclaimed per-photo JSON into the provenance room's `orphaned/`.
+        self._claimed_sidecars: frozenset[str] = frozenset()
         self.pipeline = Pipeline(
             source_dir=self.staging_dir,
             organized_dir=organized_dir,
@@ -284,6 +322,27 @@ class _Ingestor:
         # routinely land in different parts; a per-archive index would silently
         # lose metadata at every part boundary.
         self.pairing_index = pairing.build_index(all_members)
+
+        # Every sidecar path claimed by some media member, across the whole
+        # batch. `pairing.sidecar_for` already returns None for a path that
+        # is itself sidecar-shaped, so this can run over every member path
+        # unfiltered -- no need to separate media from sidecars here. A
+        # failure for one member's path must not cost every OTHER member its
+        # orphan/claimed determination, so each call is isolated -- mirrors
+        # every other per-member try/except in this module.
+        claimed: set[str] = set()
+        for member_path in all_members:
+            try:
+                sidecar = pairing.sidecar_for(member_path, self.pairing_index)
+            except Exception as exc:
+                logger.warning(
+                    "sidecar_for failed for %s during provenance indexing: %s",
+                    member_path, exc, exc_info=True,
+                )
+                continue
+            if sidecar is not None:
+                claimed.add(sidecar)
+        self._claimed_sidecars = frozenset(claimed)
 
         # SECOND PASS -- the late-sidecar case, and the reason the survey has
         # two passes at all.
@@ -424,6 +483,44 @@ class _Ingestor:
                 )
                 continue
             self._album_titles[(identity.archive_id, folder)] = metadata.parse_album_metadata(raw)
+
+    def _preserve_provenance(self, identity: archive.ArchiveIdentity, zf: zipfile.ZipFile) -> None:
+        """Preserve this archive's non-media members. Never fails the archive.
+
+        Reads the FULL member list back from the catalog (`_index_albums`'s
+        own pattern, called just above this in `_ingest_archive`) rather than
+        carrying the survey-time list forward: `_ingest_archive` is the one
+        place guaranteed to reopen the zip for every archive with outstanding
+        work -- including one revived by the late-sidecar reopen in
+        `_survey`'s second pass -- whereas `_survey` itself does not reopen a
+        zip for that case (it works from catalog rows only, see the comment
+        there). `provenance.preserve` is itself idempotent (manifest digests),
+        so calling this once per `_ingest_archive` invocation for an archive
+        -- rather than exactly once ever -- costs a re-read of small metadata
+        files, never a duplicate write.
+        """
+        try:
+            rows = self.catalog.takeout_members_all(identity.archive_id)
+            members = [
+                archive.MemberInfo(
+                    path=row["member_path"], size=row["size"],
+                    crc32=row["crc32"], kind=row["kind"],
+                )
+                for row in rows
+            ]
+            orphaned = {
+                member.path
+                for member in members
+                if member.kind == archive.KIND_METADATA
+                and _looks_like_media_sidecar(member.path)
+                and member.path not in self._claimed_sidecars
+            }
+            provenance.preserve(self.organized_dir, identity, zf, members, orphaned=orphaned)
+        except Exception:
+            logger.warning(
+                "Failed to preserve provenance for %s; ingest continues",
+                identity.path.name, exc_info=True,
+            )
 
     def _label(self, archive_path: Path, member_path: str) -> str:
         return f"{archive_path}!{member_path}"
@@ -656,6 +753,7 @@ class _Ingestor:
         try:
             with zipfile.ZipFile(identity.path, "r") as zf:
                 self._index_albums(identity, zf)
+                self._preserve_provenance(identity, zf)
                 for row in images:
                     self._ingest_image(zf, identity, row)
         except (zipfile.BadZipFile, OSError) as exc:
