@@ -357,8 +357,10 @@ Module responsibilities:
   `merge(base, updates, *, observed_at)` is total (never raises) and returns a
   document containing every value present in either argument — a superseded
   tiered/versioned block value is relocated into that block's `history[]`
-  rather than overwritten, a changed flat-map (`identity`/`exif`) key moves its
-  old value to `exif_history[]`, and a keyed list (`sources`, `albums`,
+  rather than overwritten, a changed flat-map key moves its old value to its
+  own history list (`exif` → `exif_history[]`, `identity` →
+  `identity_history[]` — table-driven via `FLAT_MAP_HISTORY_KEYS`, not
+  special-cased per key), and a keyed list (`sources`, `albums`,
   `people`, `provenance`) only ever gains entries, keyed on `path` /
   `(archive_id, folder)` / `name` / `digest` respectively. **The idempotence
   property that makes the never-lose rule usable rather than a slow leak:**
@@ -392,6 +394,24 @@ Module responsibilities:
   facts pass merges `identity`/`sources`/`date`/`descriptor`/`exif`; the
   enrichment pass later merges `classification`. There is no standalone
   `write_sidecar` — `merge_sidecar` is the only entry point.
+- **`backfill.py`** — `backfill_sidecars(organized_dir, catalog, *, dry_run=False)`
+  rebuilds/merges a sidecar for every cataloged photo from what the catalog and
+  the organized copy's own EXIF still hold, for a library organized before
+  sidecars were the default. What it can write is bounded by what the catalog
+  holds: Google Takeout `provenance[]` is not recoverable this way (only
+  re-ingesting the archives restores it). Before building its update dict it
+  reads the file's *existing* sidecar and omits the `date`/`descriptor` block
+  entirely when that block is already recorded at a tier >= the catalog's —
+  a first-hand observation a real pass already wrote must never be
+  re-asserted from the catalog's lossier columns. When it does write a date,
+  it writes `date.date_str` (the bare `YYYY-MM-DD` the catalog actually
+  holds), never a fabricated `T00:00:00` — the catalog stores a date
+  *string*, so reconstructing a `datetime` from it invents a time-of-day
+  nothing ever measured, and because sidecar history is never pruned, that
+  fabrication would be permanent. `dry_run=True` performs no filesystem
+  writes at all, including no quarantine of an unparseable existing sidecar —
+  it passes `quarantine=False` to `sidecar.read_sidecar` for exactly that
+  reason.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
   `catalog list/get`, `takeout ingest/status`, `sidecar backfill`).
 
@@ -457,7 +477,14 @@ Module responsibilities:
   omission there means the entry can never match itself on a later merge, and
   the history list grows without bound on every run. This shipped once as a
   Critical bug and is why the registry comment on `_ANNOTATION_FIELDS` is as
-  blunt as it is.
+  blunt as it is. One unbounded-growth path remains and is accepted, not a
+  bug: `classification` is a `VERSIONED_BLOCKS` entry (no tier gate), so
+  looping `enrich --reclassify` against a nondeterministic AI backend — one
+  that answers a different caption/subject for the same image on every call
+  — records a new `classification` history entry per distinct answer,
+  forever. It is user-driven (an operator has to choose to loop
+  `--reclassify`) and not exposed on `watch`, which never passes
+  `--reclassify`.
 - **Takeout pairing never guesses, and Takeout archives are never written to.**
   If no pairing rung yields exactly one sidecar match, `pairing.sidecar_for`
   returns `None` and the member is ingested from EXIF and its filename alone —
