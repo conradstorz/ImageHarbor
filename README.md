@@ -5,7 +5,10 @@ ImageHarbor: Classify. Verify. Preserve.
 ImageHarbor is a deterministic, resumable CLI that organizes a photo library. It
 reads from a read-only source, never modifies originals, content-addresses every
 file by SHA-256, copies it into an organized tree, verifies the copy, and records
-everything in a SQLite catalog with an optional JSON sidecar per image.
+everything in a SQLite catalog with a JSON sidecar per image. A sidecar is
+written by default (`--no-sidecar` opts out) and is append-only — it accumulates
+everything ever learned about a photo, from any source, and never loses a
+previously recorded value.
 
 ## Two passes
 
@@ -59,6 +62,7 @@ image's JSON sidecar, not in the path or filename.
 | `imageharbor takeout status --catalog DEST/catalog.db` | Report Takeout ingestion progress. |
 | `imageharbor watch --source SRC --dest DEST` | Continuously run both passes on an interval. |
 | `imageharbor verify DEST` | Re-verify every organized file's digest against its filename. |
+| `imageharbor sidecar backfill --dest DEST` | Rebuild/merge sidecars for a library organized before sidecars were the default. Cannot recover Google Takeout metadata for already-organized files — that requires re-ingesting the original archives. |
 
 Run `imageharbor --help` (or `<command> --help`) for the full flag list.
 

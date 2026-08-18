@@ -49,11 +49,15 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 | Build the Docker image | `docker build -t imageharbor:latest .` |
 | Run the watcher (compose) | `docker compose up -d` (see `docs/deploy-docker.md`) |
 | Query the catalog | `uv run imageharbor catalog list --catalog DEST/catalog.db` |
+| Rebuild sidecars from the catalog (cannot recover Google Takeout metadata — see `sidecar backfill` below) | `uv run imageharbor sidecar backfill --dest DEST` |
 
 `process` takes no `--ai`/`--ai-*`/`--breaker-*`/`--poison-*` flags and makes no
 network call — those flags live on `enrich` (and on `watch`, which drives both
 passes). There is no linter/formatter configured. `pyproject.toml` is the single
 source of truth for deps, extras, pytest config, and the `imageharbor` entry point.
+`--sidecar/--no-sidecar` defaults to **on** (`default=True`) on `process`,
+`enrich`, `watch`, and `takeout ingest` — `--no-sidecar` is the opt-out, not the
+default; nothing else needs to be remembered.
 
 ## Architecture
 
@@ -119,17 +123,42 @@ Module responsibilities:
   (an image/video with no `sidecar_path` on record), returning that member to
   `pending` so it re-ingests as a duplicate through
   `_maybe_upgrade_from_duplicate` and upgrades in place, handling the
-  photos-first-then-sidecars-later ordering with no new placement code. Four
+  photos-first-then-sidecars-later ordering with no new placement code. Five
   modules: `metadata.py` (pure Google-JSON parser, never raises), `pairing.py`
   (pure media→sidecar matcher that returns `None` rather than guess),
   `archive.py` (identity, enumeration, classification, extraction), `ingest.py`
-  (the only module with side effects). Archives are opened `'r'` only and are
-  never modified. Makes **no AI calls**, so — exactly like the facts pass — it
-  never consults or feeds the circuit breaker. Videos are enumerated and
-  recorded as `deferred` with their capture date but no bytes are copied; video
-  ingestion is a deliberate later project. The global (not per-archive) pairing
-  index is load-bearing: Google's multi-part zips split by size across the file
-  list, so a photo and its `.json` routinely land in different parts.
+  (orchestration — the primary module with side effects), and `provenance.py`
+  (preserves non-media members verbatim, below). Archives are opened `'r'` only
+  and are never modified. Makes **no AI calls**, so — exactly like the facts
+  pass — it never consults or feeds the circuit breaker. Videos are enumerated
+  and recorded as `deferred` with their capture date but no bytes are copied;
+  video ingestion is a deliberate later project. The global (not per-archive)
+  pairing index is load-bearing: Google's multi-part zips split by size across
+  the file list, so a photo and its `.json` routinely land in different parts.
+  `ingest.py`'s `_index_albums` (reads `Albums.json` into an
+  `(archive_id, folder) -> AlbumMetadata` map, activating
+  `metadata.parse_album_metadata`) and `_preserve_provenance` (calls
+  `provenance.preserve`) both run from **`_ingest_archive`, not `_survey`** —
+  `_survey` never reopens a `complete` archive's zip except for the narrow
+  late-sidecar-discovery case described above, and orphan detection needs the
+  whole-batch pairing index, which isn't finished building until `_survey`
+  returns; `_ingest_archive` is the point where a zip handle for that specific
+  archive is already open for the work it's about to do anyway.
+- **`takeout/provenance.py`** — preserves every archive member that is **not**
+  an image or video, verbatim, under
+  `<organized_dir>/.takeout-provenance/<archive_id>/` (keyed by the SHA-256 of
+  the zip's own bytes, so a renamed/moved archive resolves to the same room).
+  The rule is deliberately **uncurated: preserve everything that is not
+  media** — deciding which unknown file is "worth" keeping is precisely where
+  "never lose" degrades into "lose the thing nobody thought about", so
+  `archive_browser.html` (Google's offline viewer, ~169 KB per archive) is kept
+  for the same reason the Picasa face-tags file is. `manifest.json` records a
+  digest per preserved document; a member whose digest already matches what's
+  on record is skipped, which is what makes re-preserving the same archive a
+  no-op. `preserve()` takes an `orphaned` set of member paths — media-JSON
+  sidecars with no media member anywhere in the batch — computed by the caller
+  from the whole-batch pairing index, and files those under `orphaned/`
+  instead of their normal member path.
 - **`tiers.py`** — pure, I/O-free module defining the two independent quality
   ladders (`DATE_*`, `DESC_*`) and the single predicate `is_upgrade(old, new)` that
   governs every rename in the system: a proposed `(date_tier, descriptor_tier)`
@@ -321,17 +350,50 @@ Module responsibilities:
   video bytes are ever copied by any current code path.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
   rather than raising on any failure.
-- **`sidecar.py`** — optional, per-image `.json` metadata file (via `--sidecar`),
-  now **cumulative** rather than write-once: `merge_sidecar(organized_path,
-  updates)` reads the existing sidecar (if any), deep-merges nested dicts key by
-  key (`_deep_merge` — lists and scalars replace wholesale, so a caller that owns
-  a list, e.g. `sources`/`history`, must pass the complete value), and writes back
-  atomically (temp file + `os.replace`). Unknown keys — including hand edits — are
-  preserved across runs. The facts pass merges `identity`/`sources`/`date`/
-  `descriptor`/`exif`; the enrichment pass later merges `classification`. There is
-  no standalone `write_sidecar` anymore — `merge_sidecar` is the only entry point.
+- **`sidecar_schema.py`** — the sidecar merge policy, pure and I/O-free (no
+  filesystem, no import from the rest of the package — the same split that made
+  `takeout/metadata.py` and `takeout/pairing.py` exhaustively testable). One
+  rule governs it: **a sidecar may gain information and may never lose any.**
+  `merge(base, updates, *, observed_at)` is total (never raises) and returns a
+  document containing every value present in either argument — a superseded
+  tiered/versioned block value is relocated into that block's `history[]`
+  rather than overwritten, a changed flat-map (`identity`/`exif`) key moves its
+  old value to `exif_history[]`, and a keyed list (`sources`, `albums`,
+  `people`, `provenance`) only ever gains entries, keyed on `path` /
+  `(archive_id, folder)` / `name` / `digest` respectively. **The idempotence
+  property that makes the never-lose rule usable rather than a slow leak:**
+  every history append dedupes on the *value* (`_core()`, which strips
+  annotation fields), never on a timestamp — a timestamp inside the dedup key
+  would make every history list grow on every re-run, forever. `merge(merge(B,
+  U), U)` is required to be byte-identical to `merge(B, U)`; see
+  `tests/test_sidecar_schema.py::test_never_loses_a_value_over_a_random_merge_sequence`
+  for the property test this exists to satisfy. `_ANNOTATION_FIELDS`
+  (`observed_at`, `superseded_at`, `first_seen`, `last_seen`, `rejected`,
+  `history`) is the registry that makes dedup possible: **any new annotation
+  key added to a history entry must be added here**, or that entry can never
+  match itself on a later merge and the list grows unboundedly. This is not a
+  hypothetical failure mode — a `rejected` flag left out of this set once
+  shipped as a Critical bug that grew a history entry per `watch` cycle,
+  forever. `migrate()` upgrades a v1 sidecar to v2 (the old `takeout` block
+  becomes a `provenance[]` entry of `kind:
+  "imageharbor_v1_takeout_block"`), itself losslessly and idempotently.
+- **`sidecar.py`** — optional, per-image `.json` metadata file (on by default —
+  see `--sidecar/--no-sidecar` below). Policy lives entirely in
+  `sidecar_schema.py`; this module owns only I/O: `read_sidecar` (returns `{}`
+  if absent), `merge_sidecar(organized_path, updates)` (reads the existing
+  sidecar, calls `sidecar_schema.merge`, writes back atomically via a temp file
+  + `os.replace`), and quarantining a sidecar it cannot parse. **A corrupt
+  sidecar is renamed aside (`<name>.json.corrupt-<timestamp>`) rather than
+  treated as empty** — the previous behavior returned `{}` for an unreadable
+  file, which meant the next merge silently overwrote bytes nobody had actually
+  read, exactly the data loss the never-lose rule exists to prevent; quarantine
+  preserves the original bytes and lets a fresh sidecar be built beside them.
+  Unknown keys — including hand edits — are preserved across every merge. The
+  facts pass merges `identity`/`sources`/`date`/`descriptor`/`exif`; the
+  enrichment pass later merges `classification`. There is no standalone
+  `write_sidecar` — `merge_sidecar` is the only entry point.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
-  `catalog list/get`, `takeout ingest/status`).
+  `catalog list/get`, `takeout ingest/status`, `sidecar backfill`).
 
 ## Critical invariants — do not break these
 
@@ -382,6 +444,20 @@ Module responsibilities:
   never reads `stat().st_mtime`: mtime records when a file was copied, not when a
   photo was taken, and asserting a date we can't support is exactly the quiet
   corruption the project's SHA-256 discipline exists to prevent.
+- **A sidecar may gain information; it may never lose any.** Every merge into a
+  sidecar goes through `sidecar_schema.merge`, which is total (never raises)
+  and relocates a superseded value into a `history[]` list rather than
+  overwriting it — never drop a value on the floor to keep a sidecar smaller.
+  This is only usable because history dedupes on the *value* with annotation
+  fields stripped (`_core()`/`_ANNOTATION_FIELDS`), not on `observed_at` or any
+  other timestamp: a repeated `process`/`enrich`/`watch`/`takeout ingest` run
+  must leave every sidecar byte-identical
+  (`merge(merge(B, U), U) == merge(B, U)`). Do not add a new annotation key to a
+  history entry without adding it to `sidecar_schema._ANNOTATION_FIELDS` — an
+  omission there means the entry can never match itself on a later merge, and
+  the history list grows without bound on every run. This shipped once as a
+  Critical bug and is why the registry comment on `_ANNOTATION_FIELDS` is as
+  blunt as it is.
 - **Takeout pairing never guesses, and Takeout archives are never written to.**
   If no pairing rung yields exactly one sidecar match, `pairing.sidecar_for`
   returns `None` and the member is ingested from EXIF and its filename alone —

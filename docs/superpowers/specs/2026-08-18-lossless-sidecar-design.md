@@ -1,9 +1,55 @@
 # Lossless sidecars — design
 
 **Date:** 2026-08-18
-**Status:** approved, not yet implemented
+**Status:** implemented and verified against the calibrating archive
 **Extends:** [`2026-08-11-facts-first-pipeline-design.md`](2026-08-11-facts-first-pipeline-design.md),
 [`2026-08-12-google-takeout-ingestion-design.md`](2026-08-12-google-takeout-ingestion-design.md)
+
+## Implementation notes and departures
+
+Delivered across `sidecar_schema.py` (new), the `sidecar.py` rewrite,
+`takeout/provenance.py` (new), `sidecar backfill`, and default-on `--sidecar`.
+605 tests pass; see `.superpowers/sdd/task-9-report.md` for the real-archive
+verification run. Four deliberate departures from this document, each checked
+against the code rather than assumed:
+
+1. **`is_noop()` was sketched in the "Architecture" section's function table
+   and deliberately not built.** `sidecar_schema.py` exports only `merge` and
+   `migrate`. Callers that need to know whether a merge changed anything
+   (`backfill.py`'s `written`/`unchanged` counters, the verification below)
+   compare the merged document's bytes against the base's, which is simpler
+   than a second function that would have to reimplement the same judgment
+   `merge` already makes, and is trivially truthful — there is no way for a
+   byte comparison to disagree with what was actually written.
+2. **Task 4 (`enrich.py` records `model_version`) turned out to be already
+   implemented before this project started.** `enrich.py` has written
+   `content.model_version` into the classification block since commit
+   `d14f06b`, predating this spec; the "Changes to existing modules" table
+   above already says as much (`enrich.py` | **no change needed**), and this
+   note just confirms nothing regressed it.
+3. **The album-title index and the provenance-room `preserve()` call live in
+   `_ingest_archive`, not `_survey`.** The "Capture" table above lists
+   `Albums.json` and "Archive-level documents" as inputs without saying which
+   phase reads them; in the code, `ingest.py`'s `_index_albums` and
+   `_preserve_provenance` both run from `_ingest_archive`. Two reasons:
+   `_survey` never reopens a zip for an archive it has already marked
+   `complete`, except for the narrow late-sidecar-discovery case described
+   under `takeout/`'s module bullet in `CLAUDE.md` — reopening further just to
+   preserve provenance or index albums would add a second, redundant
+   reopen path for no benefit, since `_ingest_archive` already opens that
+   archive's zip handle for the extraction work it's about to do anyway.
+   Second, orphan detection needs the whole-batch pairing index, which is not
+   finished building until `_survey` returns across every archive in the
+   batch — so orphan status for `preserve()`'s `orphaned=` argument literally
+   cannot be known any earlier than `_ingest_archive`.
+4. **The "Ground truth" section originally claimed 8 orphaned sidecars in the
+   calibrating archive; the real, implementation-verified count is 0.** That
+   figure was an artifact of a check that compared a sidecar's name minus
+   `.json` against the raw member list instead of applying `pairing.py`'s
+   `(N)`-displacement rung, which pairs `P1010089.JPG(1).json` with the member
+   that is actually present, `P1010089(1).JPG`. This was already corrected
+   in the "Ground truth" section below (commit `b67d8b0`); this note just
+   confirms it reads correctly and matches the real ingest.
 
 ## Goal
 
