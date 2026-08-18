@@ -36,6 +36,21 @@ def _leaves(doc, out=None):
 # --- the guarantee -------------------------------------------------------
 
 
+def _maybe_malform(rng: random.Random, value):
+    """Occasionally swap a well-shaped update value for a bare scalar.
+
+    All three Criticals found in this module were the same shape of bug: a
+    value arriving where the code expected a dict (a tiered/versioned block)
+    or a list (a keyed list), taking a code path the generator never
+    produced. Mixing that shape into the random sequence -- a v1 sidecar
+    scalar where v2 expects a block, a hand edit doing the same -- is the
+    cheapest way to stop it recurring.
+    """
+    if rng.random() < 0.15:
+        return f"malformed-{rng.randint(0, 999)}"
+    return value
+
+
 def test_never_loses_a_value_over_a_random_merge_sequence() -> None:
     """The formal statement of the contract, over generated sequences.
 
@@ -61,21 +76,25 @@ def test_never_loses_a_value_over_a_random_merge_sequence() -> None:
         prev_date = date_block
 
         update = {
-            "date": date_block,
-            "descriptor": {
+            "date": _maybe_malform(rng, date_block),
+            "descriptor": _maybe_malform(rng, {
                 "value": rng.choice(["", "beach-trip", "emma-birthday"]),
                 "tier": rng.choice([0, 20, 30]),
                 "source": rng.choice(["none", "ai_subject", "human_filename"]),
-            },
+            }),
+            "classification": _maybe_malform(rng, {
+                "primary_subject": rng.choice(["beach", "dog", "sunset"]),
+                "model_version": f"v{i % 3}",
+            }),
             # path cycles (not strictly increasing) so the same `sources`
             # entry is re-observed later with a different `folder`, exercising
             # the gap-fill/relocate path for a genuinely empty recorded value.
-            "sources": [{"path": f"/src/{i % 20}.jpg",
+            "sources": _maybe_malform(rng, [{"path": f"/src/{i % 20}.jpg",
                          "folder": rng.choice(["", f"folder-{i % 4}"]),
-                         "first_seen": T0, "last_seen": T1}],
+                         "first_seen": T0, "last_seen": T1}]),
             "albums": [{"archive_id": f"A{i % 3}", "folder": f"album-{i % 3}",
                         "title": rng.choice(["", None, f"Album {i % 3}"])}],
-            "people": [{"name": rng.choice(["", "Emma", "Sam", "Judy"])}],
+            "people": _maybe_malform(rng, [{"name": rng.choice(["", "Emma", "Sam", "Judy"])}]),
             "exif": {"Make": rng.choice(["Canon", "Nikon"]), f"Tag{i % 5}": i},
             "provenance": [{"kind": "takeout_media_json", "digest": f"D{i % 7}",
                             "raw": {"title": f"t{i}.jpg", "imageViews": str(i)}}],
@@ -150,6 +169,38 @@ def test_a_higher_tier_wins_and_demotes_the_incumbent() -> None:
     assert after["date"]["value"] == "2015-03-09"
     assert after["date"]["tier"] == 30
     assert any(h["value"] == "2019-07-04" for h in after["date"]["history"])
+
+
+def test_a_bare_scalar_in_a_tiered_block_is_not_discarded() -> None:
+    """A v1 sidecar can hold a scalar where v2 expects a block.
+
+    Coercing it to {} loses it on the FIRST write, before any supersession
+    logic runs -- the value never reaches the code that would have relocated it.
+    """
+    doc = merge({}, {"date": "2019-07-04"}, observed_at=T0)
+    assert doc["date"]["value"] == "2019-07-04"
+    assert doc["date"]["tier"] == 0
+
+    later = merge(doc, {"date": {"value": "2015-03-09", "tier": 40, "source": "exif_original"}},
+                  observed_at=T1)
+    assert later["date"]["value"] == "2015-03-09"
+    assert any(h.get("value") == "2019-07-04" for h in later["date"]["history"])
+
+
+def test_a_bare_scalar_descriptor_is_not_discarded() -> None:
+    doc = merge({}, {"descriptor": "beach-trip"}, observed_at=T0)
+    assert doc["descriptor"]["value"] == "beach-trip"
+
+
+def test_no_empty_history_entries_are_recorded() -> None:
+    """An entry with no value is noise, not provenance."""
+    doc = merge({}, {"date": {}}, observed_at=T0)
+    doc = merge(doc, {"date": {"value": "2015-03-09", "tier": 40}}, observed_at=T1)
+    assert all(
+        {k: v for k, v in h.items()
+         if k not in {"observed_at", "superseded_at", "first_seen", "last_seen", "rejected", "history"}}
+        for h in doc["date"]["history"]
+    ), doc["date"]["history"]
 
 
 def test_a_lower_tier_loses_but_is_still_recorded() -> None:

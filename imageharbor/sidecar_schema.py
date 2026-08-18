@@ -72,17 +72,52 @@ def _relocate(history: list, core: dict, **annotations: Any) -> None:
     and the list grows on every merge. That is not hypothetical: a `rejected`
     flag outside the stripped set is exactly how this module once grew a
     history entry per `watch` cycle, forever.
+
+    An empty *core* (e.g. a demoted block that had no `value`/`tier`/`source`
+    left after stripping annotations) is skipped outright -- relocating it
+    would record an entry with nothing in it but annotations, which is noise,
+    not provenance.
     """
+    if not core:
+        return
     if not _already_recorded(history, core):
         history.append({**core, **annotations})
 
 
-def _as_list(value: Any) -> list:
-    return value if isinstance(value, list) else []
+def _coerce_block(value: Any) -> dict[str, Any]:
+    """Normalize a block-shaped field, preserving a bare value rather than dropping it.
+
+    A v1 sidecar can hold a bare scalar where v2 expects a tiered block, and a
+    hand edit can put anything anywhere. Coercing a non-dict to `{}` -- which is
+    what a naive `isinstance` guard does -- silently discards it, and this
+    module's whole contract is that nothing is silently discarded. Tier 0 is
+    the honest reading: a value with no recorded provenance, which any real
+    observation outranks.
+    """
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    return {"value": value, "tier": 0, "source": "unstructured"}
 
 
-def _as_dict(value: Any) -> dict:
-    return value if isinstance(value, dict) else {}
+def _coerce_records(value: Any) -> list[dict]:
+    """Normalize a list-of-records field, preserving a bare value or a bare
+    entry rather than dropping it.
+
+    Coercing any non-list to `[]` discards it outright, and a non-dict entry
+    inside an otherwise-real list was once `continue`d past -- both are the
+    same shape of loss `_coerce_block` fixes for tiered/versioned blocks,
+    just one level down: a value with no home in the expected shape is still
+    a value, not nothing. `None` is the one exception -- it means "field
+    absent," the normal case for every list field on a fresh document, and
+    must stay `[]` rather than becoming a stray `{"value": None}` entry on
+    every single merge.
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    return [item if isinstance(item, dict) else {"value": item} for item in items]
 
 
 def _merge_tiered(base: Any, new: Any, observed_at: str) -> dict[str, Any]:
@@ -92,12 +127,12 @@ def _merge_tiered(base: Any, new: Any, observed_at: str) -> dict[str, Any]:
     even though it did not win, and discarding it would break the rule for the
     sake of a smaller file.
     """
-    new = _as_dict(new)
-    base = _as_dict(base)
+    new = _coerce_block(new)
+    base = _coerce_block(base)
     if not base:
         return {**_core(new), "observed_at": observed_at, "history": []}
 
-    history = [h for h in _as_list(base.get("history")) if isinstance(h, dict)]
+    history = _coerce_records(base.get("history"))
     old_core, new_core = _core(base), _core(new)
 
     if old_core == new_core:
@@ -116,10 +151,10 @@ def _merge_tiered(base: Any, new: Any, observed_at: str) -> dict[str, Any]:
 
 def _merge_versioned(base: Any, new: Any, observed_at: str) -> dict[str, Any]:
     """No tiers; any change records the previous block."""
-    new, base = _as_dict(new), _as_dict(base)
+    new, base = _coerce_block(new), _coerce_block(base)
     if not base:
         return {**_core(new), "observed_at": observed_at, "history": []}
-    history = [h for h in _as_list(base.get("history")) if isinstance(h, dict)]
+    history = _coerce_records(base.get("history"))
     old_core, new_core = _core(base), _core(new)
     if old_core == new_core:
         return base
@@ -158,16 +193,14 @@ def _merge_keyed_list(base: Any, new: Any, keys: tuple[str, ...], observed_at: s
       "never recorded", so only a field's outright *absence* from the
       current entry counts as a gap to fill silently.
     """
-    out = [dict(e) for e in _as_list(base) if isinstance(e, dict)]
+    out = [dict(e) for e in _coerce_records(base)]
     index = {tuple(e.get(k) for k in keys): i for i, e in enumerate(out)}
 
-    for entry in _as_list(new):
-        if not isinstance(entry, dict):
-            continue
+    for entry in _coerce_records(new):
         identity = tuple(entry.get(k) for k in keys)
         if identity in index:
             current = out[index[identity]]
-            history = [h for h in _as_list(current.get("history")) if isinstance(h, dict)]
+            history = _coerce_records(current.get("history"))
             for field, value in entry.items():
                 if field == "history":
                     continue
@@ -205,8 +238,27 @@ def _merge_keyed_list(base: Any, new: Any, keys: tuple[str, ...], observed_at: s
 
 
 def _merge_flat_map(base: Any, new: Any, history: list, observed_at: str) -> dict:
-    out = dict(_as_dict(base))
-    for key, value in _as_dict(new).items():
+    """Merge *new* into *base* key by key.
+
+    Both arguments are expected to be dicts (key -> scalar). A non-dict
+    *base* or *new* -- a v1 sidecar with a malformed block, a hand edit --
+    would silently vanish under a naive `isinstance` coercion to `{}`;
+    instead it is relocated into *history* as a bare-value entry, the same
+    "value with no home in the expected shape is still a value" treatment
+    `_coerce_records` gives a stray list entry.
+    """
+    if not isinstance(base, dict):
+        if base is not None:
+            _relocate(history, {"value": base}, superseded_at=observed_at)
+        base = {}
+    out = dict(base)
+
+    if not isinstance(new, dict):
+        if new is not None:
+            _relocate(history, {"value": new}, observed_at=observed_at, rejected=True)
+        new = {}
+
+    for key, value in new.items():
         if key not in out:
             out[key] = value
         elif out[key] != value:
@@ -222,7 +274,18 @@ def migrate(doc: Any) -> dict[str, Any]:
     plainly that it is a reconstruction: the original Google document was not
     retained by v1, so this is the best record that exists for such a file.
     """
-    doc = dict(_as_dict(doc))
+    if isinstance(doc, dict):
+        doc = dict(doc)
+    elif doc is None:
+        doc = {}
+    else:
+        # A whole document that isn't dict-shaped at all -- a hand edit that
+        # replaced the file with a bare value, or a caller error. Coercing
+        # it to {} would drop it outright; instead it is kept as an
+        # unstructured document, the same tier-0/bare-value treatment the
+        # rest of this module gives a value that arrives in an unexpected
+        # shape.
+        doc = {"unstructured_document": doc}
     if doc.get("schema_version") == SCHEMA_VERSION:
         return doc
 
@@ -241,7 +304,7 @@ def migrate(doc: Any) -> dict[str, Any]:
 
     legacy = doc.pop("takeout", None)
     if isinstance(legacy, dict):
-        provenance = [p for p in _as_list(doc.get("provenance")) if isinstance(p, dict)]
+        provenance = _coerce_records(doc.get("provenance"))
         digest = f"v1:{legacy.get('archive_id', '')}:{legacy.get('member', '')}"
         if not any(p.get("digest") == digest for p in provenance):
             provenance.append({
@@ -256,7 +319,7 @@ def migrate(doc: Any) -> dict[str, Any]:
 
         folder = legacy.get("album")
         if folder:
-            albums = [a for a in _as_list(doc.get("albums")) if isinstance(a, dict)]
+            albums = _coerce_records(doc.get("albums"))
             identity = (legacy.get("archive_id"), folder)
             if not any((a.get("archive_id"), a.get("folder")) == identity for a in albums):
                 albums.append({"archive_id": legacy.get("archive_id"),
@@ -276,10 +339,18 @@ def merge(base: Any, updates: Any, *, observed_at: str) -> dict[str, Any]:
     Never raises.
     """
     out = migrate(base)
-    updates = _as_dict(updates)
 
-    exif_history = [h for h in _as_list(out.get("exif_history")) if isinstance(h, dict)]
-    conflicts = [c for c in _as_list(out.get("conflicts")) if isinstance(c, dict)]
+    exif_history = _coerce_records(out.get("exif_history"))
+    conflicts = _coerce_records(out.get("conflicts"))
+
+    if not isinstance(updates, dict):
+        # A non-dict *updates* -- a caller error, or a hand-assembled patch
+        # that lost its shape -- would vanish under a naive coercion to {}.
+        # It has no key to merge under, but it is still evidence about the
+        # photo, so it is recorded as a conflict rather than dropped.
+        if updates is not None:
+            _relocate(conflicts, {"key": "<updates>", "value": updates}, observed_at=observed_at)
+        updates = {}
 
     for key, value in updates.items():
         if key == "schema_version":
