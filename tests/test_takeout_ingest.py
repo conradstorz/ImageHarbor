@@ -515,7 +515,14 @@ def test_a_late_sidecar_relocation_still_records_takeout_provenance(
     it. `_merge_takeout_sidecar` was guarded on that field being non-None, so
     the branch that is this module's headline case (a sidecar arriving in a
     later part, relocating an already-organized photo) relocated the bytes
-    but silently never wrote the `takeout` sidecar block explaining why.
+    but silently never wrote the sidecar block explaining why.
+
+    Updated for Task 5: the flat, unversioned `takeout` key is gone --
+    `_merge_takeout_sidecar` now writes `provenance`/`albums` blocks the
+    schema actually knows how to merge. The first ingest has no sidecar at
+    all (no bytes to digest, so no provenance entry); the second, reopened
+    ingest is the one that actually observes a Google document, and this
+    pins that its provenance entry is not silently lost.
     """
     archives, dest = dirs
     _zip(archives / "takeout-001.zip", {f"{D}/IMG_1234.jpg": _jpeg(15)})
@@ -533,18 +540,11 @@ def test_a_late_sidecar_relocation_still_records_takeout_provenance(
     sidecar = organized.with_name(f"{organized.stem}.json")
     assert sidecar.exists()
     payload = json.loads(sidecar.read_text())
-    assert payload["takeout"]["archive"] == "takeout-001.zip"
-    # `_merge_takeout_sidecar` still writes a flat, unversioned `takeout` key
-    # (Task 5 replaces this with `provenance`/`albums` blocks the schema
-    # actually knows how to merge). Under the sidecar_schema delegation, an
-    # unrecognized key that differs between writes keeps its first-seen value
-    # and relocates the newcomer into `conflicts` rather than merging or
-    # dropping it -- so the second archive's record, sidecar path included,
-    # must still be found intact there. The guarantee this test exists to
-    # pin -- the late sidecar is never silently lost -- still holds; only
-    # WHERE it is recorded has moved.
-    conflict = next(c for c in payload["conflicts"] if c["key"] == "takeout")
-    assert conflict["value"]["sidecar"] == f"{D}/IMG_1234.jpg.json"
+    entry = next(p for p in payload["provenance"] if p["kind"] == "takeout_media_json")
+    assert entry["archive"] == "takeout-001.zip"
+    assert entry["member"] == f"{D}/IMG_1234.jpg.json"
+    assert entry["digest"]
+    assert entry["raw"]["title"] == "IMG_1234.jpg"
 
 
 def test_a_failed_retry_keeps_what_the_member_already_knew(
@@ -596,3 +596,134 @@ def test_a_failed_retry_keeps_what_the_member_already_knew(
     ][0]
     assert retried_row["status"] == "failed"
     assert retried_row["sha256_b64url"] == original_digest
+
+
+# --- Task 5: raw document preservation and real album titles ---------------
+
+
+def test_sidecar_preserves_googles_document_verbatim(dirs, catalog: Catalog) -> None:
+    """Fields nobody modelled -- imageViews, height, width -- survive here.
+
+    They come back without being parsed, and so will anything Google adds
+    later, which is the whole reason the raw document is kept.
+    """
+    archives, dest = dirs
+    payload = {
+        "title": "a.jpg",
+        "imageViews": "12",
+        "height": "2432", "width": "4320",
+        "photoTakenTime": {"timestampSeconds": "1425905792"},
+        "someFieldFromTheFuture": {"nested": [1, 2, 3]},
+    }
+    _zip(archives / "t.zip", {f"{D}/a.jpg": _jpeg(60),
+                              f"{D}/a.jpg.json": json.dumps(payload).encode()})
+
+    ingest_archives(archives, dest, catalog, write_sidecars=True)
+
+    from imageharbor.sidecar import read_sidecar
+    organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
+    entry = next(p for p in read_sidecar(organized)["provenance"]
+                 if p["kind"] == "takeout_media_json")
+    assert entry["raw"] == payload
+
+
+def test_sidecar_records_the_real_album_title(dirs, catalog: Catalog) -> None:
+    """The directory name is not the album name."""
+    archives, dest = dirs
+    _zip(archives / "t.zip", {
+        f"{D}/a.jpg": _jpeg(61),
+        f"{D}/a.jpg.json": _sidecar("a.jpg", 1425905792),
+        f"{D}/Albums.json": json.dumps({"title": "Hangout: Emma ● Sam",
+                                        "access": "protected"}).encode(),
+    })
+    ingest_archives(archives, dest, catalog, write_sidecars=True)
+
+    from imageharbor.sidecar import read_sidecar
+    organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
+    album = read_sidecar(organized)["albums"][0]
+    assert album["title"] == "Hangout: Emma ● Sam"
+    assert album["access"] == "protected"
+    assert album["folder"] == D.rsplit("/", 1)[-1]
+
+
+def test_a_photo_in_two_archives_accumulates_both_albums(dirs, catalog: Catalog) -> None:
+    """Duplicates stop being waste and become context."""
+    archives, dest = dirs
+    img = _jpeg(62)
+    _zip(archives / "one.zip", {"Takeout/A/Album One/a.jpg": img,
+                                "Takeout/A/Album One/Albums.json": json.dumps({"title": "One"}).encode()})
+    _zip(archives / "two.zip", {"Takeout/A/Album Two/b.jpg": img,
+                                "Takeout/A/Album Two/Albums.json": json.dumps({"title": "Two"}).encode()})
+
+    stats = ingest_archives(archives, dest, catalog, write_sidecars=True)
+    assert stats.ingested == 1
+    assert stats.duplicates == 1
+
+    from imageharbor.sidecar import read_sidecar
+    organized = next(dest.rglob("*.jpg"))
+    titles = {a["title"] for a in read_sidecar(organized)["albums"]}
+    assert titles == {"One", "Two"}
+
+
+def test_album_metadata_lookup_never_fails_a_photo_when_albums_json_is_malformed(
+    dirs, catalog: Catalog
+) -> None:
+    """A corrupt Albums.json degrades to 'no title', never fails the photo."""
+    archives, dest = dirs
+    _zip(archives / "t.zip", {
+        f"{D}/a.jpg": _jpeg(63),
+        f"{D}/a.jpg.json": _sidecar("a.jpg", 1425905792),
+        f"{D}/Albums.json": b"{not json",
+    })
+    stats = ingest_archives(archives, dest, catalog, write_sidecars=True)
+    assert stats.ingested == 1
+    assert stats.failed == 0
+
+    from imageharbor.sidecar import read_sidecar
+    organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
+    album = read_sidecar(organized)["albums"][0]
+    assert album["title"] is None
+    assert album["folder"] == D.rsplit("/", 1)[-1]
+
+
+def test_a_sidecar_member_whose_bytes_are_not_json_still_records_provenance(
+    dirs, catalog: Catalog
+) -> None:
+    """`raw` is omitted, but the fact a document existed is not lost."""
+    archives, dest = dirs
+    _zip(archives / "t.zip", {
+        f"{D}/a.jpg": _jpeg(64),
+        f"{D}/a.jpg.json": b"not json at all",
+    })
+    stats = ingest_archives(archives, dest, catalog, write_sidecars=True)
+    assert stats.ingested == 1
+    assert stats.failed == 0
+
+    from imageharbor.sidecar import read_sidecar
+    # No parseable photoTakenTime -- the photo organizes into Undated/, same
+    # as one with no sidecar at all. The point under test is that the
+    # sidecar document's existence (digest) is still recorded even though it
+    # failed to parse.
+    organized = next((dest / "Undated").glob("*.jpg"))
+    entry = next(p for p in read_sidecar(organized)["provenance"]
+                 if p["kind"] == "takeout_media_json")
+    assert "raw" not in entry
+    assert entry["digest"]
+
+
+def test_a_photo_with_no_albums_json_in_its_directory_still_organizes(
+    dirs, catalog: Catalog
+) -> None:
+    archives, dest = dirs
+    _zip(archives / "t.zip", {
+        f"{D}/a.jpg": _jpeg(65),
+        f"{D}/a.jpg.json": _sidecar("a.jpg", 1425905792),
+    })
+    stats = ingest_archives(archives, dest, catalog, write_sidecars=True)
+    assert stats.ingested == 1
+    assert stats.failed == 0
+
+    from imageharbor.sidecar import read_sidecar
+    organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
+    data = read_sidecar(organized)
+    assert data["albums"][0]["title"] is None

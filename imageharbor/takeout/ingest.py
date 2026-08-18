@@ -14,17 +14,47 @@ for a circuit breaker to observe and it must not touch one.
 
 from __future__ import annotations
 
+import json
 import logging
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ..catalog import Catalog
+from ..hashing import compute_sha256_b64url_bytes
 from ..pipeline import ExternalEvidence, Pipeline
 from ..sidecar import merge_sidecar
 from . import archive, metadata, pairing
 
 logger = logging.getLogger(__name__)
+
+
+def _digest_bytes(data: bytes) -> str:
+    """Content-address *data* already in memory (a zip member's bytes).
+
+    The actual digest logic lives in `hashing.compute_sha256_b64url_bytes`,
+    next to the path-based `compute_sha256_b64url` it mirrors -- content
+    addressing belongs to `hashing.py`, not to this module. This is a thin,
+    named call site so callers below read as "digest these bytes" rather
+    than reaching into another module inline.
+    """
+    return compute_sha256_b64url_bytes(data)
+
+
+def _safe_json_loads(raw: bytes) -> Any | None:
+    """Decode *raw* as JSON, or None if it isn't. Never raises.
+
+    Mirrors `takeout.metadata._load`'s broad except, for the same reason: a
+    sidecar document that fails to parse must not fail the photo it
+    describes -- it only loses `raw` from its provenance entry. The fact
+    that a document existed is still recorded, via `digest`.
+    """
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except Exception as exc:
+        logger.debug("Takeout sidecar bytes are not JSON (%s); omitting raw", exc)
+        return None
 
 STAGING_DIR_NAME = ".takeout-staging"
 
@@ -128,6 +158,10 @@ class _Ingestor:
         # implemented here because it is not needed at the sizes this ships
         # for and would add eviction logic nobody has a test for.
         self._open_zips: dict[Path, zipfile.ZipFile] = {}
+        # (archive_id, folder) -> AlbumMetadata, built once per archive (see
+        # `_index_albums`) rather than re-reading an Albums.json per photo.
+        self._album_titles: dict[tuple[str, str], metadata.AlbumMetadata] = {}
+        self._album_indexed: set[str] = set()
         self.pipeline = Pipeline(
             source_dir=self.staging_dir,
             organized_dir=organized_dir,
@@ -338,17 +372,58 @@ class _Ingestor:
             self._open_zips[path] = zf
         return zf
 
-    def _read_sidecar(self, sidecar_member: str) -> metadata.TakeoutMetadata:
+    def _read_sidecar_bytes(self, sidecar_member: str) -> bytes | None:
+        """Return the sidecar member's raw bytes, or None if it can't be read.
+
+        None (not b"") distinguishes "no document was observed" from "a real,
+        possibly empty, document was observed" -- `_merge_takeout_sidecar`
+        only records provenance for the latter.
+        """
         owner = self.owner.get(sidecar_member)
         if owner is None:
-            return metadata.EMPTY
+            return None
         try:
             zf = self._zip_for(owner)
-            return metadata.parse_photo_metadata(archive.read_member(zf, sidecar_member))
+            return archive.read_member(zf, sidecar_member)
         except (zipfile.BadZipFile, KeyError, OSError) as exc:
             logger.warning("Unreadable sidecar %s (%s); ingesting without it",
                            sidecar_member, exc)
+            return None
+
+    def _read_sidecar(self, sidecar_member: str) -> metadata.TakeoutMetadata:
+        raw = self._read_sidecar_bytes(sidecar_member)
+        if raw is None:
             return metadata.EMPTY
+        return metadata.parse_photo_metadata(raw)
+
+    def _index_albums(self, identity: archive.ArchiveIdentity, zf: zipfile.ZipFile) -> None:
+        """Build this archive's ``(archive_id, folder) -> AlbumMetadata`` index.
+
+        Read once per archive, from the zip handle `_ingest_archive` already
+        has open to process its images -- never once per photo. A 60 GB
+        export can carry 100k+ members, so a per-photo zip read here would
+        dominate the whole ingest's cost. Idempotent via `_album_indexed`, so
+        calling this at the top of every `_ingest_archive` call is cheap even
+        when nothing changed.
+        """
+        if identity.archive_id in self._album_indexed:
+            return
+        self._album_indexed.add(identity.archive_id)
+        for row in self.catalog.takeout_members_all(identity.archive_id):
+            if row["kind"] != archive.KIND_ALBUM:
+                continue
+            folder = row["member_path"].rpartition("/")[0].rpartition("/")[2] or None
+            if folder is None:
+                continue
+            try:
+                raw = archive.read_member(zf, row["member_path"])
+            except (zipfile.BadZipFile, KeyError, OSError) as exc:
+                logger.warning(
+                    "Unreadable album descriptor %s (%s); no album title recorded",
+                    row["member_path"], exc,
+                )
+                continue
+            self._album_titles[(identity.archive_id, folder)] = metadata.parse_album_metadata(raw)
 
     def _label(self, archive_path: Path, member_path: str) -> str:
         return f"{archive_path}!{member_path}"
@@ -392,7 +467,11 @@ class _Ingestor:
             path=member_path, size=row["size"], crc32=row["crc32"], kind=row["kind"]
         )
         sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
-        meta = self._read_sidecar(sidecar_member) if sidecar_member else metadata.EMPTY
+        sidecar_raw = self._read_sidecar_bytes(sidecar_member) if sidecar_member else None
+        meta = (
+            metadata.parse_photo_metadata(sidecar_raw)
+            if sidecar_raw is not None else metadata.EMPTY
+        )
 
         staged = None
         try:
@@ -457,49 +536,73 @@ class _Ingestor:
                     organized_path = Path(photo_row["organized_path"])
             if organized_path is not None:
                 self._merge_takeout_sidecar(organized_path, identity, member_path,
-                                            sidecar_member, meta)
+                                            sidecar_member, sidecar_raw, meta)
 
     def _merge_takeout_sidecar(
         self, organized_path: Path, identity, member_path: str,
-        sidecar_member: str | None, meta: metadata.TakeoutMetadata,
+        sidecar_member: str | None, sidecar_raw: bytes | None,
+        meta: metadata.TakeoutMetadata,
     ) -> None:
         """Record Google's metadata as provenance. None of it is load-bearing.
+
+        Google's document is stored VERBATIM under ``raw`` -- fields nobody
+        modelled here (``imageViews``, ``height``, ``width``, ...) and
+        anything Google adds later survive, because this never parses the
+        document into a bespoke shape; it only digests and stores it.
 
         A sidecar failure must never fail an image that is already copied,
         verified, and catalogued.
         """
         try:
-            merge_sidecar(
-                organized_path,
-                {
-                    "takeout": {
-                        "archive": identity.path.name,
-                        "archive_id": identity.archive_id,
-                        "member": member_path,
-                        "sidecar": sidecar_member,
-                        # Album membership, recorded not materialized: the
-                        # containing directory IS the album in every Takeout
-                        # layout. Placement stays date-derived, so this is a
-                        # record and never a path.
-                        "album": member_path.rpartition("/")[0].rpartition("/")[2] or None,
-                        "title": meta.title,
-                        "description": meta.description,
-                        "photo_taken_time": (
-                            meta.photo_taken_at.isoformat() if meta.photo_taken_at else None
-                        ),
-                        # Provenance only: creationTime is upload time, and is
-                        # never allowed to place a file.
-                        "creation_time": (
-                            meta.creation_at.isoformat() if meta.creation_at else None
-                        ),
-                        "latitude": meta.latitude,
-                        "longitude": meta.longitude,
-                        "people": list(meta.people),
-                        "favorited": meta.favorited,
-                        "google_exif": meta.google_exif,
-                    }
-                },
-            )
+            updates: dict[str, Any] = {}
+
+            # The per-photo Google JSON document, content-addressed. Only
+            # written when real bytes were actually read -- a photo with no
+            # sidecar at all (or an unreadable one) has no document to
+            # digest, and a fabricated digest of "nothing" would be a false
+            # observation, not a missing one.
+            if sidecar_raw is not None:
+                entry: dict[str, Any] = {
+                    "kind": "takeout_media_json",
+                    "archive_id": identity.archive_id,
+                    "archive": identity.path.name,
+                    "member": sidecar_member,
+                    "digest": _digest_bytes(sidecar_raw),
+                }
+                parsed = _safe_json_loads(sidecar_raw)
+                if parsed is not None:
+                    entry["raw"] = parsed
+                updates["provenance"] = [entry]
+
+            # Album membership, recorded not materialized: the containing
+            # directory IS the album in every Takeout layout. Placement stays
+            # date-derived, so this is a record and never a path. Written
+            # even when no Albums.json exists for the folder (title/access/
+            # date all None) -- the folder itself is still real information,
+            # and a later archive that DOES carry the title merges into this
+            # same (archive_id, folder) entry rather than creating a
+            # duplicate.
+            folder = member_path.rpartition("/")[0].rpartition("/")[2] or None
+            if folder is not None:
+                album_meta = self._album_titles.get((identity.archive_id, folder))
+                updates["albums"] = [{
+                    "archive_id": identity.archive_id,
+                    "folder": folder,
+                    "title": album_meta.title if album_meta else None,
+                    "access": album_meta.access if album_meta else None,
+                    "date": (
+                        album_meta.date.isoformat()
+                        if album_meta and album_meta.date else None
+                    ),
+                }]
+
+            if meta.people:
+                updates["people"] = [
+                    {"name": n, "source": "google_photos_people"} for n in meta.people
+                ]
+
+            if updates:
+                merge_sidecar(organized_path, updates)
         except Exception:
             logger.warning(
                 "Failed to write Takeout sidecar block for %s; image is organized "
@@ -552,6 +655,7 @@ class _Ingestor:
 
         try:
             with zipfile.ZipFile(identity.path, "r") as zf:
+                self._index_albums(identity, zf)
                 for row in images:
                     self._ingest_image(zf, identity, row)
         except (zipfile.BadZipFile, OSError) as exc:

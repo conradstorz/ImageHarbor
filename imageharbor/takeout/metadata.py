@@ -80,6 +80,8 @@ class AlbumMetadata:
 
     title: str | None = None
     description: str | None = None
+    access: str | None = None
+    date: datetime | None = None
 
 
 EMPTY = TakeoutMetadata()
@@ -225,4 +227,6 @@ def parse_album_metadata(raw: bytes) -> AlbumMetadata:
     return AlbumMetadata(
         title=_text(data.get("title")),
         description=_text(data.get("description")),
+        access=_text(data.get("access")),
+        date=_timestamp(data.get("date")),
     )

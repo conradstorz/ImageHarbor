@@ -204,3 +204,24 @@ def test_non_dict_exif_block_yields_empty_google_exif() -> None:
     raw = json.dumps({"exif": "not a dict"}).encode()
     meta = parse_photo_metadata(raw)
     assert meta.google_exif == {}
+
+
+def test_album_metadata_parses_access_and_date() -> None:
+    raw = json.dumps({
+        "title": "Hangout: Conrad Storz ● Herbie (Tony) Hughes",
+        "access": "protected",
+        "date": {"timestampSeconds": "1524674607", "formatted": "…"},
+    }).encode()
+    album = parse_album_metadata(raw)
+    assert album.title.startswith("Hangout:")
+    assert album.access == "protected"
+    assert album.date == datetime(2018, 4, 25, 16, 43, 27)
+
+
+def test_album_metadata_malformed_json_never_raises() -> None:
+    """A corrupt Albums.json must degrade to 'no album metadata', never fail
+    the batch it belongs to."""
+    album = parse_album_metadata(b"{not json")
+    assert album.title is None
+    assert album.access is None
+    assert album.date is None
