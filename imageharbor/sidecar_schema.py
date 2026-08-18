@@ -43,6 +43,13 @@ KEYED_LISTS: dict[str, tuple[str, ...]] = {
 # Key-by-key maps. A changed value is recorded in `<name>_history`.
 FLAT_MAPS: tuple[str, ...] = ("identity", "exif")
 
+# Where each flat map's superseded values are relocated. Every name in
+# FLAT_MAPS must have an entry here -- `merge()` looks up each map's history
+# list by this table rather than special-casing `exif`, so a changed
+# `identity` value is routed to its OWN history list (`identity_history`)
+# instead of a throwaway list nobody reads, which used to silently discard it.
+FLAT_MAP_HISTORY_KEYS: dict[str, str] = {"exif": "exif_history", "identity": "identity_history"}
+
 # Fields that annotate an observation rather than identify it. `_core` strips
 # every one, because a history entry's identity is the VALUE it records --
 # never when it was seen, nor why it lost. Adding a key here is how you make a
@@ -325,6 +332,18 @@ def migrate(doc: Any) -> dict[str, Any]:
                 albums.append({"archive_id": legacy.get("archive_id"),
                                "folder": folder, "title": None})
             doc["albums"] = albums
+    elif legacy is not None:
+        # A `takeout` key that isn't dict-shaped -- a hand edit, a caller
+        # error -- is still a value on record under the module-wide never-
+        # lose rule. It cannot become a provenance entry (the reconstruction
+        # above reads dict fields off it), so it is relocated into
+        # `conflicts[]` rather than vanishing along with the `doc.pop` above
+        # that removed it from `doc`. This is the same "unexpected shape is
+        # still a value, not nothing" treatment `_coerce_block` and
+        # `_coerce_records` give elsewhere in this module.
+        conflicts = _coerce_records(doc.get("conflicts"))
+        _relocate(conflicts, {"key": "takeout", "value": legacy}, observed_at="migration")
+        doc["conflicts"] = conflicts
 
     if prev_version is not None and prev_version != SCHEMA_VERSION:
         doc.setdefault("migrated_from_schema_version", prev_version)
@@ -340,7 +359,10 @@ def merge(base: Any, updates: Any, *, observed_at: str) -> dict[str, Any]:
     """
     out = migrate(base)
 
-    exif_history = _coerce_records(out.get("exif_history"))
+    flat_map_histories: dict[str, list] = {
+        name: _coerce_records(out.get(hist_key))
+        for name, hist_key in FLAT_MAP_HISTORY_KEYS.items()
+    }
     conflicts = _coerce_records(out.get("conflicts"))
 
     if not isinstance(updates, dict):
@@ -362,7 +384,7 @@ def merge(base: Any, updates: Any, *, observed_at: str) -> dict[str, Any]:
         elif key in KEYED_LISTS:
             out[key] = _merge_keyed_list(out.get(key), value, KEYED_LISTS[key], observed_at)
         elif key in FLAT_MAPS:
-            history = exif_history if key == "exif" else []
+            history = flat_map_histories[key]
             merged = _merge_flat_map(out.get(key), value, history, observed_at)
             out[key] = merged
         elif key not in out:
@@ -375,8 +397,10 @@ def merge(base: Any, updates: Any, *, observed_at: str) -> dict[str, Any]:
             core = {"key": key, "value": value}
             _relocate(conflicts, core, observed_at=observed_at)
 
-    if exif_history:
-        out["exif_history"] = exif_history
+    for name, hist_key in FLAT_MAP_HISTORY_KEYS.items():
+        history = flat_map_histories[name]
+        if history:
+            out[hist_key] = history
     if conflicts:
         out["conflicts"] = conflicts
     out["schema_version"] = SCHEMA_VERSION

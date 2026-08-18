@@ -94,14 +94,12 @@ def test_a_scalar_replaced_by_a_dict_does_not_corrupt(tmp_path: Path) -> None:
     """Type mismatches between runs resolve cleanly rather than raising.
 
     A v1 sidecar can hold a bare string where v2 expects a tiered block, so
-    this is a real migration shape, not a hypothetical one.
-
-    NOTE: the bare scalar written by the first merge is silently discarded --
-    it never appears in `history` -- because `_merge_tiered` coerces a
-    non-dict `new` value to `{}` via `_as_dict` before `_core` ever sees it.
-    That is a real "never-lose" violation, not merely a shape change; see the
-    task report for detail. This test pins the current (lossy) behavior --
-    it does not raise or corrupt the document -- without endorsing it.
+    this is a real migration shape, not a hypothetical one. `_coerce_block`
+    lifts the bare scalar to a tier-0 block (`value`/`tier`/`source`)
+    rather than discarding it, so the first merge's scalar is real evidence
+    on record -- and when the second merge's higher-tier block wins, that
+    tier-0 reading is relocated into `history` like any other superseded
+    value, not lost.
     """
     img = tmp_path / "a.jpg"
     merge_sidecar(img, {"date": "2019-07-04"})
@@ -110,3 +108,6 @@ def test_a_scalar_replaced_by_a_dict_does_not_corrupt(tmp_path: Path) -> None:
     block = read_sidecar(img)["date"]
     assert block["value"] == "2019-07-04"
     assert block["tier"] == 40
+    assert any(h.get("tier") == 0 for h in block["history"]), (
+        "the bare scalar from the first merge must survive in history"
+    )

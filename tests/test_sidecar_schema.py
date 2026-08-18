@@ -312,6 +312,19 @@ def test_a_changed_exif_value_moves_the_old_one_to_history() -> None:
     assert any(h["key"] == "Orientation" and h["value"] == 1.0 for h in after["exif_history"])
 
 
+def test_a_changed_identity_value_moves_the_old_one_to_its_own_history() -> None:
+    """Finding 4: `identity` is a FLAT_MAPS entry like `exif`, but `merge()`
+    used to route its superseded values through a throwaway `[]` nobody
+    read, silently discarding them. It must get a real history list, keyed
+    separately from `exif_history` so the two never collide."""
+    base = merge({}, {"identity": {"size": 10}}, observed_at=T0)
+    after = merge(base, {"identity": {"size": 20}}, observed_at=T1)
+    assert after["identity"]["size"] == 20
+    assert any(h["key"] == "size" and h["value"] == 10 for h in after["identity_history"])
+    # Must not leak into (or be confused with) exif's own history list.
+    assert "size" not in {h.get("key") for h in after.get("exif_history", [])}
+
+
 # --- unknown keys --------------------------------------------------------
 
 
@@ -376,6 +389,20 @@ def test_migration_is_idempotent() -> None:
     once = migrate(copy.deepcopy(V1))
     twice = migrate(copy.deepcopy(once))
     assert json.dumps(twice, sort_keys=True) == json.dumps(once, sort_keys=True)
+
+
+def test_migrate_relocates_a_non_dict_takeout_value_into_conflicts() -> None:
+    """Finding 3: `migrate()` used to `doc.pop("takeout", None)` and only
+    handle the dict-shaped case -- a `takeout` key holding anything else (a
+    hand edit, a caller error) was popped and silently dropped. It must
+    survive, relocated into `conflicts[]` like every other value that
+    arrives in an unexpected shape."""
+    out = migrate({"schema_version": 1, "takeout": "a bare note"})
+    assert "takeout" not in out
+    assert any(
+        c.get("key") == "takeout" and c.get("value") == "a bare note"
+        for c in out.get("conflicts", [])
+    )
 
 
 def test_merge_migrates_a_v1_base_automatically() -> None:
