@@ -379,39 +379,71 @@ class _Ingestor:
                 and not row["sidecar_path"]
                 and pairing.sidecar_for(row["member_path"], self.pairing_index) is not None
             ]
-            if not stale:
+            if stale:
+                self.stats.archives_reopened += 1
+                members = [
+                    archive.MemberInfo(
+                        path=row["member_path"], size=row["size"],
+                        crc32=row["crc32"], kind=row["kind"],
+                    )
+                    for row in stale
+                ]
+                if self.dry_run:
+                    # Report the work without performing or recording any of it.
+                    todo.append((identity, members))
+                    continue
+
+                for row in stale:
+                    # Every field this row already holds must be passed back:
+                    # `takeout_member_set` is a blind full-row UPDATE and would
+                    # otherwise null what it does not receive. `sidecar_path` is
+                    # deliberately left None -- re-ingesting is what establishes it.
+                    self.catalog.takeout_member_set(
+                        identity.archive_id,
+                        row["member_path"],
+                        status=_PENDING,
+                        sha256_b64url=row["sha256_b64url"],
+                        taken_at=row["taken_at"],
+                        sidecar_path=None,
+                        last_error=row["last_error"],
+                    )
+                self.catalog.takeout_archive_set_status(identity.archive_id, "partial")
+                todo.append((identity, members))
+                continue
+
+            # No stale media/sidecar work -- but the provenance room, only
+            # ever created by `_ingest_archive` reopening the zip (see
+            # `_preserve_provenance`), may be missing: deleted by hand, or
+            # never finished (e.g. a crash between writing a document and
+            # updating the manifest). Detected by manifest absence, guarded
+            # by `non_media` so an archive that legitimately has nothing to
+            # preserve (a pure-image export, no JSON/album member at all)
+            # is never treated as needing one -- `preserve()` only writes a
+            # manifest `if written:`, so such an archive would otherwise be
+            # judged "missing" and reopened on every single future run,
+            # forever.
+            #
+            # Reopening here reuses the exact machinery above: adding
+            # `(identity, [])` to `todo` with NO member reset to `pending`
+            # means `_ingest_archive`'s work queue for this archive stays
+            # empty, so nothing is re-extracted or re-ingested -- only the
+            # zip gets reopened so `_preserve_provenance` can run again
+            # (itself idempotent via the manifest's own digests).
+            non_media = [
+                row for row in rows
+                if row["kind"] not in (archive.KIND_IMAGE, archive.KIND_VIDEO)
+            ]
+            manifest_missing = bool(non_media) and not provenance.manifest_path(
+                self.organized_dir, identity.archive_id
+            ).exists()
+            if not manifest_missing:
                 self.stats.archives_skipped += 1
                 continue
 
             self.stats.archives_reopened += 1
-            members = [
-                archive.MemberInfo(
-                    path=row["member_path"], size=row["size"],
-                    crc32=row["crc32"], kind=row["kind"],
-                )
-                for row in stale
-            ]
-            if self.dry_run:
-                # Report the work without performing or recording any of it.
-                todo.append((identity, members))
-                continue
-
-            for row in stale:
-                # Every field this row already holds must be passed back:
-                # `takeout_member_set` is a blind full-row UPDATE and would
-                # otherwise null what it does not receive. `sidecar_path` is
-                # deliberately left None -- re-ingesting is what establishes it.
-                self.catalog.takeout_member_set(
-                    identity.archive_id,
-                    row["member_path"],
-                    status=_PENDING,
-                    sha256_b64url=row["sha256_b64url"],
-                    taken_at=row["taken_at"],
-                    sidecar_path=None,
-                    last_error=row["last_error"],
-                )
-            self.catalog.takeout_archive_set_status(identity.archive_id, "partial")
-            todo.append((identity, members))
+            # No media work is reported for a provenance-only reopen: nothing
+            # is re-ingested, and a dry run performs no writes at all.
+            todo.append((identity, []))
 
         return todo
 
@@ -742,11 +774,14 @@ class _Ingestor:
         self.stats.deferred += 1
 
     def _ingest_archive(self, identity: archive.ArchiveIdentity) -> None:
+        # No early return when `pending` is empty: `_ingest_archive` is now
+        # also reached for a provenance-only reopen (see `_survey`'s second
+        # pass), where `pending` is empty BY DESIGN -- no member was reset to
+        # `pending`, so nothing here is re-extracted or re-ingested -- but
+        # the zip still needs to be opened once so `_preserve_provenance` can
+        # rebuild a missing/incomplete room. `images`/`videos` stay empty in
+        # that case, so the loops below do nothing either way.
         pending = self.catalog.takeout_members_pending(identity.archive_id)
-        if not pending:
-            self.catalog.takeout_archive_set_status(identity.archive_id, "complete")
-            return
-
         images = [r for r in pending if r["kind"] == archive.KIND_IMAGE]
         videos = [r for r in pending if r["kind"] == archive.KIND_VIDEO]
 

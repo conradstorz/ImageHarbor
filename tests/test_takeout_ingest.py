@@ -711,6 +711,64 @@ def test_a_sidecar_member_whose_bytes_are_not_json_still_records_provenance(
     assert entry["digest"]
 
 
+def test_a_deleted_provenance_room_is_recreated_by_re_ingesting_a_complete_archive(
+    dirs, catalog: Catalog, monkeypatch
+) -> None:
+    """Finding 6: the provenance room is only ever created by
+    `_ingest_archive` reopening the zip, which a `complete` archive with no
+    stale sidecar work never reaches -- so a room deleted by hand (or never
+    finished) stayed gone forever, and re-ingesting -- the documented
+    recovery -- silently did nothing.
+
+    `_survey` must now detect a missing manifest for a `complete` archive
+    that has any non-media member and put it back in `todo`, WITHOUT
+    resetting any member to `pending` -- so the room comes back but not one
+    byte of media is re-extracted.
+    """
+    import shutil
+
+    from imageharbor.takeout import provenance
+
+    archives, dest = dirs
+    _zip(
+        archives / "t.zip",
+        {
+            f"{D}/a.jpg": _jpeg(70),
+            f"{D}/a.jpg.json": _sidecar("a.jpg", 1425905792),
+        },
+    )
+
+    first = ingest_archives(archives, dest, catalog)
+    assert first.ingested == 1
+
+    identity = catalog.takeout_archives_all()[0]["archive_id"]
+    room = dest / provenance.ROOM_NAME / identity
+    manifest = provenance.manifest_path(dest, identity)
+    assert room.exists()
+    assert manifest.exists()
+
+    shutil.rmtree(room)
+    assert not room.exists()
+
+    calls: list[str] = []
+    real = archive_mod.extract_to
+    monkeypatch.setattr(
+        archive_mod, "extract_to",
+        lambda zf, m, s: (calls.append(m.path), real(zf, m, s))[1],
+    )
+
+    second = ingest_archives(archives, dest, catalog)
+
+    assert calls == [], "re-ingesting a complete archive must not re-extract any member"
+    assert second.ingested == 0
+    assert second.duplicates == 0
+    assert len(list(dest.rglob("*.jpg"))) == 1, "no photo was re-copied"
+    assert room.exists(), "the provenance room must be recreated"
+    assert manifest.exists(), "the manifest must be rewritten"
+    assert any(room.rglob("a.jpg.json")), "the preserved document must be back"
+    assert catalog.takeout_archive_get(identity)["status"] == "complete"
+
+
 def test_a_photo_with_no_albums_json_in_its_directory_still_organizes(
     dirs, catalog: Catalog
 ) -> None:
