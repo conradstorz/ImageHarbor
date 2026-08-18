@@ -39,7 +39,7 @@ Copied verbatim from `docs/superpowers/specs/2026-08-18-lossless-sidecar-design.
 | `imageharbor/backfill.py` | create | Rebuild sidecars from the catalog |
 | `.gitignore` | modify | `.takeout-provenance/` |
 | `tests/test_sidecar_schema.py` | create | The never-lose property, idempotence, keying, migration |
-| `tests/test_sidecar.py` | create | Atomicity, corrupt-file quarantine |
+| `tests/test_sidecar.py` | **modify** | Atomicity, corrupt-file quarantine. This file ALREADY EXISTS with 11 tests — add to it, do not rewrite it. Several existing tests cover behavior this project does not change (`sidecar_path_for` on a dotted stem, a missing sidecar reading empty, bytes-valued EXIF serializing as text). Only `test_lists_are_replaced_not_appended` is genuinely obsolete: it pins the data-loss bug being removed. |
 | `tests/test_backfill.py` | create | Backfill correctness and idempotence |
 | `tests/test_takeout_provenance.py` | create | Provenance room, orphaned sidecars |
 | `tests/test_takeout_ingest.py` | modify | Raw capture, albums, accumulation across archives |
