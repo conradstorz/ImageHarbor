@@ -322,7 +322,7 @@ the run.
 | `sidecar_schema.py` | **new** — pure merge policy, history, keying, v1 migration |
 | `sidecar.py` | delegate merging to `sidecar_schema`; keep the public surface; remove `_deep_merge` |
 | `pipeline.py` | write `sources[].folder`; no behavioral change otherwise |
-| `enrich.py` | classification block gains `model_version`; merge shape unchanged at the call site |
+| `enrich.py` | **no change needed** — it has written `model_version` into the classification block since `d14f06b`. Verified 2026-08-18; the original change table asserted this without checking. What the block gains is *significance*: history now makes it possible to tell which model produced which answer. |
 | `takeout/ingest.py` | write `provenance[].raw`; populate `albums[]` from `Albums.json`; write the provenance room; record orphaned sidecars |
 | `takeout/metadata.py` | `parse_album_metadata` gains `access` and `date`; becomes reachable |
 | `cli.py` | flip four `--sidecar` defaults; add the `sidecar` group with `backfill` |

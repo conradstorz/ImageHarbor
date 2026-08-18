@@ -31,7 +31,7 @@ Copied verbatim from `docs/superpowers/specs/2026-08-18-lossless-sidecar-design.
 | `imageharbor/sidecar_schema.py` | create | Pure merge policy: field shapes, history, keyed lists, v1 migration |
 | `imageharbor/sidecar.py` | modify | Read, atomic write, corrupt-file quarantine; delegates policy |
 | `imageharbor/pipeline.py` | modify | `sources[].folder` |
-| `imageharbor/enrich.py` | modify | `classification.model_version` |
+| `imageharbor/enrich.py` | **unchanged** | Already writes `model_version` (since `d14f06b`). Task 4 is a test-only task: pin it. |
 | `imageharbor/takeout/metadata.py` | modify | `AlbumMetadata` gains `access` and `date` |
 | `imageharbor/takeout/ingest.py` | modify | `provenance[].raw`, `albums[]`, the provenance room |
 | `imageharbor/takeout/provenance.py` | create | Write and index the provenance room |
