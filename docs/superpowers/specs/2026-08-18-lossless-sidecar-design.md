@@ -77,9 +77,18 @@ for the largest cluster. Guessing was rejected: this project's pairing rule is
 already "never guess", and a face attached to the wrong photo is exactly the
 silent corruption that rule exists to prevent.
 
-**Eight sidecars have no media member in this part** — including
-`P1010089.JPG(1).json` and `P1010089.JPG(2).json`, whose photos live in an
-archive part not present. Today they are classified `parsed` and forgotten.
+**No sidecar in this export is orphaned** — all 86 media JSON documents pair
+with a media member, matching `pairing.py`'s own 86/86 claim. An earlier draft
+of this section asserted eight orphans, including `P1010089.JPG(1).json`; that
+figure was an artifact of a crude check that compared a sidecar's name minus
+`.json` against the member list instead of applying the pairing rungs. The
+`(N)`-displacement rung pairs `P1010089.JPG(1).json` with `P1010089(1).JPG`,
+which is present. Corrected 2026-08-18 after the implementation reproduced the
+real number.
+
+The orphaned bucket is still built, because a genuine orphan is expected the
+moment a multi-part export is ingested one part at a time — it is simply not
+exercised by this single-part archive.
 
 **Sizes.** Google's per-photo JSON averages 503 B (max 618 B). Current
 ImageHarbor sidecars average 2,540 B. Embedding the raw document costs roughly
