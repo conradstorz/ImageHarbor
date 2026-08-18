@@ -14,12 +14,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from .sidecar_schema import SCHEMA_VERSION as SIDECAR_SCHEMA_VERSION
+from .sidecar_schema import merge as merge_documents
 
-SIDECAR_SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 def _json_default(o: Any) -> Any:
@@ -53,49 +55,54 @@ def sidecar_path_for(organized_path: Path) -> Path:
     return organized_path.with_name(f"{organized_path.stem}.json")
 
 
-def read_sidecar(organized_path: Path) -> dict[str, Any]:
-    """Return the existing sidecar contents, or ``{}`` if absent or unreadable.
+def _quarantine(path: Path, reason: str) -> None:
+    """Move an unreadable sidecar aside instead of writing over it.
 
-    A corrupt sidecar is reported and treated as empty rather than raising: it
-    must never block an image that is already copied, verified, and cataloged.
+    Returning {} for a corrupt file -- the previous behavior -- meant the next
+    merge silently replaced whatever those bytes held. Under the never-lose
+    rule that is the one unacceptable outcome, so the bytes are preserved
+    under a timestamped name and a fresh sidecar is built beside them.
+    """
+    stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        path.replace(target)
+        logger.warning("Unreadable sidecar %s (%s); preserved as %s", path, reason, target.name)
+    except OSError as exc:
+        logger.error("Could not quarantine %s (%s); leaving it untouched", path, exc)
+
+
+def read_sidecar(organized_path: Path) -> dict[str, Any]:
+    """Return the existing sidecar contents, or ``{}`` if absent.
+
+    An unreadable sidecar is quarantined (see :func:`_quarantine`) and reported
+    as empty, so the caller proceeds with a fresh document while the original
+    bytes survive on disk.
     """
     path = sidecar_path_for(organized_path)
     if not path.exists():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Unreadable sidecar %s (%s); treating as empty", path, exc)
+    except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+        _quarantine(path, str(exc))
         return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge *updates* into *base*, returning a new dict.
-
-    Nested dicts merge key-by-key so a partial update never drops a sibling
-    field.  Lists and scalars replace wholesale -- callers that own a list
-    (``sources``, ``history``) pass the complete value.
-    """
-    merged = dict(base)
-    for key, value in updates.items():
-        existing = merged.get(key)
-        if isinstance(existing, dict) and isinstance(value, dict):
-            merged[key] = _deep_merge(existing, value)
-        else:
-            merged[key] = value
-    return merged
+    if not isinstance(data, dict):
+        _quarantine(path, "top-level value is not an object")
+        return {}
+    return data
 
 
 def merge_sidecar(organized_path: Path, updates: dict[str, Any]) -> Path:
     """Merge *updates* into the sidecar for *organized_path* and write it back.
 
-    The write is atomic (temp file in the same directory, then ``os.replace``)
-    so an interrupted run cannot leave a half-written sidecar.
+    Merge policy lives in :mod:`imageharbor.sidecar_schema`; this function owns
+    only reading, the atomic write (temp file then ``os.replace``), and the
+    quarantine of an unreadable file.
     """
     path = sidecar_path_for(organized_path)
-    merged = _deep_merge(read_sidecar(organized_path), updates)
-    merged["schema_version"] = SIDECAR_SCHEMA_VERSION
+    observed_at = datetime.now(tz=timezone.utc).isoformat()
+    merged = merge_documents(read_sidecar(organized_path), updates, observed_at=observed_at)
 
     tmp = path.with_name(f"{path.name}.tmp")
     try:

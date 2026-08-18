@@ -534,7 +534,17 @@ def test_a_late_sidecar_relocation_still_records_takeout_provenance(
     assert sidecar.exists()
     payload = json.loads(sidecar.read_text())
     assert payload["takeout"]["archive"] == "takeout-001.zip"
-    assert payload["takeout"]["sidecar"] == f"{D}/IMG_1234.jpg.json"
+    # `_merge_takeout_sidecar` still writes a flat, unversioned `takeout` key
+    # (Task 5 replaces this with `provenance`/`albums` blocks the schema
+    # actually knows how to merge). Under the sidecar_schema delegation, an
+    # unrecognized key that differs between writes keeps its first-seen value
+    # and relocates the newcomer into `conflicts` rather than merging or
+    # dropping it -- so the second archive's record, sidecar path included,
+    # must still be found intact there. The guarantee this test exists to
+    # pin -- the late sidecar is never silently lost -- still holds; only
+    # WHERE it is recorded has moved.
+    conflict = next(c for c in payload["conflicts"] if c["key"] == "takeout")
+    assert conflict["value"]["sidecar"] == f"{D}/IMG_1234.jpg.json"
 
 
 def test_a_failed_retry_keeps_what_the_member_already_knew(
