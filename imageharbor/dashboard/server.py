@@ -230,49 +230,67 @@ def make_handler(
                     HTTPStatus.BAD_REQUEST, {"error": f"unknown setting(s): {unknown}"}
                 )
                 return
-            # bool is a subclass of int -- reject it explicitly for
-            # "interval" so {"interval": true} cannot silently become
-            # interval=1.0 by falling through to float(True).
-            if "interval" in body and isinstance(body["interval"], bool):
-                self._send_json(
-                    HTTPStatus.BAD_REQUEST, {"error": "interval must be numeric"}
-                )
-                return
-            # `json.loads` accepts the bare (non-standard-JSON) tokens
-            # `Infinity`/`-Infinity`/`NaN` and hands back a real `float`, so
-            # `{"interval": Infinity}` reaches here as `body["interval"] ==
-            # float("inf")` -- a value `ControlPlane.set_override` would
-            # also now reject, but rejecting it explicitly at this boundary
-            # (rather than relying solely on that downstream ValueError)
-            # means non-finite junk never even reaches `set_override`, per
-            # the same "the boundary rejects it, the reader is never asked
-            # to defend against it" rule the negative-interval test above
-            # already pins.
-            if "interval" in body and isinstance(body["interval"], (int, float)):
-                if not math.isfinite(body["interval"]):
-                    self._send_json(
-                        HTTPStatus.BAD_REQUEST,
-                        {"error": "interval must be a finite number"},
+
+            # Validate every key in the request BEFORE applying any of them.
+            # `body.items()` iterates in dict (insertion) order, and
+            # `ControlPlane.set_override` persists each key as it is called
+            # -- so a loop that validates-and-applies key-by-key can persist
+            # an earlier, valid key and only then discover a later key is
+            # bad, leaving the store partially updated even though the
+            # caller receives nothing but a 400 (reproduced: `{"enrich":
+            # false, "interval": -5}` left `enrich` applied and `interval`
+            # untouched). Collecting every key's validation error into
+            # `errors` first, and only calling `set_override` in a second,
+            # separate loop once `errors` is empty, is what makes "the
+            # boundary rejects a bad request before any write happens" true
+            # for a multi-key body, not just a single-key one -- the shape
+            # of the code (validate loop, then apply loop) is the guarantee,
+            # not a try/except that would have to unwind a partial write
+            # after the fact.
+            errors: dict[str, str] = {}
+            if "interval" in body:
+                interval = body["interval"]
+                # bool is a subclass of int -- reject it explicitly so
+                # {"interval": true} cannot silently become interval=1.0 by
+                # falling through to float(True).
+                if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+                    errors["interval"] = "interval must be numeric"
+                elif not math.isfinite(interval):
+                    # `json.loads` accepts the bare (non-standard-JSON)
+                    # tokens `Infinity`/`-Infinity`/`NaN` and hands back a
+                    # real `float`, so `{"interval": Infinity}` reaches here
+                    # as `body["interval"] == float("inf")`. Rejecting it
+                    # explicitly at this boundary (rather than relying
+                    # solely on `set_override`'s own ValueError) means
+                    # non-finite junk never even reaches `set_override` --
+                    # this was a Critical fix and must not regress.
+                    errors["interval"] = "interval must be a finite number"
+                elif interval <= 0:
+                    errors["interval"] = (
+                        "interval must be a positive, finite number"
                     )
-                    return
             if "enrich" in body and not isinstance(body["enrich"], bool):
+                errors["enrich"] = "enrich must be a boolean"
+
+            if errors:
                 self._send_json(
-                    HTTPStatus.BAD_REQUEST, {"error": "enrich must be a boolean"}
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "invalid setting(s): " + ", ".join(sorted(errors)),
+                        "details": errors,
+                    },
                 )
                 return
+
+            # Every key validated above -- apply all of them. `set_override`
+            # can still raise for a key whose validation logic drifts out of
+            # sync with the checks above; nothing has been written yet at
+            # that point either, since this is the first write in the
+            # request.
             for key, value in body.items():
                 try:
                     control.set_override(key, value)
                 except ValueError as exc:
-                    # Nothing before this key was invalid, but a key already
-                    # applied earlier in this same request is not rolled
-                    # back -- see the module docstring's boundary-validation
-                    # rule: this can only happen for a body with more than
-                    # one recognized key, one of which failed validation
-                    # after another already succeeded, which is deliberately
-                    # rejected before any write happens (see the type checks
-                    # above) for the two keys this endpoint accepts, so in
-                    # practice this branch fires only for a single-key body.
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
             self._send_json(HTTPStatus.OK, {"overrides": control.overrides()})

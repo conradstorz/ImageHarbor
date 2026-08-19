@@ -7,15 +7,58 @@ point: it composes one small, independent function per section (``now``,
 design's "one document rather than several endpoints" rule (see
 ``docs/superpowers/specs/2026-08-19-dashboard-design.md``, "HTTP surface").
 
-Accepted inconsistency
------------------------
-Every section here is a live SQL query against a catalog the watcher may be
-actively writing to. **This module deliberately takes no lock and opens no
-transaction to obtain a consistent snapshot** -- a page that shows a photo
-counted in one number and not yet in another for one poll interval is a far
-better trade than blocking the writer to render a status page. See the
-design doc's "Accepted inconsistency" section. Do not "fix" this with a
-transaction or a lock.
+Accepted inconsistency, and the lock that is NOT a fix for it
+----------------------------------------------------------------
+Two different concurrency properties are in play in this module, and they
+must not be conflated. (They once were: an earlier version of this
+docstring told a future maintainer to remove the very lock that fixes
+property 2 below, in the name of preserving property 1. That would have
+reintroduced a measured Critical defect. The two are separate changes with
+opposite verdicts -- read both before touching either.)
+
+1. **No consistent snapshot across sections -- still true, still
+   deliberate, still correct not to fix.** Every section here is a live SQL
+   query against a catalog the watcher may be actively writing to, and none
+   of them run inside a shared transaction with each other. A page that
+   shows a photo counted in one number and not yet in another for one poll
+   interval is a far better trade than blocking the writer for the
+   duration of a whole page render. See the design doc's "Accepted
+   inconsistency" section. **Do not** wrap `collect()` (or any subset of
+   its sections) in a transaction to try to make the sections agree with
+   each other -- that remains the wrong fix, for this reason, today as much
+   as ever.
+
+2. **Thread-safety on the shared connection -- required, not optional, and
+   already fixed below; do not undo it.** The dashboard's HTTP server
+   (`daemon_threads = True`) and the watcher loop share one
+   `sqlite3.Connection`. `check_same_thread=False` *permits* concurrent
+   access to it from multiple threads; it does not make that access safe.
+   Measured under realistic concurrent load (dashboard polling + watcher
+   writing, 25s): 55 exceptions out of the writer -- `cannot commit - no
+   transaction is active`, `SystemError: error return without exception
+   set` out of `Catalog.run_finish` -- and a file copied and verified but
+   never catalogued. `_library_section`, `_evidence_section`, and
+   `_queues_section` below run ad hoc aggregate SQL directly against
+   `catalog._conn` (there is no `Catalog` wrapper method for that query),
+   so each acquires `catalog.lock` -- the same `threading.RLock` every
+   other guarded `Catalog` method takes internally -- around its query
+   block. **Do not remove these `with catalog.lock:` blocks**; doing so
+   reintroduces the defect measured above. See `catalog.py`'s class
+   docstring (CRITICAL finding #2, 2026-08-19 whole-branch review) for the
+   full account.
+
+   This lock is not the transaction/snapshot described in point 1, and
+   solves a different problem: it only serializes *access to the
+   connection object* for the duration of one section's queries -- it does
+   not hold the writer off for the whole page render, and it creates no
+   consistent view across sections (`_library_section` and
+   `_evidence_section` each take and release the lock separately, so the
+   watcher is free to write between them). A future maintainer who notices
+   the lock and reads it as "oh, so we DO serialize for consistency after
+   all, let me extend it to a snapshot" would be making the same mistake as
+   the maintainer who would have removed it -- both come from merging
+   these two properties into one. They are not one property. Keep them
+   separate: no transaction (point 1), but yes lock (point 2).
 
 A failing section must not fail the document
 ----------------------------------------------
@@ -553,8 +596,10 @@ def collect(
 
     Every section is independently wrapped by `_safe`: a query that raises
     logs and reports that section as `None` rather than failing the whole
-    document. See the module docstring for the reasoning and for why no lock
-    or transaction is taken here.
+    document. See the module docstring for why no *transaction* spans these
+    sections (deliberate) versus why three of them *do* take `catalog.lock`
+    around their own raw-SQL block (required for thread-safety, a different
+    property).
 
     IMPORTANT finding #5 (2026-08-19 whole-branch review): the unenriched
     backlog count is computed exactly ONCE here (via the guarded, `_safe`-

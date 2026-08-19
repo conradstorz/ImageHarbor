@@ -233,6 +233,63 @@ def test_post_settings_rejects_unknown_key(handler_cls, control: ControlPlane) -
 
 
 # ---------------------------------------------------------------------------
+# POST /api/settings -- IMPORTANT finding: multi-key requests must validate
+# every key before applying any of them (reproduced: an earlier `enrich`
+# key was persisted before a later, invalid `interval` key raised).
+# ---------------------------------------------------------------------------
+
+
+def test_post_settings_multi_key_failure_leaves_earlier_key_unchanged(
+    handler_cls, control: ControlPlane
+) -> None:
+    """`{"enrich": false, "interval": -5}` must 400 AND leave `enrich` untouched.
+
+    Dict (insertion) order puts the valid key first and the invalid key
+    second -- exactly the order that exposed the bug when keys were
+    validated and applied one at a time in the same loop.
+    """
+    assert control.enrich_enabled is True
+    assert control.interval == 300
+    status, _, _ = _dispatch_json(
+        handler_cls, "POST", "/api/settings", {"enrich": False, "interval": -5}
+    )
+    assert status == 400
+    # The store, not just the status code: `enrich` must not have been
+    # applied even though it appears before the bad `interval` key.
+    assert control.enrich_enabled is True
+    assert control.interval == 300
+
+
+def test_post_settings_multi_key_failure_other_key_order(
+    handler_cls, control: ControlPlane
+) -> None:
+    """Same as above with the keys reversed, so the test does not depend on
+    dict ordering -- the invalid key now comes first, the valid key second.
+    """
+    assert control.enrich_enabled is True
+    assert control.interval == 300
+    status, _, _ = _dispatch_json(
+        handler_cls, "POST", "/api/settings", {"interval": -5, "enrich": False}
+    )
+    assert status == 400
+    assert control.enrich_enabled is True
+    assert control.interval == 300
+
+
+def test_post_settings_valid_multi_key_request_applies_both(
+    handler_cls, control: ControlPlane
+) -> None:
+    status, _, body = _dispatch_json(
+        handler_cls, "POST", "/api/settings", {"enrich": False, "interval": 120}
+    )
+    assert status == 200
+    assert control.enrich_enabled is False
+    assert control.interval == 120
+    assert body["overrides"]["interval"]["overridden"] is True
+    assert body["overrides"]["enrich"]["overridden"] is True
+
+
+# ---------------------------------------------------------------------------
 # POST /api/settings -- CRITICAL finding #1: Infinity/-Infinity/NaN
 # ---------------------------------------------------------------------------
 #
