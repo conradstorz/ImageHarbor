@@ -674,10 +674,18 @@ class _Ingestor:
     ) -> None:
         """Record Google's metadata as provenance. None of it is load-bearing.
 
-        Google's document is stored VERBATIM under ``raw`` -- fields nobody
-        modelled here (``imageViews``, ``height``, ``width``, ...) and
-        anything Google adds later survive, because this never parses the
-        document into a bespoke shape; it only digests and stores it.
+        ``raw`` holds the PARSED document -- every field Google shipped,
+        including ones nobody modelled here (``imageViews``, ``height``,
+        ``width``, ...), so anything Google adds later survives with no code
+        change, because this never reshapes the document into a bespoke
+        model; it only parses and stores it. That parse (``_safe_json_loads``,
+        via ``bytes.decode(..., errors="replace")``) is not byte-for-byte --
+        whitespace, key order, and any non-UTF-8 byte are not preserved by
+        ``raw`` itself. ``digest`` is computed over the ORIGINAL bytes before
+        parsing, so a sidecar can always be tied back to the exact document
+        it came from. Byte-for-byte fidelity of the document itself lives
+        separately, in the provenance room (``provenance.preserve``), which
+        stores every non-media archive member unchanged.
 
         A sidecar failure must never fail an image that is already copied,
         verified, and catalogued.
