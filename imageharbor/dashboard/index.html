@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ImageHarbor Dashboard</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --border: #d8dbe0;
+    --text: #1b1e23;
+    --muted: #5b6270;
+    --ok: #1a7f37;
+    --warn: #b35c00;
+    --bad: #b3261e;
+    --accent: #2f5fd6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --panel: #1d2025;
+      --border: #33373f;
+      --text: #e7e9ec;
+      --muted: #9aa1ad;
+      --ok: #4fce76;
+      --warn: #e0a344;
+      --bad: #f0665f;
+      --accent: #7fa2ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+    padding: 0.9rem 1.25rem;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  header h1 { font-size: 1.05rem; margin: 0; font-weight: 600; }
+  .state-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-weight: 600;
+    padding: 0.25rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    font-size: 0.85rem;
+  }
+  .dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; display: inline-block; }
+  .dot.running, .dot.closed { background: var(--ok); }
+  .dot.pausing, .dot.half_open { background: var(--warn); }
+  .dot.paused, .dot.open { background: var(--muted); }
+  .dot.error { background: var(--bad); }
+  header .spacer { flex: 1; }
+  button {
+    font: inherit;
+    padding: 0.4rem 0.85rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  main {
+    padding: 1rem 1.25rem 3rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 1rem;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  section.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.15rem;
+  }
+  section.panel.wide { grid-column: 1 / -1; }
+  section.panel h2 {
+    margin: 0 0 0.75rem;
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  .kv-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 0.6rem 1rem;
+  }
+  .kv-grid .kv { display: flex; flex-direction: column; gap: 0.15rem; }
+  .kv .label { font-size: 0.75rem; color: var(--muted); }
+  .kv .value { font-size: 1.15rem; font-weight: 600; }
+  .kv .value.small { font-size: 0.95rem; font-weight: 500; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  table caption { text-align: left; font-weight: 600; margin-bottom: 0.4rem; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tier-tables { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
+  @media (max-width: 560px) { .tier-tables { grid-template-columns: 1fr; } }
+  .muted { color: var(--muted); }
+  .row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+  .override-warning {
+    font-size: 0.82rem;
+    color: var(--warn);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.35rem;
+    flex-wrap: wrap;
+  }
+  input[type=number] {
+    font: inherit;
+    width: 6rem;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+  }
+  .control-row { display: flex; align-items: center; gap: 0.75rem; margin: 0.4rem 0; flex-wrap: wrap; }
+  .status-badge {
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .status-badge.projected { color: var(--ok); border-color: var(--ok); }
+  .status-badge.stalled { color: var(--bad); border-color: var(--bad); }
+  .status-badge.complete { color: var(--accent); border-color: var(--accent); }
+  .status-badge.unknown { color: var(--muted); }
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.75rem;
+    padding: 1rem;
+  }
+  .error-banner {
+    display: none;
+    background: var(--bad);
+    color: #fff;
+    padding: 0.5rem 1.25rem;
+    font-size: 0.85rem;
+  }
+  .error-banner.visible { display: block; }
+</style>
+</head>
+<body>
+<div id="error-banner" class="error-banner"></div>
+<header>
+  <h1>ImageHarbor</h1>
+  <span id="state-pill" class="state-pill"><span class="dot" id="state-dot"></span><span id="state-text">loading…</span></span>
+  <span id="breaker-pill" class="state-pill"><span class="dot" id="breaker-dot"></span><span id="breaker-text">breaker —</span></span>
+  <span class="spacer"></span>
+  <button id="pause-btn" disabled>…</button>
+</header>
+
+<main>
+
+  <section class="panel">
+    <h2>Now</h2>
+    <div class="kv-grid">
+      <div class="kv"><span class="label">Phase</span><span class="value" id="now-phase">—</span></div>
+      <div class="kv"><span class="label">Next pass in</span><span class="value" id="now-next">—</span></div>
+      <div class="kv"><span class="label">Paused</span><span class="value" id="now-paused">—</span></div>
+      <div class="kv"><span class="label">Poll interval</span><span class="value" id="now-interval">—</span></div>
+    </div>
+    <p class="muted" id="now-last-run" style="margin-top:0.75rem;"></p>
+  </section>
+
+  <section class="panel">
+    <h2>Library</h2>
+    <div class="kv-grid">
+      <div class="kv"><span class="label">Photos</span><span class="value" id="lib-photos">—</span></div>
+      <div class="kv"><span class="label">Total size</span><span class="value" id="lib-bytes">—</span></div>
+      <div class="kv"><span class="label">Source paths</span><span class="value" id="lib-sources">—</span></div>
+      <div class="kv"><span class="label">Undated</span><span class="value" id="lib-undated">—</span></div>
+      <div class="kv"><span class="label">Duplicates collapsed</span><span class="value" id="lib-dupes">—</span></div>
+      <div class="kv"><span class="label">Bytes saved</span><span class="value" id="lib-saved">—</span></div>
+      <div class="kv"><span class="label">Enriched</span><span class="value" id="lib-enriched">—</span></div>
+      <div class="kv"><span class="label">Date range</span><span class="value small" id="lib-range">—</span></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Projection</h2>
+    <div class="kv-grid">
+      <div class="kv"><span class="label">Backlog</span><span class="value" id="proj-backlog">—</span></div>
+      <div class="kv"><span class="label">Recent rate</span><span class="value" id="proj-rate">—</span></div>
+      <div class="kv"><span class="label">Projected complete</span><span class="value" id="proj-eta">—</span></div>
+    </div>
+    <p style="margin-top:0.6rem;">
+      <span class="status-badge" id="proj-status">—</span>
+      <span class="muted" id="proj-reason"></span>
+    </p>
+  </section>
+
+  <section class="panel wide">
+    <h2>Evidence quality</h2>
+    <div class="tier-tables">
+      <table>
+        <caption>Date tier</caption>
+        <thead><tr><th>Source</th><th class="num">Count</th></tr></thead>
+        <tbody id="date-tier-body"><tr><td colspan="2" class="muted">loading…</td></tr></tbody>
+      </table>
+      <table>
+        <caption>Descriptor tier</caption>
+        <thead><tr><th>Source</th><th class="num">Count</th></tr></thead>
+        <tbody id="descriptor-tier-body"><tr><td colspan="2" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Queues</h2>
+    <div class="kv-grid">
+      <div class="kv"><span class="label">Unenriched</span><span class="value" id="q-unenriched">—</span></div>
+      <div class="kv"><span class="label">Quarantined</span><span class="value" id="q-quarantined">—</span></div>
+      <div class="kv"><span class="label">Failed (active)</span><span class="value" id="q-failed">—</span></div>
+      <div class="kv"><span class="label">Takeout pending</span><span class="value" id="q-takeout">—</span></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>History</h2>
+    <div class="kv-grid">
+      <div class="kv"><span class="label">Passes (24h)</span><span class="value" id="hist-passes-24h">—</span></div>
+      <div class="kv"><span class="label">Copied (24h)</span><span class="value" id="hist-copied-24h">—</span></div>
+      <div class="kv"><span class="label">Errors (24h)</span><span class="value" id="hist-errors-24h">—</span></div>
+      <div class="kv"><span class="label">Passes (30d)</span><span class="value" id="hist-passes-30d">—</span></div>
+    </div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Settings</h2>
+    <div class="control-row">
+      <label for="interval-input">Poll interval (sec)</label>
+      <input type="number" id="interval-input" min="1" step="1">
+      <button id="interval-apply">Apply</button>
+      <span id="interval-override" class="override-warning" style="display:none;"></span>
+    </div>
+    <div class="control-row">
+      <label><input type="checkbox" id="enrich-toggle"> AI enrichment enabled</label>
+      <span id="enrich-override" class="override-warning" style="display:none;"></span>
+    </div>
+  </section>
+
+</main>
+
+<footer>Polling /api/stats every 5s. No authentication -- see the design doc's Non-goals.</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  const POLL_MS = 5000;
+  const $ = (id) => document.getElementById(id);
+
+  function fmtBytes(n) {
+    if (typeof n !== "number") return "—";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let v = n, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(i === 0 ? 0 : 1) + " " + units[i];
+  }
+
+  function fmtSeconds(s) {
+    if (typeof s !== "number") return "—";
+    if (s < 60) return Math.round(s) + "s";
+    if (s < 3600) return Math.round(s / 60) + "m";
+    return (s / 3600).toFixed(1) + "h";
+  }
+
+  function fmtEta(seconds) {
+    if (typeof seconds !== "number") return "—";
+    const when = new Date(Date.now() + seconds * 1000);
+    return fmtSeconds(seconds) + " (~" + when.toLocaleString() + ")";
+  }
+
+  function showError(msg) {
+    const el = $("error-banner");
+    if (msg) {
+      el.textContent = msg;
+      el.classList.add("visible");
+    } else {
+      el.classList.remove("visible");
+    }
+  }
+
+  function renderNow(now) {
+    const stateText = $("state-text");
+    const stateDot = $("state-dot");
+    if (!now) {
+      stateText.textContent = "unavailable";
+      stateDot.className = "dot error";
+      $("pause-btn").disabled = true;
+      return;
+    }
+    const labels = { running: "RUNNING", pausing: "PAUSING…", paused: "PAUSED" };
+    stateText.textContent = labels[now.state] || now.state || "—";
+    stateDot.className = "dot " + (now.state || "");
+
+    const breakerText = $("breaker-text");
+    const breakerDot = $("breaker-dot");
+    const b = now.breaker || {};
+    if (b.state) {
+      breakerText.textContent = "breaker " + b.state;
+      breakerDot.className = "dot " + b.state.toLowerCase();
+    } else {
+      breakerText.textContent = "breaker n/a";
+      breakerDot.className = "dot";
+    }
+
+    $("now-phase").textContent = now.phase || "idle";
+    $("now-next").textContent = now.paused ? "—" : fmtSeconds(now.next_pass_seconds);
+    $("now-paused").textContent = now.paused ? "yes" : "no";
+    $("now-interval").textContent = fmtSeconds(now.interval);
+
+    const lastRunEl = $("now-last-run");
+    if (now.last_run) {
+      const r = now.last_run;
+      lastRunEl.textContent =
+        "last pass (" + r.kind + "): " + (r.copied || 0) + " copied · " +
+        (r.duplicates || 0) + " duplicates · " + (r.errors || 0) + " errors · " +
+        (r.enriched || 0) + " enriched";
+    } else {
+      lastRunEl.textContent = "no completed pass yet";
+    }
+
+    const pauseBtn = $("pause-btn");
+    pauseBtn.disabled = false;
+    if (now.paused) {
+      pauseBtn.textContent = "Resume";
+      pauseBtn.dataset.target = "false";
+    } else {
+      pauseBtn.textContent = "Pause";
+      pauseBtn.dataset.target = "true";
+    }
+  }
+
+  function renderLibrary(lib) {
+    if (!lib) {
+      ["lib-photos", "lib-bytes", "lib-sources", "lib-undated", "lib-dupes",
+       "lib-saved", "lib-enriched", "lib-range"].forEach((id) => { $(id).textContent = "unavailable"; });
+      return;
+    }
+    $("lib-photos").textContent = lib.total_photos;
+    $("lib-bytes").textContent = fmtBytes(lib.total_bytes);
+    $("lib-sources").textContent = lib.distinct_source_paths;
+    $("lib-undated").textContent = lib.undated_count;
+    $("lib-dupes").textContent = lib.duplicates_collapsed;
+    $("lib-saved").textContent = fmtBytes(lib.bytes_saved);
+    $("lib-enriched").textContent = lib.enriched_count + " / " + (lib.enriched_count + lib.unenriched_count);
+    const dr = lib.date_range || {};
+    $("lib-range").textContent = (dr.earliest || "?") + " – " + (dr.latest || "?");
+  }
+
+  function renderEvidence(evidence) {
+    const dateBody = $("date-tier-body");
+    const descBody = $("descriptor-tier-body");
+    if (!evidence) {
+      dateBody.innerHTML = '<tr><td colspan="2" class="muted">unavailable</td></tr>';
+      descBody.innerHTML = '<tr><td colspan="2" class="muted">unavailable</td></tr>';
+      return;
+    }
+    const rowsFor = (list) => list.map((t) =>
+      "<tr><td>" + t.source + "</td><td class=\"num\">" + t.count + "</td></tr>"
+    ).join("");
+    dateBody.innerHTML = rowsFor(evidence.date_tiers || []) || '<tr><td colspan="2" class="muted">none</td></tr>';
+    descBody.innerHTML = rowsFor(evidence.descriptor_tiers || []) || '<tr><td colspan="2" class="muted">none</td></tr>';
+  }
+
+  function renderQueues(queues) {
+    if (!queues) {
+      ["q-unenriched", "q-quarantined", "q-failed", "q-takeout"].forEach((id) => { $(id).textContent = "unavailable"; });
+      return;
+    }
+    $("q-unenriched").textContent = queues.unenriched_count;
+    $("q-quarantined").textContent = queues.quarantined_count;
+    $("q-failed").textContent = queues.failed_active_count;
+    $("q-takeout").textContent = queues.takeout_pending;
+  }
+
+  function renderHistory(history) {
+    if (!history) {
+      ["hist-passes-24h", "hist-copied-24h", "hist-errors-24h", "hist-passes-30d"].forEach((id) => { $(id).textContent = "unavailable"; });
+      return;
+    }
+    const d = history.last_24h || {};
+    const d30 = history.last_30d || {};
+    $("hist-passes-24h").textContent = d.passes ?? "—";
+    $("hist-copied-24h").textContent = d.copied ?? "—";
+    $("hist-errors-24h").textContent = d.errors ?? "—";
+    $("hist-passes-30d").textContent = d30.passes ?? "—";
+  }
+
+  function renderProjection(projection) {
+    const statusEl = $("proj-status");
+    if (!projection) {
+      $("proj-backlog").textContent = "—";
+      $("proj-rate").textContent = "—";
+      $("proj-eta").textContent = "—";
+      statusEl.textContent = "unavailable";
+      statusEl.className = "status-badge unknown";
+      $("proj-reason").textContent = "";
+      return;
+    }
+    $("proj-backlog").textContent = projection.backlog + " photos";
+    $("proj-rate").textContent = projection.rate_per_hour != null
+      ? projection.rate_per_hour.toFixed(1) + "/hour" : "—";
+    $("proj-eta").textContent = projection.eta_seconds != null ? fmtEta(projection.eta_seconds) : "—";
+    statusEl.textContent = (projection.status || "unknown").toUpperCase();
+    statusEl.className = "status-badge " + (projection.status || "unknown");
+    $("proj-reason").textContent = projection.reason || "";
+  }
+
+  function renderOverrideRow(key, inputId, overrideId, overrides, fmt) {
+    const info = overrides && overrides[key];
+    const input = $(inputId);
+    const warn = $(overrideId);
+    if (!info) {
+      warn.style.display = "none";
+      return;
+    }
+    if (document.activeElement !== input) {
+      if (input.type === "checkbox") { input.checked = !!info.value; }
+      else { input.value = info.value; }
+    }
+    if (info.overridden) {
+      warn.style.display = "";
+      warn.innerHTML = "&#9888; overriding config value " + fmt(info.env_value) +
+        ' <button class="revert-btn" data-key="' + key + '">Revert to config</button>';
+    } else {
+      warn.style.display = "none";
+    }
+  }
+
+  function renderOverrides(overrides) {
+    renderOverrideRow("interval", "interval-input", "interval-override", overrides, (v) => v + "s");
+    renderOverrideRow("enrich", "enrich-toggle", "enrich-override", overrides, (v) => (v ? "on" : "off"));
+  }
+
+  function render(doc) {
+    renderNow(doc.now);
+    renderLibrary(doc.library);
+    renderEvidence(doc.evidence);
+    renderQueues(doc.queues);
+    renderHistory(doc.history);
+    renderProjection(doc.projection);
+    renderOverrides(doc.overrides);
+  }
+
+  async function postJSON(url, body) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = (await resp.json()).error || ""; } catch (e) { /* ignore */ }
+      throw new Error("request failed (" + resp.status + ") " + detail);
+    }
+    return resp.json();
+  }
+
+  async function tick() {
+    try {
+      const resp = await fetch("/api/stats");
+      if (!resp.ok) throw new Error("stats fetch failed: " + resp.status);
+      const doc = await resp.json();
+      render(doc);
+      showError(null);
+    } catch (err) {
+      showError("Could not refresh: " + err.message);
+    }
+  }
+
+  $("pause-btn").addEventListener("click", async () => {
+    const target = $("pause-btn").dataset.target === "true";
+    try {
+      await postJSON("/api/pause", { paused: target });
+    } catch (err) {
+      showError(err.message);
+    }
+    tick();
+  });
+
+  $("interval-apply").addEventListener("click", async () => {
+    const value = Number($("interval-input").value);
+    try {
+      await postJSON("/api/settings", { interval: value });
+    } catch (err) {
+      showError(err.message);
+    }
+    tick();
+  });
+
+  $("enrich-toggle").addEventListener("change", async (e) => {
+    try {
+      await postJSON("/api/settings", { enrich: e.target.checked });
+    } catch (err) {
+      showError(err.message);
+    }
+    tick();
+  });
+
+  document.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".revert-btn");
+    if (!btn) return;
+    try {
+      await postJSON("/api/settings/revert", { key: btn.dataset.key });
+    } catch (err) {
+      showError(err.message);
+    }
+    tick();
+  });
+
+  tick();
+  setInterval(tick, POLL_MS);
+})();
+</script>
+</body>
+</html>
