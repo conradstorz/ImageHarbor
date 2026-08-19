@@ -409,6 +409,51 @@ def test_iter_unenriched_respects_limit(tmp_path):
         assert len(cat.iter_unenriched(limit=2)) == 2
 
 
+# ---------------------------------------------------------------------------
+# count_unenriched -- IMPORTANT finding #5
+# ---------------------------------------------------------------------------
+
+
+def test_count_unenriched_matches_len_of_iter_unenriched(tmp_path):
+    """`count_unenriched()` (a real `COUNT(*)`) must agree with
+    `len(iter_unenriched())` in every case the row-fetching version covers --
+    see `Catalog.count_unenriched`'s docstring on why the WHERE clause is
+    kept byte-for-byte identical rather than hand-duplicated.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        for i in range(5):
+            cat.upsert(
+                sha256_b64url=f"D{i}",
+                original_path=f"/{i}.jpg",
+                organized_path=f"/lib/{i}.jpg",
+            )
+        assert cat.count_unenriched() == len(cat.iter_unenriched()) == 5
+
+        cat.mark_enriched(
+            "D0", pcs_primary="330", pcs_name="beach", secondary_tags=[],
+            ai_caption="", objects=[], ocr_text="", model_version="stub",
+        )
+        assert cat.count_unenriched() == len(cat.iter_unenriched()) == 4
+
+
+def test_count_unenriched_excludes_quarantined_content(tmp_path):
+    """Same exclusion `iter_unenriched_excludes_quarantined_content` pins,
+    for the COUNT(*) version -- a quarantined digest must not be counted."""
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        assert cat.count_unenriched() == 1
+
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")
+        cat.quarantine_file("/a.jpg")
+
+        assert cat.count_unenriched() == 0
+
+
 def test_iter_unenriched_excludes_quarantined_content(tmp_path):
     """Quarantine means "stop asking the model", so the row leaves the queue.
 

@@ -100,28 +100,64 @@ def _now_section(
 ) -> dict:
     """Running/paused/phase/breaker/next-pass, per the design's "Now" panel.
 
-    ``current_run`` is the most recent run row with ``ended_at IS NULL`` (a
-    pass in flight, or one a crash left behind); ``last_run`` is the most
-    recent row that finished. Both are ``None`` -- distinctly, not ``{}`` --
-    when no such row exists yet (e.g. a brand-new catalog that has never run
-    a pass).
+    ``current_run`` is the most recent run row with ``ended_at IS NULL``
+    THAT THIS PROCESS ITSELF STARTED (``Catalog.run_started_by_this_process``
+    -- see its docstring); ``last_run`` is the most recent row that finished.
+    Both are ``None`` -- distinctly, not ``{}`` -- when no such row exists
+    yet (e.g. a brand-new catalog that has never run a pass).
+
+    IMPORTANT finding #4 (2026-08-19 whole-branch review): ``current_run``
+    used to be simply "the most recent row with ``ended_at IS NULL``",
+    including one a crash left behind. `docker-compose.yml` has no
+    `stop_grace_period`, so Docker's 10s default can SIGKILL a facts pass
+    mid-copy over a large CIFS mount -- and `run_once`'s `finally` (which
+    always closes a row, even on an in-process exception) never runs at all
+    when the whole process is killed, leaving that row open forever. After a
+    restart, the NEW process reading that same catalog would previously
+    treat that orphaned row as "the current in-flight pass" -- and if
+    `paused` also happened to be persisted `True` (so the new process's
+    `watch()` loop never starts a pass at all, per `ControlPlane`'s
+    restart-durable pause), the page was PINNED at "PAUSING…" forever,
+    because nothing this process ever does can make that stale row's
+    `ended_at` stop being NULL. Restricting `current_run` to a row this
+    process itself started (tracked in-memory since `Catalog.__init__`,
+    never persisted) fixes that: a genuinely live pass is always this
+    process's own, so `current_run` can never be a stale orphan. Any OTHER
+    unfinished row is now explicitly surfaced as ``crashed_runs`` below,
+    instead of the two "unfinished_runs() is implemented and tested but
+    called from nowhere in production" and "the documented crash signal
+    never appears" complaints this finding also raised.
     """
     recent = catalog.recent_runs(limit=5)
     current_run: dict | None = None
     last_run: dict | None = None
     for row in recent:
-        if row["ended_at"] is None and current_run is None:
+        if (
+            row["ended_at"] is None
+            and current_run is None
+            and catalog.run_started_by_this_process(row["id"])
+        ):
             current_run = dict(row)
         elif row["ended_at"] is not None and last_run is None:
             last_run = dict(row)
         if current_run is not None and last_run is not None:
             break
 
+    # Any unfinished row that is not the (now correctly identified)
+    # in-flight pass is a died-mid-pass leftover from a previous process --
+    # see the docstring above. `unfinished_runs()` is unlimited (unlike the
+    # `recent_runs(limit=5)` window above), because a stale row can be
+    # arbitrarily old once the watcher has been paused since the crash.
+    current_id = current_run["id"] if current_run is not None else None
+    crashed_runs = [dict(r) for r in catalog.unfinished_runs() if r["id"] != current_id]
+
     paused = control.paused
     if paused:
         # Pause takes effect at the next file boundary (see the design's
         # "Pause semantics"), so a still-in-flight run while paused IS the
-        # "finishing up" state the UI calls PAUSING.
+        # "finishing up" state the UI calls PAUSING. `current_run` is now
+        # never a stale orphan (see above), so this can no longer stay
+        # "pausing" forever after a restart.
         state = "pausing" if current_run is not None else "paused"
     else:
         state = "running"
@@ -155,6 +191,7 @@ def _now_section(
         "phase": phase,
         "current_run": current_run,
         "last_run": last_run,
+        "crashed_runs": crashed_runs,
         "breaker": breaker_info,
         "next_pass_seconds": next_pass_seconds,
         "interval": control.interval,
@@ -182,46 +219,56 @@ def _library_section(catalog: Catalog) -> dict:
     addressing guarantees every source row for one digest has the same size,
     so ``MIN(size)`` per digest reads the library's actual (deduplicated)
     byte total, not a sum across duplicate copies.
+
+    CRITICAL finding #2 (2026-08-19 whole-branch review): this section
+    reaches ``catalog._conn`` directly for aggregate SQL that has no
+    ``Catalog`` wrapper method, so the whole block runs under
+    ``catalog.lock`` -- the same lock every guarded ``Catalog`` method takes
+    -- rather than racing the watcher's writes on the shared connection.
+    ``catalog.count()`` below is itself lock-guarded; ``catalog.lock`` is an
+    ``RLock`` precisely so a guarded method can be called from inside a
+    block that already holds it, from the same thread, without deadlocking.
     """
-    conn = catalog._conn
-    total_photos = catalog.count()
+    with catalog.lock:
+        conn = catalog._conn
+        total_photos = catalog.count()
 
-    rows = conn.execute(
-        """
-        SELECT p.sha256_b64url AS digest, COUNT(s.source_path) AS n, MIN(s.size) AS sz
-        FROM photos p
-        JOIN sources s ON s.sha256_b64url = p.sha256_b64url
-        WHERE p.organized_path IS NOT NULL
-        GROUP BY p.sha256_b64url
-        """
-    ).fetchall()
-    total_bytes = sum((r["sz"] or 0) for r in rows)
-    duplicates_collapsed = sum(max(0, r["n"] - 1) for r in rows)
-    bytes_saved = sum(max(0, r["n"] - 1) * (r["sz"] or 0) for r in rows)
+        rows = conn.execute(
+            """
+            SELECT p.sha256_b64url AS digest, COUNT(s.source_path) AS n, MIN(s.size) AS sz
+            FROM photos p
+            JOIN sources s ON s.sha256_b64url = p.sha256_b64url
+            WHERE p.organized_path IS NOT NULL
+            GROUP BY p.sha256_b64url
+            """
+        ).fetchall()
+        total_bytes = sum((r["sz"] or 0) for r in rows)
+        duplicates_collapsed = sum(max(0, r["n"] - 1) for r in rows)
+        bytes_saved = sum(max(0, r["n"] - 1) * (r["sz"] or 0) for r in rows)
 
-    distinct_source_paths = conn.execute(
-        "SELECT COUNT(DISTINCT source_path) AS n FROM sources"
-    ).fetchone()["n"]
+        distinct_source_paths = conn.execute(
+            "SELECT COUNT(DISTINCT source_path) AS n FROM sources"
+        ).fetchone()["n"]
 
-    date_range = conn.execute(
-        "SELECT MIN(date_value) AS mn, MAX(date_value) AS mx FROM photos "
-        "WHERE organized_path IS NOT NULL AND date_value IS NOT NULL"
-    ).fetchone()
+        date_range = conn.execute(
+            "SELECT MIN(date_value) AS mn, MAX(date_value) AS mx FROM photos "
+            "WHERE organized_path IS NOT NULL AND date_value IS NOT NULL"
+        ).fetchone()
 
-    undated_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
-        "AND date_tier = ?",
-        (tiers.DATE_NONE,),
-    ).fetchone()["n"]
+        undated_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
+            "AND date_tier = ?",
+            (tiers.DATE_NONE,),
+        ).fetchone()["n"]
 
-    enriched_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
-        "AND enriched_at IS NOT NULL"
-    ).fetchone()["n"]
-    unenriched_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
-        "AND enriched_at IS NULL"
-    ).fetchone()["n"]
+        enriched_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
+            "AND enriched_at IS NOT NULL"
+        ).fetchone()["n"]
+        unenriched_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
+            "AND enriched_at IS NULL"
+        ).fetchone()["n"]
 
     return {
         "total_photos": total_photos,
@@ -250,22 +297,27 @@ def _evidence_section(catalog: Catalog) -> dict:
     -- an absent key would be indistinguishable from "this section could not
     be queried", which `collect()` already represents a different way (the
     whole section is `None`).
+
+    CRITICAL finding #2: raw ``catalog._conn`` access, same as
+    `_library_section` above -- guarded by ``catalog.lock`` for the same
+    reason.
     """
-    conn = catalog._conn
-    date_counts = {
-        row["date_tier"]: row["n"]
-        for row in conn.execute(
-            "SELECT date_tier, COUNT(*) AS n FROM photos "
-            "WHERE organized_path IS NOT NULL GROUP BY date_tier"
-        )
-    }
-    descriptor_counts = {
-        row["descriptor_tier"]: row["n"]
-        for row in conn.execute(
-            "SELECT descriptor_tier, COUNT(*) AS n FROM photos "
-            "WHERE organized_path IS NOT NULL GROUP BY descriptor_tier"
-        )
-    }
+    with catalog.lock:
+        conn = catalog._conn
+        date_counts = {
+            row["date_tier"]: row["n"]
+            for row in conn.execute(
+                "SELECT date_tier, COUNT(*) AS n FROM photos "
+                "WHERE organized_path IS NOT NULL GROUP BY date_tier"
+            )
+        }
+        descriptor_counts = {
+            row["descriptor_tier"]: row["n"]
+            for row in conn.execute(
+                "SELECT descriptor_tier, COUNT(*) AS n FROM photos "
+                "WHERE organized_path IS NOT NULL GROUP BY descriptor_tier"
+            )
+        }
 
     date_tiers = [
         {"tier": t, "source": tiers.DATE_SOURCE_NAMES[t], "count": date_counts.get(t, 0)}
@@ -287,31 +339,39 @@ def _evidence_section(catalog: Catalog) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _queues_section(catalog: Catalog) -> dict:
+def _queues_section(catalog: Catalog, unenriched_count: int | None) -> dict:
     """Unenriched, quarantined (with reasons), failed-but-not-yet-quarantined,
     and pending Takeout members.
 
-    ``unenriched_count`` reuses ``Catalog.iter_unenriched`` rather than a
-    hand-duplicated COUNT query, deliberately: that method's exclusion join
-    (quarantine correlated on `(source_path, size, mtime_ns)`, see its own
-    docstring) is exactly the definition of "still in the queue", and
-    duplicating it here would risk the same kind of silent drift the
-    project's CLAUDE.md already warns about for the digest-parsing logic.
+    ``unenriched_count`` is passed in, already computed once by `collect()`
+    via `Catalog.count_unenriched()` -- see that method's docstring (IMPORTANT
+    finding #5, 2026-08-19 whole-branch review) for why this section no
+    longer runs its own `len(catalog.iter_unenriched())` (a `SELECT *` that
+    fetched and discarded every row just to count them, duplicated with
+    `_projection_section`'s identical call) and why the value can be `None`
+    (the precomputing call itself failed) rather than crashing this section.
+
+    This module's raw-SQL queries below acquire ``catalog.lock`` around the
+    whole block (see CRITICAL finding #2): `dashboard/stats.py` reaches
+    `catalog._conn` directly for aggregate SQL that has no `Catalog` wrapper
+    method, so it must take the same lock every guarded `Catalog` method
+    takes internally, or these queries would race the watcher's writes on
+    the shared connection exactly like the wrapped methods used to before
+    the lock existed.
     """
-    conn = catalog._conn
-    unenriched_count = len(catalog.iter_unenriched())
+    with catalog.lock:
+        conn = catalog._conn
+        quarantined_rows = conn.execute(
+            "SELECT source_path, last_error, fail_count, first_failed_at, last_failed_at "
+            "FROM failed_files WHERE quarantined = 1 ORDER BY last_failed_at DESC"
+        ).fetchall()
+        quarantined = [dict(r) for r in quarantined_rows]
 
-    quarantined_rows = conn.execute(
-        "SELECT source_path, last_error, fail_count, first_failed_at, last_failed_at "
-        "FROM failed_files WHERE quarantined = 1 ORDER BY last_failed_at DESC"
-    ).fetchall()
-    quarantined = [dict(r) for r in quarantined_rows]
-
-    failed_active_rows = conn.execute(
-        "SELECT source_path, last_error, fail_count, first_failed_at, last_failed_at "
-        "FROM failed_files WHERE quarantined = 0 ORDER BY last_failed_at DESC"
-    ).fetchall()
-    failed_active = [dict(r) for r in failed_active_rows]
+        failed_active_rows = conn.execute(
+            "SELECT source_path, last_error, fail_count, first_failed_at, last_failed_at "
+            "FROM failed_files WHERE quarantined = 0 ORDER BY last_failed_at DESC"
+        ).fetchall()
+        failed_active = [dict(r) for r in failed_active_rows]
 
     takeout = catalog.takeout_status_counts()
     takeout_pending = takeout.get("members", {}).get("pending", 0)
@@ -386,13 +446,26 @@ def _projection_section(
     control: ControlPlane,
     breaker: CircuitBreaker | None,
     now: datetime,
+    unenriched_count: int | None,
 ) -> dict:
     """Wrap `dashboard/projections.project` with this catalog's live inputs.
 
-    The backlog is recomputed here (not read from an already-collected
-    `queues` section) so this section can succeed or fail entirely
-    independently of `queues` -- one failing section must never take another
-    down with it.
+    ``unenriched_count`` is passed in from `collect()` (IMPORTANT finding
+    #5): both this section and `_queues_section` need the same backlog
+    count, and each independently running `len(catalog.iter_unenriched())`
+    -- a `SELECT *` fetching and discarding every row just to count them --
+    measured 0.32s per call at 15k photos, linear, TWICE per `/api/stats`
+    poll, on the connection the watcher writes through. `collect()` now
+    computes it once via `Catalog.count_unenriched()` (a real `COUNT(*)`)
+    and passes the result to both. `None` here means that single
+    precomputation failed -- `projections.project`'s own `_parse_backlog`
+    already treats an unreadable backlog as `STATUS_UNKNOWN` rather than
+    crashing (see its docstring), so this section stays exactly as safe as
+    it was when it queried independently -- it just no longer queries
+    independently. A previously-failing `queues` section can therefore no
+    longer take `projection` down with it (nor vice versa): both read the
+    same precomputed, already-`_safe`-guarded value, so one query failure
+    degrades both sections identically instead of one crashing.
 
     `stale_after_seconds` is deliberately NOT `projections.DEFAULT_STALE_AFTER_SECONDS`
     (one day): that default assumes at most about one pass a day is normal,
@@ -404,7 +477,6 @@ def _projection_section(
     (e.g. 30s in a test or a very chatty deployment) doesn't flag ordinary
     single-pass jitter as staleness.
     """
-    backlog = len(catalog.iter_unenriched())
     # `projections._parse_run` requires `isinstance(run, Mapping)` to accept a
     # row as readable -- and `sqlite3.Row` deliberately does NOT satisfy
     # `Mapping` (it supports index/name lookup but not the full Mapping
@@ -413,13 +485,29 @@ def _projection_section(
     # "valid value silently treated as unreadable" failure mode this
     # project's CLAUDE.md warns about, so the rows are converted to plain
     # dicts here before reaching `project()`.
-    runs = [dict(r) for r in catalog.recent_runs(limit=_HISTORY_RUN_LIMIT)]
+    #
+    # IMPORTANT finding #3 (2026-08-19 whole-branch review): filtered to
+    # `kind == "enrich"` ONLY. `run_once` (watcher.py) writes one 'facts' row
+    # and, when it runs, one 'enrich' row per pass -- and a 'facts' row
+    # ALWAYS has `enriched == 0` (the facts phase makes no AI calls and never
+    # enriches anything), so mixing the two kinds into one rate sample feeds
+    # `projections.project` a valid-looking `0.0/hr` sample for every facts
+    # pass under a second, which drags `statistics.median_low` straight to
+    # zero -- reported "stalled" on every healthy deployment with a
+    # sub-second facts pass (i.e. most real ones), even while enrichment is
+    # actively working through a real backlog at a real rate. A facts pass
+    # is not a slow enrichment pass; it is a different measurement of a
+    # different phase, and averaging them together does not produce a
+    # meaningful rate, it destroys the only one that exists.
+    runs = [
+        dict(r) for r in catalog.recent_runs(limit=_HISTORY_RUN_LIMIT) if r["kind"] == "enrich"
+    ]
     breaker_open = breaker.is_open() if breaker is not None else False
     stale_after_seconds = max(4 * control.interval, 3600.0)
 
     result = projections.project(
         runs,
-        backlog,
+        unenriched_count,
         breaker_open=breaker_open,
         paused=control.paused,
         now=now,
@@ -467,17 +555,28 @@ def collect(
     logs and reports that section as `None` rather than failing the whole
     document. See the module docstring for the reasoning and for why no lock
     or transaction is taken here.
+
+    IMPORTANT finding #5 (2026-08-19 whole-branch review): the unenriched
+    backlog count is computed exactly ONCE here (via the guarded, `_safe`-
+    wrapped `Catalog.count_unenriched()`, a real `COUNT(*)`) and handed to
+    both `_queues_section` and `_projection_section`, which previously each
+    ran their own `len(catalog.iter_unenriched())` -- a `SELECT *` fetching
+    and discarding every row just to count them. `None` (the precomputation
+    itself failed) is a legitimate value for both sections to receive; see
+    each section's own docstring for how it stays safe on that input.
     """
     resolved_now = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    unenriched_count = _safe("unenriched_count", catalog.count_unenriched)
 
     return {
         "now": _safe("now", _now_section, catalog, control, breaker, resolved_now),
         "library": _safe("library", _library_section, catalog),
         "evidence": _safe("evidence", _evidence_section, catalog),
-        "queues": _safe("queues", _queues_section, catalog),
+        "queues": _safe("queues", _queues_section, catalog, unenriched_count),
         "history": _safe("history", _history_section, catalog, resolved_now),
         "projection": _safe(
-            "projection", _projection_section, catalog, control, breaker, resolved_now
+            "projection", _projection_section, catalog, control, breaker,
+            resolved_now, unenriched_count,
         ),
         "overrides": _safe("overrides", _overrides_section, control),
     }

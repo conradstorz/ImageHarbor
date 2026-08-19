@@ -315,6 +315,67 @@ def test_now_section_pausing_when_paused_mid_run(
 
 
 # ---------------------------------------------------------------------------
+# Now: died-mid-pass rows -- IMPORTANT finding #4
+# ---------------------------------------------------------------------------
+
+
+def test_crashed_runs_surfaces_an_orphaned_open_row_from_a_previous_process(
+    tmp_path: Path,
+) -> None:
+    """`unfinished_runs()` was implemented and tested but never called from
+    production code, so a died-mid-pass row (Docker SIGKILL mid-copy, no
+    `stop_grace_period`) was invisible. Simulated here by opening a SECOND
+    `Catalog` on the same file, mirroring a container restart after a crash
+    left a `runs` row open: the row exists in the database, but this new
+    process never itself called `run_start` for it.
+    """
+    db = tmp_path / "c.db"
+    dead = Catalog(db)
+    dead_run_id = dead.run_start("facts")  # never finished: the process "dies" here
+    dead.close()
+
+    live = Catalog(db)
+    try:
+        control = ControlPlane(live, env_interval=300, env_enrich=True)
+        doc = stats.collect(live, control, now=datetime.now(timezone.utc))
+        now_section = doc["now"]
+
+        assert now_section["current_run"] is None  # not mistaken for the live pass
+        assert [r["id"] for r in now_section["crashed_runs"]] == [dead_run_id]
+        assert now_section["state"] == "running"  # not paused, so just "running"
+    finally:
+        live.close()
+
+
+def test_now_section_does_not_stay_pausing_forever_after_a_restart(
+    tmp_path: Path,
+) -> None:
+    """The specific symptom finding #4 called out: `paused` persisted across
+    a restart (see `ControlPlane`'s restart-durable pause), a crash left a
+    `runs` row open, and the OLD code treated that orphaned row as "the
+    current in-flight pass" -- pinning the page at PAUSING... forever, since
+    nothing the new process does can ever close a row it never opened.
+    """
+    db = tmp_path / "c.db"
+    dead = Catalog(db)
+    ControlPlane(dead, env_interval=300, env_enrich=True).set_paused(True)
+    dead.run_start("facts")  # crash mid-pass: this row never closes
+    dead.close()
+
+    live = Catalog(db)
+    try:
+        control = ControlPlane(live, env_interval=300, env_enrich=True)
+        assert control.paused is True  # pause survived the "restart"
+
+        doc = stats.collect(live, control, now=datetime.now(timezone.utc))
+        assert doc["now"]["state"] == "paused"  # NOT stuck at "pausing" forever
+        assert doc["now"]["current_run"] is None
+        assert len(doc["now"]["crashed_runs"]) == 1
+    finally:
+        live.close()
+
+
+# ---------------------------------------------------------------------------
 # Projection
 # ---------------------------------------------------------------------------
 
@@ -370,6 +431,114 @@ def test_projection_staleness_window_derives_from_poll_interval(
 
     assert doc["projection"]["status"] == "stalled"
     assert "ended" in doc["projection"]["reason"]
+
+
+def test_projection_at_stats_collect_level_ignores_mixed_facts_rows(
+    catalog: Catalog, control: ControlPlane
+) -> None:
+    """IMPORTANT finding #3, asserted at the `stats.collect` level -- the
+    layer where it was actually missing. `projections.project` itself was
+    already correct in isolation (filtering to enrich-only rows there showed
+    'projected' at 600/hr); the bug was that `_projection_section` passed
+    BOTH 'facts' and 'enrich' rows through. A 'facts' row always has
+    `enriched == 0`, so every sub-second facts pass contributes a valid-
+    looking `0.0/hr` sample, dragging `statistics.median_low` to zero --
+    'stalled' on every healthy deployment.
+
+    Six healthy passes: a 'facts' row (enriched=0, exactly what a real facts
+    pass looks like) immediately followed by a 1-minute 'enrich' row that
+    enriched 10 photos (600/hr), against a 400-photo backlog. The facts row
+    duration is deliberately >= `projections.MIN_PASS_SECONDS` (2s, not the
+    sub-second duration a facts pass often has in practice) -- a sub-second
+    facts row would be filtered out by the *unrelated* MIN_PASS_SECONDS
+    floor regardless of kind, which is exactly how the original finding
+    slipped past both live tests undetected (see the finding text: "Neither
+    live test could catch it: one had a zero backlog, the other's facts pass
+    was sub-second so the zeros were filtered by MIN_PASS_SECONDS"). Using a
+    duration at or above that floor is what makes this test actually
+    exercise the kind filter rather than accidentally passing for the wrong
+    reason.
+    """
+    now = datetime.now(timezone.utc)
+    cursor_time = now - timedelta(minutes=30)
+    for _ in range(6):
+        facts_start = cursor_time
+        facts_end = facts_start + timedelta(seconds=2)
+        facts_id = catalog.run_start("facts")
+        catalog.run_finish(
+            facts_id, scanned=5, copied=0, duplicates=0, errors=0,
+            enriched=0, enrich_failed=0, breaker_state="CLOSED", paused=False,
+        )
+        catalog._conn.execute(
+            "UPDATE runs SET started_at=?, ended_at=? WHERE id=?",
+            (facts_start.isoformat(), facts_end.isoformat(), facts_id),
+        )
+
+        enrich_start = facts_end
+        enrich_end = enrich_start + timedelta(minutes=1)
+        enrich_id = catalog.run_start("enrich")
+        catalog.run_finish(
+            enrich_id, scanned=10, copied=0, duplicates=0, errors=0,
+            enriched=10, enrich_failed=0, breaker_state="CLOSED", paused=False,
+        )
+        catalog._conn.execute(
+            "UPDATE runs SET started_at=?, ended_at=? WHERE id=?",
+            (enrich_start.isoformat(), enrich_end.isoformat(), enrich_id),
+        )
+        cursor_time = enrich_end + timedelta(minutes=1)
+    catalog._conn.commit()
+
+    for i in range(400):
+        catalog.upsert(
+            sha256_b64url=f"B{i}".rjust(43, "0"),
+            original_path=f"/b{i}.jpg",
+            organized_path=f"/lib/b{i}.jpg",
+        )
+
+    doc = stats.collect(catalog, control, now=now)
+
+    assert doc["projection"]["status"] == "projected"
+    assert doc["projection"]["rate_per_hour"] == pytest.approx(600.0, rel=0.05)
+    assert doc["projection"]["backlog"] == 400
+
+
+# ---------------------------------------------------------------------------
+# unenriched_count computed once -- IMPORTANT finding #5
+# ---------------------------------------------------------------------------
+
+
+def test_collect_computes_unenriched_count_exactly_once(
+    catalog: Catalog, control: ControlPlane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_queues_section` and `_projection_section` each used to run their own
+    `len(catalog.iter_unenriched())` -- a `SELECT *` fetching and discarding
+    every row just to count them, twice per poll. `collect()` now computes
+    `count_unenriched()` once and hands the result to both.
+    """
+    real = catalog.count_unenriched
+    calls = {"n": 0}
+
+    def _counting() -> int:
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(catalog, "count_unenriched", _counting)
+
+    stats.collect(catalog, control, now=datetime.now(timezone.utc))
+
+    assert calls["n"] == 1
+
+
+def test_queues_and_projection_agree_on_the_shared_backlog_count(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, control: ControlPlane
+) -> None:
+    source = tmp_path / "source"
+    _run_pipeline_with_three_photos(source, organized_dir, catalog)
+
+    doc = stats.collect(catalog, control, now=datetime.now(timezone.utc))
+
+    assert doc["queues"]["unenriched_count"] == 3
+    assert doc["projection"]["backlog"] == 3
 
 
 # ---------------------------------------------------------------------------
