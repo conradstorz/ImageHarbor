@@ -58,6 +58,17 @@ def compute_sha256_b64url(path: Path) -> str:
     return encode_base64url(compute_sha256_bytes(path))
 
 
+def compute_sha256_b64url_bytes(data: bytes) -> str:
+    """Compute SHA-256 of *data* (already in memory) as 43-char Base64url.
+
+    Mirrors :func:`compute_sha256_b64url`, which takes a path. This is for
+    bytes that did not come from a plain file on disk -- e.g. one member of
+    a zip archive -- where writing them to a temp file just to hash them
+    would be wasted I/O.
+    """
+    return encode_base64url(hashlib.sha256(data).digest())
+
+
 def verify_file(path: Path, expected_b64url: str) -> bool:
     """Return True if the SHA-256 of *path* matches *expected_b64url*."""
     return compute_sha256_b64url(path) == expected_b64url

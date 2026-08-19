@@ -150,6 +150,53 @@ def test_read_exif_with_exif(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_read_exif_bytes_valued_tag_normalizes_to_text(tmp_path: Path) -> None:
+    """ExifVersion (and FlashPixVersion/SceneType/GPSVersionID) are commonly
+    stored as raw bytes on real cameras. `read_exif` must decode them to text
+    -- matching `sidecar._json_default`'s write-time decode -- so a value
+    written to a sidecar and read back on the next pass compares equal
+    instead of tripping a false supersession (`"0230" != b"0230"`)."""
+    p = tmp_path / "withversion.jpg"
+    exif = Image.Exif()
+    exif[36864] = b"0230"  # ExifVersion
+    Image.new("RGB", (4, 4), "green").save(p, "JPEG", exif=exif.tobytes())
+
+    result = read_exif(p)
+
+    assert result["ExifVersion"] == "0230"
+    assert isinstance(result["ExifVersion"], str)
+
+
+def test_read_exif_merged_twice_records_no_false_supersession(tmp_path: Path) -> None:
+    """End-to-end THROUGH DISK: a bytes-valued EXIF tag merged and written to
+    a real sidecar file, then read back via a fresh `read_exif` call and
+    merged again, must not grow `exif_history`.
+
+    This must round-trip through actual JSON on disk (`merge_sidecar` +
+    `read_sidecar`), not just call `sidecar_schema.merge` in memory twice --
+    an in-memory merge sees the same Python `bytes` object both times
+    regardless of normalization and would pass even with the bug present.
+    The bug only shows once the FIRST write has gone through
+    `sidecar._json_default` (bytes -> text) and comes back off disk as text,
+    to be compared against a second, unnormalized `bytes` read.
+    """
+    from imageharbor.sidecar import merge_sidecar, read_sidecar
+
+    p = tmp_path / "withversion2.jpg"
+    exif = Image.Exif()
+    exif[36864] = b"0230"  # ExifVersion
+    Image.new("RGB", (4, 4), "green").save(p, "JPEG", exif=exif.tobytes())
+
+    first_read = read_exif(p)
+    merge_sidecar(p, {"exif": first_read})
+
+    second_read = read_exif(p)
+    merge_sidecar(p, {"exif": second_read})
+
+    doc = read_sidecar(p)
+    assert doc.get("exif_history", []) == []
+
+
 def test_read_exif_corrupt_file_does_not_raise(tmp_path: Path) -> None:
     p = tmp_path / "corrupt.jpg"
     p.write_bytes(b"\x00\x01\x02not a real image\xff\xfe\xab")

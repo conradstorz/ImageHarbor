@@ -480,33 +480,40 @@ class Pipeline:
         # catalog update already committed, so it is logged and swallowed.
         if self.write_sidecars:
             try:
-                sources = [
-                    {
-                        "path": r["source_path"],
-                        "first_seen": r["first_seen_at"],
-                        "last_seen": r["last_seen_at"],
+                sources = [_source_entry(r) for r in self.catalog.sources_for(sha256_b64url)]
+                sidecar_updates: dict[str, Any] = {"sources": sources}
+
+                # Only assert a `date` block when the date dimension itself
+                # improved (`date` is the FRESH resolve_date() result here).
+                # When the incumbent's date wins instead, `best_date` is
+                # `date_from_row(row)` -- a midnight reconstruction of the
+                # date STRING the catalog holds, not an observation. Writing
+                # that would both fabricate a time-of-day nothing measured
+                # (the same error `backfill.py` guards against) and, because
+                # its ISO string would not byte-match whatever precision the
+                # incumbent sidecar block already carries, risk recording a
+                # false "rejected" supersession against the incumbent's own
+                # correct value. Omitting the block leaves that already-
+                # correct entry untouched.
+                if date.tier > old[0]:
+                    sidecar_updates["date"] = {
+                        "value": best_date.value.isoformat() if best_date.value else None,
+                        "tier": best_date.tier,
+                        "source": best_date.source,
                     }
-                    for r in self.catalog.sources_for(sha256_b64url)
-                ]
-                merge_sidecar(
-                    proposed,
-                    {
-                        "sources": sources,
-                        "date": {
-                            "value": best_date.value.isoformat() if best_date.value else None,
-                            "tier": best_date.tier,
-                            "source": best_date.source,
-                        },
-                        "descriptor": {
-                            "value": best_descriptor,
-                            "tier": new[1],
-                            "source": (
-                                descriptor.source if descriptor.tier > old[1]
-                                else (row["descriptor_source"] or "none")
-                            ),
-                        },
-                    },
-                )
+
+                # Same reasoning for `descriptor`: only assert it when the
+                # descriptor dimension itself improved. `is_upgrade` (checked
+                # above) guarantees at least one of these two blocks is
+                # included.
+                if descriptor.tier > old[1]:
+                    sidecar_updates["descriptor"] = {
+                        "value": best_descriptor,
+                        "tier": new[1],
+                        "source": descriptor.source,
+                    }
+
+                merge_sidecar(proposed, sidecar_updates)
             except Exception:
                 logger.warning(
                     "Failed to update sidecar after upgrading %s; file and "
@@ -534,14 +541,7 @@ class Pipeline:
         descriptor: "ResolvedDescriptor",
         exif_data: dict[str, Any],
     ) -> None:
-        sources = [
-            {
-                "path": row["source_path"],
-                "first_seen": row["first_seen_at"],
-                "last_seen": row["last_seen_at"],
-            }
-            for row in self.catalog.sources_for(sha256_b64url)
-        ]
+        sources = [_source_entry(row) for row in self.catalog.sources_for(sha256_b64url)]
         merge_sidecar(
             organized_path,
             {
@@ -569,6 +569,26 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _source_entry(row) -> dict[str, Any]:
+    """A sidecar `sources[]` entry from a catalog `sources` row.
+
+    `folder` is the immediate parent of the source path -- for a Takeout
+    member that is its album directory, and for an ordinary `process` run it
+    is whatever folder the owner had the photo in. Both are facts about the
+    photo's history that the date-derived tree would otherwise erase.
+    """
+    raw = row["source_path"]
+    member = raw.rsplit("!", 1)[-1]          # Takeout labels are <zip>!<member>
+    normalized = member.replace("\\", "/")
+    folder = normalized.rsplit("/", 2)[-2] if "/" in normalized else ""
+    return {
+        "path": raw,
+        "folder": folder,
+        "first_seen": row["first_seen_at"],
+        "last_seen": row["last_seen_at"],
+    }
 
 
 def _log_result(result: ProcessResult) -> None:

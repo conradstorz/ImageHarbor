@@ -55,6 +55,24 @@ _GPS_TAGS: dict[int, str] = {
 }
 
 
+def _normalize_exif_value(value: Any) -> Any:
+    """Decode raw EXIF ``bytes``/``bytearray`` to text.
+
+    Real cameras store several tags (``ExifVersion``, ``FlashPixVersion``,
+    ``SceneType``, ``GPSVersionID``) as raw bytes, e.g. ``b"0230"``.
+    ``sidecar._json_default`` already decodes bytes the same lossy way
+    (``bytes(o).decode("utf-8", "replace")``) when a sidecar is WRITTEN, so a
+    tag read back as ``bytes`` on the next pass would compare unequal to the
+    text already on record and the merge would record a value superseded by
+    itself. Normalizing here, at the read boundary, means every consumer of
+    `read_exif` -- not just the sidecar merge -- sees the same text both
+    times, which is what keeps a repeated run byte-identical.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return value
+
+
 def _rational_to_float(value: Any) -> float | Any:
     """Convert an IFDRational or (num, denom) tuple to a float."""
     if hasattr(value, "numerator") and hasattr(value, "denominator"):
@@ -124,7 +142,7 @@ def read_exif(path: Path) -> dict[str, Any]:
                         else v
                         for v in value
                     ]
-                result[tag_name] = value
+                result[tag_name] = _normalize_exif_value(value)
 
             # Parse GPS sub-IFD
             if gps_raw:
@@ -138,7 +156,7 @@ def read_exif(path: Path) -> dict[str, Any]:
                             else v
                             for v in gps_val
                         ]
-                    gps[gps_name] = gps_val
+                    gps[gps_name] = _normalize_exif_value(gps_val)
 
                 # Compute decimal lat/lon when possible. Each coordinate is
                 # handled in its own try/except so a missing or malformed

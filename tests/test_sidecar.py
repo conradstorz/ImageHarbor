@@ -1,91 +1,114 @@
-"""Tests for cumulative sidecar merging."""
+"""Tests for sidecar I/O: atomicity and corrupt-file handling."""
+
+from __future__ import annotations
 
 import json
+from datetime import datetime
+from pathlib import Path
 
-from imageharbor.sidecar import (
-    SIDECAR_SCHEMA_VERSION,
-    merge_sidecar,
-    read_sidecar,
-    sidecar_path_for,
-)
+import imageharbor.sidecar as sidecar_module
+from imageharbor.sidecar import _quarantine, merge_sidecar, read_sidecar, sidecar_path_for
 
 
-def test_sidecar_path_appends_json_rather_than_replacing_a_suffix(tmp_path):
+def _img(tmp_path: Path) -> Path:
+    p = tmp_path / "2015-03-09_abc.jpg"
+    p.write_bytes(b"x")
+    return p
+
+
+def test_merge_creates_then_accretes(tmp_path: Path) -> None:
+    img = _img(tmp_path)
+    merge_sidecar(img, {"exif": {"Make": "Canon"}})
+    merge_sidecar(img, {"exif": {"Model": "5D"}})
+    doc = read_sidecar(img)
+    assert doc["exif"] == {"Make": "Canon", "Model": "5D"}
+
+
+def test_a_corrupt_sidecar_is_quarantined_not_overwritten(tmp_path: Path) -> None:
+    """Treating a corrupt sidecar as empty would destroy data under the new rule.
+
+    The old behavior logged and returned {}, so the next merge silently wrote a
+    fresh document over whatever the unreadable bytes contained.
+    """
+    img = _img(tmp_path)
+    path = sidecar_path_for(img)
+    path.write_text('{"exif": {"Make": "Canon"} TRUNCATED', encoding="utf-8")
+
+    merge_sidecar(img, {"exif": {"Model": "5D"}})
+
+    quarantined = list(tmp_path.glob("*.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert "TRUNCATED" in quarantined[0].read_text(encoding="utf-8")
+    assert read_sidecar(img)["exif"] == {"Model": "5D"}
+
+
+def test_two_quarantines_at_the_same_instant_both_survive(tmp_path: Path, monkeypatch) -> None:
+    """Finding 3: `_quarantine` stamped to whole seconds and called
+    `path.replace(target)` unconditionally, so two quarantines within the
+    same tick -- a monkeypatched clock returning an identical timestamp is
+    the worst case, but a coarse system clock can hit this for real --
+    silently overwrote the FIRST quarantined file's bytes with the second's,
+    losing exactly what this function exists to preserve.
+    """
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, 0, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(sidecar_module, "datetime", _FixedDatetime)
+
+    path = tmp_path / "a.json"
+    path.write_text("first corrupt bytes", encoding="utf-8")
+    _quarantine(path, "reason one")
+
+    path.write_text("second corrupt bytes", encoding="utf-8")
+    _quarantine(path, "reason two")
+
+    quarantined = sorted(tmp_path.glob("a.json.corrupt-*"))
+    assert len(quarantined) == 2
+    assert len({p.name for p in quarantined}) == 2  # distinct names
+    contents = {p.read_text(encoding="utf-8") for p in quarantined}
+    assert contents == {"first corrupt bytes", "second corrupt bytes"}
+
+
+def test_a_hand_edit_survives_a_merge(tmp_path: Path) -> None:
+    img = _img(tmp_path)
+    merge_sidecar(img, {"exif": {"Make": "Canon"}})
+    doc = read_sidecar(img)
+    doc["my_note"] = "grandma's camera"
+    sidecar_path_for(img).write_text(json.dumps(doc), encoding="utf-8")
+
+    merge_sidecar(img, {"exif": {"Model": "5D"}})
+    assert read_sidecar(img)["my_note"] == "grandma's camera"
+
+
+def test_repeated_merge_is_byte_identical(tmp_path: Path) -> None:
+    img = _img(tmp_path)
+    update = {"sources": [{"path": "/a.jpg", "folder": "d", "first_seen": "T", "last_seen": "T"}]}
+    merge_sidecar(img, update)
+    first = sidecar_path_for(img).read_bytes()
+    merge_sidecar(img, update)
+    assert sidecar_path_for(img).read_bytes() == first
+
+
+def test_no_temp_file_is_left_behind(tmp_path: Path) -> None:
+    img = _img(tmp_path)
+    merge_sidecar(img, {"exif": {"Make": "Canon"}})
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_sidecar_path_appends_json_rather_than_replacing_a_suffix(tmp_path: Path) -> None:
     """A stem containing dots must not lose part of its name."""
     img = tmp_path / "2019-07-04-v1.2_abc.jpg"
     assert sidecar_path_for(img).name == "2019-07-04-v1.2_abc.json"
 
 
-def test_merge_creates_and_stamps_schema_version(tmp_path):
-    img = tmp_path / "a.jpg"
-    merge_sidecar(img, {"identity": {"sha256_b64url": "D1"}})
-    data = read_sidecar(img)
-    assert data["schema_version"] == SIDECAR_SCHEMA_VERSION
-    assert data["identity"]["sha256_b64url"] == "D1"
-
-
-def test_merge_is_cumulative_across_runs(tmp_path):
-    img = tmp_path / "a.jpg"
-    merge_sidecar(img, {"identity": {"sha256_b64url": "D1"}, "date": {"tier": 40}})
-    merge_sidecar(img, {"classification": {"pcs_code": "330"}})
-    data = read_sidecar(img)
-    assert data["identity"]["sha256_b64url"] == "D1"
-    assert data["date"]["tier"] == 40
-    assert data["classification"]["pcs_code"] == "330"
-
-
-def test_merge_deep_merges_nested_dicts(tmp_path):
-    img = tmp_path / "a.jpg"
-    merge_sidecar(img, {"identity": {"sha256_b64url": "D1", "size": 10}})
-    merge_sidecar(img, {"identity": {"size": 20}})
-    data = read_sidecar(img)
-    assert data["identity"] == {"sha256_b64url": "D1", "size": 20}
-
-
-def test_merge_preserves_hand_added_keys(tmp_path):
-    img = tmp_path / "a.jpg"
-    merge_sidecar(img, {"identity": {"sha256_b64url": "D1"}})
-    path = sidecar_path_for(img)
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data["my_note"] = "grandma's kitchen, not a beach"
-    data["identity"]["my_field"] = 1
-    path.write_text(json.dumps(data), encoding="utf-8")
-
-    # The second merge must REWRITE the same nested dict the hand edit lives in
-    # -- an update that only touched an unrelated key would not prove anything.
-    merge_sidecar(img, {"identity": {"sha256_b64url": "D2"}, "classification": {"pcs_code": "330"}})
-    after = read_sidecar(img)
-    assert after["my_note"] == "grandma's kitchen, not a beach"
-    assert after["identity"]["my_field"] == 1
-    assert after["identity"]["sha256_b64url"] == "D2"
-
-
-def test_lists_are_replaced_not_appended(tmp_path):
-    img = tmp_path / "a.jpg"
-    merge_sidecar(img, {"sources": [{"path": "/a.jpg"}]})
-    merge_sidecar(img, {"sources": [{"path": "/a.jpg"}, {"path": "/b.jpg"}]})
-    assert len(read_sidecar(img)["sources"]) == 2
-
-
-def test_read_of_a_missing_sidecar_is_empty(tmp_path):
+def test_read_of_a_missing_sidecar_is_empty(tmp_path: Path) -> None:
     assert read_sidecar(tmp_path / "nope.jpg") == {}
 
 
-def test_corrupt_sidecar_does_not_raise_and_is_rebuilt(tmp_path):
-    img = tmp_path / "a.jpg"
-    sidecar_path_for(img).write_text("{not json", encoding="utf-8")
-    assert read_sidecar(img) == {}
-    merge_sidecar(img, {"identity": {"sha256_b64url": "D1"}})
-    assert read_sidecar(img)["identity"]["sha256_b64url"] == "D1"
-
-
-def test_no_temp_file_is_left_behind(tmp_path):
-    img = tmp_path / "a.jpg"
-    merge_sidecar(img, {"identity": {"sha256_b64url": "D1"}})
-    assert [p.name for p in tmp_path.iterdir()] == ["a.json"]
-
-
-def test_bytes_valued_exif_serializes_as_text_not_python_repr(tmp_path):
+def test_bytes_valued_exif_serializes_as_text_not_python_repr(tmp_path: Path) -> None:
     """Real EXIF carries raw bytes (ExifVersion, SceneType, MakerNote).
 
     A bare default=str would not raise, but would write Python repr syntax
@@ -99,9 +122,24 @@ def test_bytes_valued_exif_serializes_as_text_not_python_repr(tmp_path):
     assert read_sidecar(img)["exif"]["ExifVersion"] == "0230"
 
 
-def test_a_scalar_replaced_by_a_dict_does_not_corrupt(tmp_path):
-    """Type mismatches between runs replace cleanly rather than raising."""
+def test_a_scalar_replaced_by_a_dict_does_not_corrupt(tmp_path: Path) -> None:
+    """Type mismatches between runs resolve cleanly rather than raising.
+
+    A v1 sidecar can hold a bare string where v2 expects a tiered block, so
+    this is a real migration shape, not a hypothetical one. `_coerce_block`
+    lifts the bare scalar to a tier-0 block (`value`/`tier`/`source`)
+    rather than discarding it, so the first merge's scalar is real evidence
+    on record -- and when the second merge's higher-tier block wins, that
+    tier-0 reading is relocated into `history` like any other superseded
+    value, not lost.
+    """
     img = tmp_path / "a.jpg"
     merge_sidecar(img, {"date": "2019-07-04"})
     merge_sidecar(img, {"date": {"value": "2019-07-04", "tier": 40}})
-    assert read_sidecar(img)["date"] == {"value": "2019-07-04", "tier": 40}
+
+    block = read_sidecar(img)["date"]
+    assert block["value"] == "2019-07-04"
+    assert block["tier"] == 40
+    assert any(h.get("tier") == 0 for h in block["history"]), (
+        "the bare scalar from the first merge must survive in history"
+    )

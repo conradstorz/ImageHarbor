@@ -131,9 +131,9 @@ def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
 )
 @click.option(
     "--sidecar/--no-sidecar",
-    default=False,
+    default=True,
     show_default=True,
-    help="Write a JSON sidecar alongside each organized image.",
+    help="Write a JSON sidecar alongside each organized image. Use --no-sidecar to suppress.",
 )
 @click.option(
     "--dry-run",
@@ -222,9 +222,9 @@ def process(
 @click.option(
     "--sidecar/--no-sidecar",
     envvar="IMAGEHARBOR_SIDECAR",
-    default=False,
+    default=True,
     show_default=True,
-    help="Write/update a JSON sidecar alongside each organized image.",
+    help="Write/update a JSON sidecar alongside each organized image. Use --no-sidecar to suppress.",
 )
 @click.option(
     "--ai",
@@ -383,9 +383,9 @@ def enrich(
 @click.option(
     "--sidecar/--no-sidecar",
     envvar="IMAGEHARBOR_SIDECAR",
-    default=False,
+    default=True,
     show_default=True,
-    help="Write a JSON sidecar alongside each organized image.",
+    help="Write a JSON sidecar alongside each organized image. Use --no-sidecar to suppress.",
 )
 @click.option(
     "--ai",
@@ -637,9 +637,9 @@ def takeout_cmd() -> None:
 )
 @click.option(
     "--sidecar/--no-sidecar",
-    default=False,
+    default=True,
     show_default=True,
-    help="Write a JSON sidecar alongside each organized image.",
+    help="Write a JSON sidecar alongside each organized image. Use --no-sidecar to suppress.",
 )
 @click.option(
     "--include-trash",
@@ -814,3 +814,70 @@ def catalog_get(catalog_path: Path, sha256: str) -> None:
 
 # Alias so `imageharbor catalog list` works
 main.add_command(catalog_cmd, name="catalog")
+
+
+# ---------------------------------------------------------------------------
+# sidecar
+# ---------------------------------------------------------------------------
+
+
+@click.group()
+def sidecar_cmd() -> None:
+    """Operate on sidecar files for an already-organized library."""
+
+
+@sidecar_cmd.command(name="backfill")
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report what would be written without writing anything.",
+)
+def sidecar_backfill(dest: Path, catalog_path: Path | None, dry_run: bool) -> None:
+    """Rebuild/merge sidecars for an already-organized library from DEST's catalog.
+
+    For libraries organized before sidecars were the default (see `process
+    --no-sidecar`), this writes a sidecar built from what the catalog holds:
+    identity, sources, date and descriptor with their tiers, and a fresh EXIF
+    read from each organized copy. A file that already has a sidecar is
+    merged into, not skipped -- the merge is a no-op if the sidecar was
+    already complete.
+
+    Google Takeout metadata is NOT recoverable this way: `provenance` stays
+    empty for backfilled files, because the original archive documents were
+    never stored for them. Recovering that means re-ingesting the archives.
+    """
+    from .backfill import backfill_sidecars
+
+    if catalog_path is None:
+        catalog_path = dest / "catalog.db"
+
+    with Catalog(catalog_path) as catalog:
+        stats = backfill_sidecars(dest, catalog, dry_run=dry_run)
+
+    if dry_run:
+        click.echo("[DRY-RUN] No files were written.")
+    click.echo(
+        f"Cataloged={stats.cataloged}  Written={stats.written}  "
+        f"Unchanged={stats.unchanged}  Failed={stats.failed}"
+    )
+
+    if stats.failed:
+        sys.exit(1)
+
+
+# Alias so `imageharbor sidecar backfill` works
+main.add_command(sidecar_cmd, name="sidecar")
