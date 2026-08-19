@@ -823,3 +823,183 @@ def test_takeout_tables_do_not_bump_the_schema_version(tmp_path) -> None:
     # Reopening must not raise LegacyCatalogError or lose the row.
     with Catalog(tmp_path / "c.db") as cat:
         assert cat.takeout_archive_get("A" * 43) is not None
+
+
+# ---------------------------------------------------------------------------
+# runs
+# ---------------------------------------------------------------------------
+
+
+def test_run_start_returns_id_with_ended_at_null_and_is_unfinished(catalog: Catalog) -> None:
+    run_id = catalog.run_start("facts")
+    assert isinstance(run_id, int)
+    unfinished = catalog.unfinished_runs()
+    assert len(unfinished) == 1
+    assert unfinished[0]["id"] == run_id
+    assert unfinished[0]["ended_at"] is None
+    assert unfinished[0]["kind"] == "facts"
+
+
+def test_run_finish_populates_counters_and_clears_unfinished(catalog: Catalog) -> None:
+    run_id = catalog.run_start("enrich")
+    catalog.run_finish(
+        run_id,
+        scanned=10,
+        copied=3,
+        duplicates=2,
+        errors=1,
+        enriched=4,
+        enrich_failed=1,
+        breaker_state="OPEN",
+        paused=False,
+    )
+    assert catalog.unfinished_runs() == []
+    rows = catalog.recent_runs()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["id"] == run_id
+    assert row["ended_at"] is not None
+    assert row["scanned"] == 10
+    assert row["copied"] == 3
+    assert row["duplicates"] == 2
+    assert row["errors"] == 1
+    assert row["enriched"] == 4
+    assert row["enrich_failed"] == 1
+    assert row["breaker_state"] == "OPEN"
+    assert row["paused"] == 0  # stored as an INTEGER, False -> 0
+
+
+def test_recent_runs_is_newest_first_and_respects_limit(catalog: Catalog) -> None:
+    ids = []
+    for i in range(5):
+        run_id = catalog.run_start("facts")
+        catalog.run_finish(
+            run_id, scanned=i, copied=0, duplicates=0, errors=0,
+            enriched=0, enrich_failed=0, breaker_state="CLOSED", paused=False,
+        )
+        ids.append(run_id)
+    rows = catalog.recent_runs(limit=3)
+    assert len(rows) == 3
+    assert [r["id"] for r in rows] == list(reversed(ids))[:3]
+
+
+def test_unfinished_runs_only_returns_runs_with_ended_at_null(catalog: Catalog) -> None:
+    finished_id = catalog.run_start("facts")
+    catalog.run_finish(
+        finished_id, scanned=1, copied=0, duplicates=0, errors=0,
+        enriched=0, enrich_failed=0, breaker_state="CLOSED", paused=False,
+    )
+    unfinished_id = catalog.run_start("enrich")
+    unfinished = catalog.unfinished_runs()
+    assert [r["id"] for r in unfinished] == [unfinished_id]
+
+
+# ---------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------
+
+
+def test_setting_roundtrip(catalog: Catalog) -> None:
+    assert catalog.setting_get("interval") is None
+    catalog.setting_set("interval", "120")
+    assert catalog.setting_get("interval") == "120"
+
+
+def test_setting_set_overwrites_existing_value(catalog: Catalog) -> None:
+    catalog.setting_set("enrich", "1")
+    catalog.setting_set("enrich", "0")
+    assert catalog.setting_get("enrich") == "0"
+
+
+def test_setting_delete_removes_the_row_not_blanks_it(catalog: Catalog) -> None:
+    """A revert must DELETE the row so the env var is consulted again -- see
+    the `settings` table comment. Writing an empty string instead would look
+    identical today and silently shadow every future compose change."""
+    catalog.setting_set("interval", "300")
+    catalog.setting_delete("interval")
+    assert catalog.setting_get("interval") is None
+    # Confirm the row is truly gone, not present with an empty/old value.
+    row = catalog._conn.execute(
+        "SELECT * FROM settings WHERE key='interval'"
+    ).fetchone()
+    assert row is None
+
+
+def test_setting_delete_of_missing_key_is_a_noop(catalog: Catalog) -> None:
+    catalog.setting_delete("does-not-exist")  # must not raise
+    assert catalog.setting_get("does-not-exist") is None
+
+
+def test_settings_all_returns_dict_of_all_settings(catalog: Catalog) -> None:
+    catalog.setting_set("interval", "60")
+    catalog.setting_set("enrich", "1")
+    assert catalog.settings_all() == {"interval": "60", "enrich": "1"}
+
+
+def test_settings_all_empty(catalog: Catalog) -> None:
+    assert catalog.settings_all() == {}
+
+
+# ---------------------------------------------------------------------------
+# busy timeout
+#
+# No test here: `sqlite3.connect()`'s default `timeout=5.0` already calls
+# `sqlite3_busy_timeout(db, 5000)` on every connection, so `PRAGMA
+# busy_timeout` reads 5000 whether or not `Catalog.__init__` sets it
+# explicitly -- a test asserting that value would pass identically with the
+# line removed. See the mutation-testing note in the Task 2 report.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# runs / settings: schema version and legacy safety
+# ---------------------------------------------------------------------------
+
+
+def test_a_catalog_predating_runs_and_settings_reopens_without_raising(tmp_path):
+    """A catalog written before this change has `photos`/`sources` but no
+    `runs`/`settings` tables at all. Opening it must add both tables
+    additively (not raise `LegacyCatalogError`), and they must be usable
+    immediately.
+    """
+    import sqlite3
+
+    from imageharbor.catalog import Catalog
+
+    db = tmp_path / "pre_runs_settings.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(_OLD_PHOTOS_TABLE_DDL)
+    conn.execute(
+        "INSERT INTO photos (sha256_b64url, original_path, created_at) VALUES ('OLD', '/x.jpg', 'now')"
+    )
+    conn.execute(
+        "CREATE TABLE sources (sha256_b64url TEXT NOT NULL, source_path TEXT NOT NULL, "
+        "size INTEGER, mtime_ns INTEGER, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, "
+        "PRIMARY KEY (sha256_b64url, source_path))"
+    )
+    conn.execute(
+        "INSERT INTO sources (sha256_b64url, source_path, size, mtime_ns, first_seen_at, last_seen_at) "
+        "VALUES ('OLD', '/x.jpg', 1, 1, 'now', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    with Catalog(db) as cat:  # must not raise LegacyCatalogError
+        assert cat.get_by_sha256("OLD") is not None
+        run_id = cat.run_start("facts")
+        assert cat.unfinished_runs()[0]["id"] == run_id
+        cat.setting_set("interval", "120")
+        assert cat.setting_get("interval") == "120"
+
+
+def test_runs_and_settings_tables_do_not_bump_the_schema_version(tmp_path: Path) -> None:
+    from imageharbor.catalog import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == "2"
+    with Catalog(tmp_path / "c.db") as cat:
+        run_id = cat.run_start("facts")
+        cat.setting_set("interval", "120")
+    # Reopening must not raise LegacyCatalogError or lose the rows.
+    with Catalog(tmp_path / "c.db") as cat:
+        assert cat.setting_get("interval") == "120"
+        assert cat.unfinished_runs()[0]["id"] == run_id

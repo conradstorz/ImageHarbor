@@ -121,6 +121,32 @@ CREATE TABLE IF NOT EXISTS takeout_members (
 );
 CREATE INDEX IF NOT EXISTS idx_takeout_members_status  ON takeout_members(status);
 CREATE INDEX IF NOT EXISTS idx_takeout_members_archive ON takeout_members(archive_id);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT    NOT NULL,          -- 'facts' | 'enrich'
+    started_at    TEXT    NOT NULL,
+    ended_at      TEXT,                      -- NULL while in flight
+    scanned       INTEGER NOT NULL DEFAULT 0,
+    copied        INTEGER NOT NULL DEFAULT 0,
+    duplicates    INTEGER NOT NULL DEFAULT 0,
+    errors        INTEGER NOT NULL DEFAULT 0,
+    enriched      INTEGER NOT NULL DEFAULT 0,
+    enrich_failed INTEGER NOT NULL DEFAULT 0,
+    breaker_state TEXT    NOT NULL DEFAULT 'CLOSED',
+    paused        INTEGER NOT NULL DEFAULT 0  -- pass ended because of a pause
+);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+
+-- Keys: 'paused' ('0'|'1'), 'interval' (seconds), 'enrich' ('0'|'1').
+-- A key present here overrides the env-var value; absent means "follow config".
+-- Reverting an override DELETES the row rather than writing the env value, so
+-- a later compose change is picked up instead of being shadowed by a stale copy.
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 # Bumped when a catalog schema change is significant enough that opening an
@@ -199,6 +225,11 @@ class Catalog:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        # The dashboard writes settings rows from its own connection while the
+        # watcher writes photo rows from this one. Without a busy timeout, any
+        # overlap surfaces as an opaque `database is locked` abort instead of a
+        # brief wait -- and a settings write must never be able to fail a pass.
+        self._conn.execute("PRAGMA busy_timeout=5000;")
         self._conn.executescript(_SCHEMA)
         self._ensure_photo_columns()
         self._conn.commit()
@@ -873,6 +904,93 @@ class Catalog:
             """
         ).fetchone()["n"]
         return {"archives": archives, "members": members, "missing_metadata": missing}
+
+    # ------------------------------------------------------------------
+    # Runs and settings
+    #
+    # Both tables are purely additive: no existing row is reinterpreted and no
+    # existing column changes meaning, so SCHEMA_VERSION stays "2" and
+    # `_guard_legacy_catalog` correctly does not fire for a catalog that
+    # predates them.
+    # ------------------------------------------------------------------
+
+    def run_start(self, kind: str) -> int:
+        cursor = self._conn.execute(
+            "INSERT INTO runs (kind, started_at) VALUES (?,?)",
+            (kind, _now_iso()),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def run_finish(
+        self,
+        run_id: int,
+        *,
+        scanned: int,
+        copied: int,
+        duplicates: int,
+        errors: int,
+        enriched: int,
+        enrich_failed: int,
+        breaker_state: str,
+        paused: bool,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE runs
+            SET ended_at=?, scanned=?, copied=?, duplicates=?, errors=?,
+                enriched=?, enrich_failed=?, breaker_state=?, paused=?
+            WHERE id=?
+            """,
+            (
+                _now_iso(), scanned, copied, duplicates, errors,
+                enriched, enrich_failed, breaker_state, int(paused),
+                run_id,
+            ),
+        )
+        self._conn.commit()
+
+    def recent_runs(self, limit: int = 50) -> list[sqlite3.Row]:
+        cursor = self._conn.execute(
+            "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        return cursor.fetchall()
+
+    def unfinished_runs(self) -> list[sqlite3.Row]:
+        cursor = self._conn.execute(
+            "SELECT * FROM runs WHERE ended_at IS NULL ORDER BY id"
+        )
+        return cursor.fetchall()
+
+    def setting_get(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+        return row["value"] if row is not None else None
+
+    def setting_set(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at) VALUES (?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (key, value, _now_iso()),
+        )
+        self._conn.commit()
+
+    def setting_delete(self, key: str) -> None:
+        """Delete the override row so the env var is consulted again.
+
+        Writing an empty string instead would look identical today and
+        silently shadow every future compose change -- see the comment on
+        `settings` in `_SCHEMA`.
+        """
+        self._conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        self._conn.commit()
+
+    def settings_all(self) -> dict[str, str]:
+        cursor = self._conn.execute("SELECT key, value FROM settings")
+        return {row["key"]: row["value"] for row in cursor}
 
     # ------------------------------------------------------------------
     # Taxonomy
