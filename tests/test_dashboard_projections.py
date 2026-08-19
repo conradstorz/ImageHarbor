@@ -130,3 +130,58 @@ def test_malformed_runs_never_raise(runs) -> None:
     """A dashboard must not crash on a row a crashed pass left behind."""
     p = project(runs, backlog=10, breaker_open=False, paused=False, now=NOW)
     assert p.status in {STATUS_UNKNOWN, STATUS_STALLED, STATUS_PROJECTED}
+
+
+# --- the five defects fixed here -------------------------------------------
+
+
+def test_a_timezone_mismatch_within_a_row_does_not_raise() -> None:
+    """A row we cannot read in time is not evidence -- and must not crash the page."""
+    naive_end = (NOW.replace(tzinfo=None) + timedelta(minutes=10)).isoformat()
+    row = {"started_at": NOW.isoformat(), "ended_at": naive_end, "enriched": 10}
+    p = project([row, row], backlog=100, breaker_open=False, paused=False, now=NOW)
+    assert p.status in {STATUS_UNKNOWN, STATUS_STALLED}
+
+
+def test_unparseable_rows_cannot_evict_real_passes_from_the_window() -> None:
+    """The window is chosen chronologically, not by how the timestamp text sorts.
+
+    With a string sort, rows beginning with a letter sort ahead of every ISO
+    date and starve the window of real passes -- or, with other junk, promote
+    fake ones and produce a confidently absurd rate.
+    """
+    healthy = _steady(n=10)
+    junk = [{"started_at": f"zzz-{i}", "ended_at": f"zzz-{i}", "enriched": 1} for i in range(15)]
+    p = project(healthy + junk, backlog=120, breaker_open=False, paused=False, now=NOW)
+    assert p.status == STATUS_PROJECTED
+    assert p.rate_per_hour == pytest.approx(60.0)
+
+
+def test_a_stale_history_does_not_project() -> None:
+    """Flags can be wrong; a wedged watcher may never trip the breaker.
+
+    This is the module's independent defense, which is why it does not simply
+    trust the caller's paused/breaker_open bookkeeping.
+    """
+    stale = [_run(minutes_ago=60 * 24 * 60 + (i + 1) * 15, duration_min=10.0, enriched=10)
+             for i in range(10)]
+    p = project(stale, backlog=500, breaker_open=False, paused=False, now=NOW)
+    assert p.status == STATUS_STALLED
+    assert p.eta_seconds is None
+
+
+def test_the_rate_is_always_one_a_pass_actually_achieved() -> None:
+    """An interpolated median invents a rate nobody ever ran at."""
+    bimodal = ([_run((i + 1) * 15, 60.0, 10) for i in range(5)] +      # 10/hr
+               [_run((i + 6) * 15, 6.0, 100) for i in range(5)])       # 1000/hr
+    p = project(bimodal, backlog=100, breaker_open=False, paused=False, now=NOW)
+    assert p.rate_per_hour in {10.0, 1000.0}
+
+
+def test_an_absurd_eta_is_reported_as_stalled() -> None:
+    """1,141 years is a statement that work is not progressing, not an estimate."""
+    slow = [_run((i + 1) * 15, 600.0, 1) for i in range(10)]   # 0.1/hr
+    p = project(slow, backlog=1_000_000, breaker_open=False, paused=False, now=NOW)
+    assert p.status == STATUS_STALLED
+    assert p.rate_per_hour is not None     # the operator can still see the rate
+    assert p.eta_seconds is None
