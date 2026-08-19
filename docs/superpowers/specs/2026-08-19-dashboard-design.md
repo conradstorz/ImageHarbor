@@ -274,18 +274,45 @@ the previous run died, and is what the page reports.
 
 ## Concurrency
 
-The dashboard **reads through its own connection**. WAL already supports
-concurrent readers, so a slow page render can never block the watcher.
+**Corrected 2026-08-19** (final whole-branch review, pre-merge, CRITICAL
+finding): this section originally described the dashboard reading "through
+its own connection." That was never actually implemented — `cli.py` passes
+the **same** `Catalog` (and therefore the same `sqlite3.Connection`) to
+`ControlPlane`, `dashboard.server.serve()`, and `watcher.watch()`. The
+dashboard's HTTP server runs `daemon_threads = True`, so every request
+(`/api/stats` reads, `/api/pause` and `/api/settings` writes) reaches that
+one shared connection from its own thread, concurrently with the watch
+loop's photo writes. `check_same_thread=False` *permits* this; it does not
+make it *safe*. Measured under realistic load before the fix (4 pollers at
+5 Hz + pause POSTs, 25s): 55 exceptions raised out of the writer, including
+`cannot commit - no transaction is active`, `cannot start a transaction
+within a transaction`, `another row available`, and `SystemError: error
+return without exception set` out of `Catalog.run_finish` — a file could be
+copied and verified but not cataloged under exactly the load the dashboard
+itself creates.
 
-For settings it **writes** — a single-row upsert with no relationship to any
-file operation. This is a deliberate exception to the project's
-single-writer-per-catalog discipline and is stated rather than smuggled in. The
-discipline exists to stop two ImageHarbor processes racing on photo rows and
-relocations; a settings row participates in neither.
+The actual fix is `Catalog.lock`, a public, reentrant `threading.RLock`
+guarding every public `Catalog` method (`RLock`, not `Lock`, because several
+methods call other guarded methods on the same object from the same
+thread — e.g. `upsert` calls `get_by_sha256`). A genuine second connection
+(one for the dashboard, one for the watcher) was considered and rejected:
+`ControlPlane` is read from *both* threads (the HTTP handler serving
+`/api/stats`, and the watch loop reading `control.interval`/
+`control.enrich_enabled`/`control.pause_check()` every iteration), so
+splitting the connection in two would still leave that shared seam
+unguarded — the lock is the smaller change that actually closes the gap,
+and a second connection remains available later as a pure read-side
+optimization rather than a correctness requirement.
 
-It is made safe by adding `PRAGMA busy_timeout` to `Catalog.__init__`. Without
-it, any contention surfaces as an opaque `database is locked` abort rather than
-a brief wait. This closes a gap the 2026-08-18 review already recorded.
+`PRAGMA busy_timeout` (added to `Catalog.__init__`) governs contention
+*between separate SQLite connections*. With only one connection in the
+process — now serialized end-to-end by `Catalog.lock` before any two
+threads can reach SQLite concurrently at all — this pragma is **inert for
+the current topology**: there is nothing for SQLite's own busy-wait to
+arbitrate, because the Python-level lock already ensures only one thread is
+ever inside `sqlite3` at a time. It is kept anyway as an explicit pin at the
+point of use, for the day a second connection is actually added and this
+contention becomes real.
 
 ### Accepted inconsistency
 

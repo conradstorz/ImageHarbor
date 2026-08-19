@@ -842,7 +842,14 @@ def test_enrich_pass_that_raises_still_closes_its_row(
     rows = {row["kind"]: row for row in catalog.recent_runs(limit=5)}
     assert rows["facts"]["ended_at"] is not None    # facts phase completed cleanly
     assert rows["enrich"]["ended_at"] is not None    # closed despite the crash
-    assert rows["enrich"]["errors"] == 1
+    # IMPORTANT finding #7: `errors` on a `runs` row means "facts-phase
+    # errors"; an 'enrich'-kind row has no facts phase and must always be 0
+    # here -- the crash itself is recorded ONLY in `enrich_failed`, never in
+    # both (that double-write is what finding #7 removed: it made the
+    # dashboard history panel's 24h error figure count every enrichment
+    # failure twice).
+    assert rows["enrich"]["errors"] == 0
+    assert rows["enrich"]["enrich_failed"] == 1
     assert rows["enrich"]["enriched"] == 0
 
 

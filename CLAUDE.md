@@ -350,14 +350,38 @@ Module responsibilities:
   `value`, `updated_at`) holding at most three rows — `paused` ('0'/'1', no
   env counterpart), `interval` (seconds), `enrich` ('0'/'1') — where a
   present row overrides the corresponding env var and an absent one means
-  "follow config". `__init__` also now sets `PRAGMA busy_timeout=5000` on
-  every connection: measured 2026-08-19, this was **not** actually closing a
-  gap — CPython's `sqlite3.connect()` already applies `timeout=5.0` by
-  default, which *is* `busy_timeout=5000`, so contention between the
-  watcher's photo writes and the dashboard's settings writes already waited
-  five seconds before this line existed. The pragma is kept anyway, as an
-  explicit pin at the point of use against a future `connect(timeout=0)`
-  silently removing that wait — belt-and-braces, not a bug fix.
+  "follow config". **`Catalog.lock`** (a public, reentrant `threading.RLock`)
+  guards every public `Catalog` method — added 2026-08-19 (final
+  whole-branch-review finding, pre-merge) after `cli.py`'s single shared
+  `Catalog` was found to be reached concurrently by the dashboard's
+  `daemon_threads=True` HTTP server and the watcher loop, which
+  `check_same_thread=False` *permits* but does not make *safe*: measured
+  under load, 55 raw `sqlite3`/`SystemError` exceptions out of the writer in
+  25 seconds. `RLock`, not `Lock`, because several methods call other
+  guarded methods on the same object from the same thread (e.g. `upsert`
+  calls `get_by_sha256`). A second connection (one for the dashboard, one
+  for the watcher) was considered and rejected: `ControlPlane` is read from
+  *both* threads, so splitting the connection would still leave that seam
+  unguarded — the lock is the smaller change that actually closes the gap.
+  `dashboard/stats.py`'s three sections that run aggregate SQL directly
+  against `catalog._conn` (no `Catalog` wrapper method covers them) acquire
+  this same lock around their query blocks.
+
+  **Corrected 2026-08-19** (this section previously described a
+  two-connection architecture — "the dashboard writes settings rows from its
+  own connection while the watcher writes photo rows from this one" — that
+  was never actually implemented; the spec's Concurrency section made the
+  same claim and has been corrected too): there has only ever been **one**
+  connection, now guarded end-to-end by `Catalog.lock` as described above.
+  `__init__` still sets `PRAGMA busy_timeout=5000` on that one connection,
+  but it governs contention *between separate SQLite connections* — with
+  only one connection in the process, sharing one `sqlite3.Connection`
+  object under one Python-level lock, this pragma is **inert for the
+  current topology**: two threads never reach SQLite concurrently in the
+  first place, so there is nothing for SQLite's own busy-wait to arbitrate.
+  It is kept anyway as an explicit pin at the point of use, for the day a
+  second connection is added (e.g. as a pure read-side optimization) and
+  this contention becomes real again.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
   Also defines `VIDEO_EXTENSIONS`, for **classification only** — `discover_images`

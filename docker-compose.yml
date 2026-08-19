@@ -26,6 +26,16 @@ services:
       - /mnt/nas/photos-organized:/data/dest     # read-write organized library
       - imageharbor-catalog:/data/catalog        # local catalog volume (NOT on NAS)
     restart: unless-stopped
+    # IMPORTANT finding #4 (2026-08-19 whole-branch review, pre-merge):
+    # Docker's default stop_grace_period is 10s. A facts pass copying a
+    # large file over a slow CIFS/NAS mount can easily outlast that, so a
+    # plain `docker stop`/`docker compose down`/deploy restart would SIGKILL
+    # the process mid-copy -- which also leaves that pass's `runs` row open
+    # forever (see Catalog.run_started_by_this_process / stats._now_section's
+    # "crashed_runs" in dashboard/stats.py, which now surfaces exactly this
+    # on the dashboard after a restart). 60s gives SIGTERM time to let the
+    # current file finish before SIGKILL lands.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 30s

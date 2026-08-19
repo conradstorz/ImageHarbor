@@ -440,12 +440,26 @@ def run_once(
                 # unknowable here; only the crash itself is recorded.
                 row_stats = enrich_stats if enrich_stats is not None else EnrichStats()
                 row_errors = row_stats.errors + (1 if enrich_crashed else 0)
+                # IMPORTANT finding #7 (2026-08-19 whole-branch review): this
+                # used to pass `row_errors` into BOTH `errors` and
+                # `enrich_failed`, so the dashboard history panel's 24h error
+                # figure (which sums `errors` across runs -- see
+                # `dashboard/stats.py`'s `_window_summary`) counted every
+                # enrichment failure twice: once as itself (`enrich_failed`)
+                # and once again as if it were a facts-phase error
+                # (`errors`). `errors` on a `runs` row means "facts-phase
+                # errors"; an 'enrich'-kind row has no facts phase at all, so
+                # it is always 0 here. `enrich_failed` alone carries every
+                # AI-perception and post-perception failure this pass hit
+                # (`EnrichStats.errors`, which already sums `ai_failed` +
+                # `io_failed`, plus the crash-in-flight count) -- see
+                # `EnrichStats`'s own fields in enrich.py.
                 catalog.run_finish(
                     enrich_run_id,
                     scanned=row_stats.total,
                     copied=0,
                     duplicates=0,
-                    errors=row_errors,
+                    errors=0,
                     enriched=row_stats.enriched,
                     enrich_failed=row_errors,
                     breaker_state=_breaker_state(),
