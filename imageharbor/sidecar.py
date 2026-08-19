@@ -62,9 +62,22 @@ def _quarantine(path: Path, reason: str) -> None:
     merge silently replaced whatever those bytes held. Under the never-lose
     rule that is the one unacceptable outcome, so the bytes are preserved
     under a timestamped name and a fresh sidecar is built beside them.
+
+    The stamp carries microsecond precision, but that alone does not
+    guarantee a unique name -- a monkeypatched clock in a test, or simply
+    two quarantines landing in the same tick on a coarse system clock, would
+    still collide and `path.replace(target)` would silently overwrite the
+    FIRST quarantined file with the second, losing exactly the bytes this
+    function exists to preserve. So a numeric suffix is appended and bumped
+    until the candidate name is free, rather than trusting the timestamp
+    alone to be unique.
     """
-    stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     target = path.with_name(f"{path.name}.corrupt-{stamp}")
+    suffix = 0
+    while target.exists():
+        suffix += 1
+        target = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
     try:
         path.replace(target)
         logger.warning("Unreadable sidecar %s (%s); preserved as %s", path, reason, target.name)

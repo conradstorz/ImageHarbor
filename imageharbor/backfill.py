@@ -26,6 +26,7 @@ from .pipeline import _source_entry
 from .relocate import resolve_organized_path
 from .sidecar import merge_sidecar, read_sidecar, sidecar_path_for
 from .sidecar_schema import merge as merge_documents
+from .sidecar_schema import normalize_tier
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,12 @@ def _already_recorded_at_or_above(existing: dict, key: str, catalog_tier: int) -
     block = existing.get(key)
     if not isinstance(block, dict):
         return False
-    return (block.get("tier") or 0) >= catalog_tier
+    # Sibling of sidecar_schema._merge_tiered's totality bug: a hand-edited
+    # or corrupted sidecar can hold a non-int tier (e.g. "30"), and comparing
+    # that directly against catalog_tier (always an int) raises TypeError.
+    # normalize_tier reads anything uncoercible as tier 0, same as the
+    # merge path.
+    return normalize_tier(block.get("tier")) >= catalog_tier
 
 
 def _build_updates(organized_path: Path, row, existing: dict) -> dict:

@@ -241,6 +241,43 @@ def test_a_repeated_losing_observation_does_not_grow_the_history() -> None:
     assert json.dumps(doc, sort_keys=True) == after_first
 
 
+@pytest.mark.parametrize("malformed_tier", ["not-a-number", None, 25.0, {"nested": 1}])
+def test_a_non_int_tier_never_raises(malformed_tier) -> None:
+    """Finding 1: `_merge_tiered` compared `new_tier > old_tier` without
+    normalizing types, so a hand-edited or corrupted sidecar carrying a
+    non-int tier (a string, `None`, a float, a dict) raised `TypeError` --
+    a crash, where the never-lose rule demands a degrade to "less is
+    recorded" instead. `merge()` must stay total regardless of which side
+    (base or update) carries the malformed value.
+    """
+    good = {"date": {"value": "2015-03-09", "tier": 40, "source": "exif_original"}}
+    malformed = {"date": {"value": "2019-07-04", "tier": malformed_tier, "source": "hand_edit"}}
+
+    base = merge({}, malformed, observed_at=T0)
+    after = merge(base, good, observed_at=T1)  # malformed as the base -- must not raise
+    assert after["date"]["value"] in ("2015-03-09", "2019-07-04")
+
+    base2 = merge({}, good, observed_at=T0)
+    after2 = merge(base2, malformed, observed_at=T1)  # malformed as the update -- must not raise
+    assert after2["date"]["value"] in ("2015-03-09", "2019-07-04")
+
+
+def test_a_coercible_string_tier_compares_as_its_int_value() -> None:
+    """A numeric-string tier ("30") is real evidence, not automatically the
+    loser -- it must normalize to 30 and win or lose on that value, exactly
+    like the reproduction from finding 1.
+    """
+    base = merge({}, {"date": {"value": "2019-07-04", "tier": "30", "source": "x"}}, observed_at=T0)
+
+    beats_lower = merge(base, {"date": {"value": "2015-03-09", "tier": 20, "source": "y"}},
+                         observed_at=T1)
+    assert beats_lower["date"]["value"] == "2019-07-04"
+
+    loses_to_higher = merge(base, {"date": {"value": "2015-03-09", "tier": 40, "source": "exif_original"}},
+                             observed_at=T1)
+    assert loses_to_higher["date"]["value"] == "2015-03-09"
+
+
 # --- keyed lists ---------------------------------------------------------
 
 

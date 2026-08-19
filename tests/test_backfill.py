@@ -146,6 +146,25 @@ def test_backfill_merges_into_an_existing_thin_sidecar(
     assert "sources" in doc
 
 
+def test_backfill_does_not_raise_on_a_non_int_tier_in_an_existing_sidecar(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """Sibling of finding 1: `_already_recorded_at_or_above` compared a
+    stored block's tier against `catalog_tier` with the same un-normalized
+    `(block.get("tier") or 0) >= catalog_tier` shape as the bug in
+    `sidecar_schema._merge_tiered` -- a hand-edited sidecar with a string
+    tier (e.g. `"tier": "30"`) raised `TypeError` inside backfill too.
+    """
+    _organize_without_sidecars(source_dir, organized_dir, catalog)
+    organized = next(organized_dir.rglob("*.jpg"))
+    merge_sidecar(organized, {"date": {"value": "2019-07-04", "tier": "30", "source": "hand_edit"}})
+
+    stats = backfill_sidecars(organized_dir, catalog)
+
+    assert stats.failed == 0
+    read_sidecar(organized)  # must not raise while reading it back either
+
+
 def test_backfill_twice_is_fully_unchanged_and_byte_identical(
     source_dir: Path, organized_dir: Path, catalog: Catalog
 ) -> None:

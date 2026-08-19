@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
-from imageharbor.sidecar import merge_sidecar, read_sidecar, sidecar_path_for
+import imageharbor.sidecar as sidecar_module
+from imageharbor.sidecar import _quarantine, merge_sidecar, read_sidecar, sidecar_path_for
 
 
 def _img(tmp_path: Path) -> Path:
@@ -38,6 +40,36 @@ def test_a_corrupt_sidecar_is_quarantined_not_overwritten(tmp_path: Path) -> Non
     assert len(quarantined) == 1
     assert "TRUNCATED" in quarantined[0].read_text(encoding="utf-8")
     assert read_sidecar(img)["exif"] == {"Model": "5D"}
+
+
+def test_two_quarantines_at_the_same_instant_both_survive(tmp_path: Path, monkeypatch) -> None:
+    """Finding 3: `_quarantine` stamped to whole seconds and called
+    `path.replace(target)` unconditionally, so two quarantines within the
+    same tick -- a monkeypatched clock returning an identical timestamp is
+    the worst case, but a coarse system clock can hit this for real --
+    silently overwrote the FIRST quarantined file's bytes with the second's,
+    losing exactly what this function exists to preserve.
+    """
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, 0, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(sidecar_module, "datetime", _FixedDatetime)
+
+    path = tmp_path / "a.json"
+    path.write_text("first corrupt bytes", encoding="utf-8")
+    _quarantine(path, "reason one")
+
+    path.write_text("second corrupt bytes", encoding="utf-8")
+    _quarantine(path, "reason two")
+
+    quarantined = sorted(tmp_path.glob("a.json.corrupt-*"))
+    assert len(quarantined) == 2
+    assert len({p.name for p in quarantined}) == 2  # distinct names
+    contents = {p.read_text(encoding="utf-8") for p in quarantined}
+    assert contents == {"first corrupt bytes", "second corrupt bytes"}
 
 
 def test_a_hand_edit_survives_a_merge(tmp_path: Path) -> None:

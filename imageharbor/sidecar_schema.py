@@ -91,6 +91,28 @@ def _relocate(history: list, core: dict, **annotations: Any) -> None:
         history.append({**core, **annotations})
 
 
+def normalize_tier(value: Any) -> int:
+    """Coerce a stored tier to an int; anything uncoercible reads as tier 0.
+
+    A tier only ever needs to answer "which of these two is higher", so a
+    value whose provenance cannot be established this way -- a hand-edited
+    string, `None`, a float, a dict, a corrupted anything -- honestly
+    outranks nothing. Comparing an un-normalized tier against another (e.g.
+    `"30" > 40`) raises `TypeError` and breaks this module's totality
+    guarantee; every tier comparison in this module (and any sibling module
+    that reads a sidecar's stored tier, e.g. `backfill.py`) must route
+    through this function rather than comparing the raw stored value.
+    """
+    if isinstance(value, bool):
+        # bool is an int subclass but is never a legitimate tier -- treat it
+        # the same as any other type that was never meant to hold one.
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _coerce_block(value: Any) -> dict[str, Any]:
     """Normalize a block-shaped field, preserving a bare value rather than dropping it.
 
@@ -145,8 +167,8 @@ def _merge_tiered(base: Any, new: Any, observed_at: str) -> dict[str, Any]:
     if old_core == new_core:
         return base  # nothing observed that is not already on record
 
-    old_tier = base.get("tier") or 0
-    new_tier = new.get("tier") or 0
+    old_tier = normalize_tier(base.get("tier"))
+    new_tier = normalize_tier(new.get("tier"))
 
     if new_tier > old_tier:
         _relocate(history, old_core, superseded_at=observed_at)
