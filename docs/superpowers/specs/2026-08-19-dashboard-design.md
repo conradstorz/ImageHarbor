@@ -1,7 +1,7 @@
 # Operational dashboard and control gateway — design
 
 **Date:** 2026-08-19
-**Status:** approved, not yet implemented
+**Status:** implemented (2026-08-19) — see "Departures from this design" below
 **Extends:** [`2026-07-31-dockerized-watcher-design.md`](2026-07-31-dockerized-watcher-design.md)
 
 ## Goal
@@ -376,6 +376,42 @@ malformed body returning 400 rather than raising, and an unknown path returning
   first, then start `watch`, and assert photos are still organized and only a
   warning was logged. Mutation-test it: let the bind error propagate and confirm
   the test fails.
+
+## Departures from this design
+
+Two deliberate departures from what this spec originally described, both
+confirmed against the shipped code (`imageharbor/watcher.py`,
+`imageharbor/dashboard/`, `imageharbor/catalog.py`) rather than assumed:
+
+- **`watch()` takes the `ControlPlane` object, not `interval`/
+  `enrich_enabled` values.** This spec's "The dials" table implies the three
+  controls are read like ordinary config. In the implementation,
+  `watcher.watch(..., control=control)` receives the live `ControlPlane`
+  instance itself and re-reads `control.pause_check()`, `control.interval`,
+  and `control.enrich_enabled` fresh on *every* loop iteration — never a
+  value captured once. `watch()` loops for the life of the container, so a
+  plain float/bool parameter would freeze at process start: the dashboard
+  would accept an edit, persist it, and show it as active, but two of the
+  three dials (interval, enrichment toggle) would silently never actually
+  change runtime behavior until a restart. The pre-existing `interval`/
+  `enrich_enabled` parameters are kept on `watch()`, used only when
+  `control=None` (e.g. tests, or a future non-dashboard caller), and behave
+  exactly as they did before this feature.
+- **The `PRAGMA busy_timeout` was never actually the gap this spec first
+  claimed.** Already corrected in "Ground truth" and "Concurrency" above,
+  confirmed still accurate against the shipped `Catalog.__init__`
+  (`imageharbor/catalog.py`): CPython's `sqlite3.connect()` applies
+  `timeout=5.0` by default, which *is* `busy_timeout=5000`, so contention
+  between the watcher's photo writes and the dashboard's settings writes
+  already waited five seconds before this pragma was added. The pragma is
+  kept as an explicit pin at the point of use — belt-and-braces against a
+  future `connect(timeout=0)` silently removing that wait, not a bug fix.
+
+Everything else in this spec — the module split, the two additive tables, the
+five HTTP routes, the never-stop-the-watcher rule, pause-between-photos
+semantics in both passes, and projections refusing to guess — matches the
+shipped implementation as verified during Task 9 (live watcher + dashboard
+testing against a real organized library).
 
 ## Accepted limitations
 
