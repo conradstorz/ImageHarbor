@@ -1003,3 +1003,88 @@ def test_runs_and_settings_tables_do_not_bump_the_schema_version(tmp_path: Path)
     with Catalog(tmp_path / "c.db") as cat:
         assert cat.setting_get("interval") == "120"
         assert cat.unfinished_runs()[0]["id"] == run_id
+
+
+# ---------------------------------------------------------------------------
+# Concurrency -- CRITICAL finding #2
+#
+# `cli.py` passes ONE `Catalog` to `ControlPlane`, the dashboard HTTP server
+# (`daemon_threads = True`, one thread per request), and the watcher loop.
+# `check_same_thread=False` PERMITS concurrent access from multiple threads;
+# it does not make it safe. Measured under realistic load before the fix (4
+# pollers at 5 Hz + pause POSTs, 25s): 55 exceptions out of the writer,
+# including "cannot commit - no transaction is active", "cannot start a
+# transaction within a transaction", "another row available", and
+# "SystemError: error return without exception set" out of `run_finish`.
+# `Catalog.lock` (a `threading.RLock`) now guards every public method.
+#
+# This test is deterministic on purpose -- a FIXED thread count and a FIXED
+# operation count per thread, not a timed loop -- so it fails the same way
+# every time it fails, rather than being a flaky proxy for real contention.
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_reads_and_writes_from_multiple_threads_raise_nothing(tmp_path: Path) -> None:
+    import queue
+    import threading
+
+    THREADS_EACH = 4          # writer threads and reader threads, each
+    OPS_PER_THREAD = 40        # fixed, not time-based
+
+    cat = Catalog(tmp_path / "concurrent.db")
+    errors: "queue.Queue[BaseException]" = queue.Queue()
+
+    def _writer(thread_id: int) -> None:
+        try:
+            for i in range(OPS_PER_THREAD):
+                digest = f"W{thread_id}-{i}"
+                cat.upsert(
+                    sha256_b64url=digest,
+                    original_path=f"/w{thread_id}/{i}.jpg",
+                    organized_path=f"/lib/w{thread_id}/{i}.jpg",
+                )
+                run_id = cat.run_start("facts")
+                cat.run_finish(
+                    run_id, scanned=1, copied=1, duplicates=0, errors=0,
+                    enriched=0, enrich_failed=0, breaker_state="CLOSED", paused=False,
+                )
+                cat.setting_set("interval", str(100 + i))
+                cat.record_file_failure(f"/w{thread_id}/{i}.jpg", 10, i, "boom")
+        except BaseException as exc:  # noqa: BLE001 -- captured for the assertion below
+            errors.put(exc)
+
+    def _reader(thread_id: int) -> None:
+        try:
+            for _ in range(OPS_PER_THREAD):
+                cat.recent_runs(limit=5)
+                cat.unfinished_runs()
+                cat.iter_unenriched()
+                cat.count_unenriched()
+                cat.settings_all()
+                list(cat.iter_all())
+        except BaseException as exc:  # noqa: BLE001
+            errors.put(exc)
+
+    threads = [
+        threading.Thread(target=_writer, args=(n,), name=f"writer-{n}")
+        for n in range(THREADS_EACH)
+    ] + [
+        threading.Thread(target=_reader, args=(n,), name=f"reader-{n}")
+        for n in range(THREADS_EACH)
+    ]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        assert all(not t.is_alive() for t in threads), "a thread did not finish within 60s"
+
+        collected: list[BaseException] = []
+        while not errors.empty():
+            collected.append(errors.get_nowait())
+        assert collected == [], (
+            f"{len(collected)} exception(s) raised by concurrent Catalog access: "
+            f"{[repr(e) for e in collected]}"
+        )
+    finally:
+        cat.close()

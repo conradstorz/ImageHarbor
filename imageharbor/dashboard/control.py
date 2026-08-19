@@ -15,6 +15,7 @@ change.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from imageharbor.catalog import Catalog
@@ -33,12 +34,21 @@ def _parse_interval(raw: Any) -> float | None:
     """Parse a stored interval string to a positive, finite float.
 
     Returns None for anything that cannot be trusted as a real interval:
-    unparseable text, NaN, zero, or negative. Zero or negative is treated as
-    unreadable rather than "instant" -- a 0-second poll interval would spin
-    the watcher loop as fast as the CPU allows, which is exactly the kind of
-    quiet corruption this project's discipline exists to prevent. A huge but
-    well-formed value (e.g. "1e9") is accepted: it is a silly interval, not
-    an unreadable one, and an operator who set it gets what they asked for.
+    unparseable text, NaN, +/-Infinity, zero, or negative. Zero or negative
+    is treated as unreadable rather than "instant" -- a 0-second poll
+    interval would spin the watcher loop as fast as the CPU allows, which is
+    exactly the kind of quiet corruption this project's discipline exists to
+    prevent. Infinity is rejected for a sharper reason: it is not merely a
+    silly interval, it is not representable at all where an interval is
+    actually consumed -- ``threading.Event.wait(math.inf)`` raises
+    ``OverflowError`` (a `float` timestamp/timeout must fit a platform
+    `time_t`), so a stored `inf` must never reach a caller as if it were a
+    real, if extreme, number. `math.isfinite` is the single check that
+    correctly rejects NaN and both infinities together -- see
+    `set_override` below, which enforces the same rule at write time. A
+    huge but well-formed *finite* value (e.g. "1e9") is still accepted: it
+    is a silly interval, not an unreadable one, and an operator who set it
+    gets what they asked for.
     """
     if raw is None:
         return None
@@ -46,7 +56,7 @@ def _parse_interval(raw: Any) -> float | None:
         value = float(raw)
     except (TypeError, ValueError):
         return None
-    if value != value:  # NaN != NaN
+    if not math.isfinite(value):
         return None
     if value <= 0:
         return None
@@ -174,7 +184,11 @@ class ControlPlane:
                 interval = float(value)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"interval must be numeric, got {value!r}") from exc
-            if interval != interval or interval <= 0:
+            # math.isfinite is the one check that rejects NaN AND both
+            # +/-Infinity -- see _parse_interval's docstring for why a
+            # stored Infinity is not just "silly" but actively unsafe: it
+            # reaches Event.wait() downstream and raises OverflowError there.
+            if not math.isfinite(interval) or interval <= 0:
                 raise ValueError(
                     f"interval must be a positive, finite number, got {value!r}"
                 )

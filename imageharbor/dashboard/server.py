@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -237,6 +238,23 @@ def make_handler(
                     HTTPStatus.BAD_REQUEST, {"error": "interval must be numeric"}
                 )
                 return
+            # `json.loads` accepts the bare (non-standard-JSON) tokens
+            # `Infinity`/`-Infinity`/`NaN` and hands back a real `float`, so
+            # `{"interval": Infinity}` reaches here as `body["interval"] ==
+            # float("inf")` -- a value `ControlPlane.set_override` would
+            # also now reject, but rejecting it explicitly at this boundary
+            # (rather than relying solely on that downstream ValueError)
+            # means non-finite junk never even reaches `set_override`, per
+            # the same "the boundary rejects it, the reader is never asked
+            # to defend against it" rule the negative-interval test above
+            # already pins.
+            if "interval" in body and isinstance(body["interval"], (int, float)):
+                if not math.isfinite(body["interval"]):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "interval must be a finite number"},
+                    )
+                    return
             if "enrich" in body and not isinstance(body["enrich"], bool):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST, {"error": "enrich must be a boolean"}

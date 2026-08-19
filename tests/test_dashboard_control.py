@@ -184,12 +184,24 @@ def test_an_unparseable_stored_value_falls_back_to_env(catalog: Catalog) -> None
     assert control.interval == 300
 
 
-@pytest.mark.parametrize("hostile_interval", ["abc", "", "-5", "0", "nan"])
+@pytest.mark.parametrize(
+    "hostile_interval",
+    ["abc", "", "-5", "0", "nan", "inf", "-inf", "Infinity", "-Infinity"],
+)
 def test_hostile_stored_intervals_fall_back_to_env_not_zero(
     catalog: Catalog, hostile_interval: str, caplog
 ) -> None:
     """None of these must ever produce 0 -- a 0-second poll interval would
-    spin the watcher loop as fast as the CPU allows."""
+    spin the watcher loop as fast as the CPU allows.
+
+    "inf"/"Infinity" is the sharpest case here (CRITICAL finding #1): a
+    stored positive Infinity is not merely a silly interval like "1e9" is --
+    `float("inf")` is > 0, so the old code's `value <= 0` check let it
+    through, and it is not representable where an interval is actually
+    consumed (`Event.wait(math.inf)` raises `OverflowError`). It must fall
+    back to the env value like every other unreadable stored value, not
+    reach `ControlPlane.interval` as `inf`.
+    """
     catalog.setting_set("interval", hostile_interval)
     with caplog.at_level(logging.WARNING):
         control = ControlPlane(catalog, env_interval=300, env_enrich=True)
@@ -240,6 +252,25 @@ def test_set_override_rejects_a_non_positive_interval(catalog: Catalog) -> None:
     with pytest.raises(ValueError):
         control.set_override("interval", -5)
     # neither rejected write left a row behind
+    assert catalog.setting_get("interval") is None
+    assert control.interval == 300
+
+
+@pytest.mark.parametrize(
+    "non_finite", [float("inf"), float("-inf"), float("nan")]
+)
+def test_set_override_rejects_a_non_finite_interval(
+    catalog: Catalog, non_finite: float
+) -> None:
+    """CRITICAL finding #1: `{"interval": Infinity}` must never reach the
+    settings store. `float("inf") > 0`, so a stale `interval <= 0` check
+    alone is not enough to reject it -- `math.isfinite` is required. A
+    stored `inf` would otherwise reach `ControlPlane.interval` unchanged and
+    later crash `watcher.watch()`'s `Event.wait(inf)` with `OverflowError`.
+    """
+    control = ControlPlane(catalog, env_interval=300, env_enrich=True)
+    with pytest.raises(ValueError):
+        control.set_override("interval", non_finite)
     assert catalog.setting_get("interval") is None
     assert control.interval == 300
 

@@ -233,6 +233,37 @@ def test_post_settings_rejects_unknown_key(handler_cls, control: ControlPlane) -
 
 
 # ---------------------------------------------------------------------------
+# POST /api/settings -- CRITICAL finding #1: Infinity/-Infinity/NaN
+# ---------------------------------------------------------------------------
+#
+# `json.dumps` cannot serialize `float("inf")` (raises `ValueError`), so
+# `_dispatch_json` can't be used to send it -- but `json.loads` (Python's
+# stdlib, used by `_read_json_body`) accepts the bare, non-standard-JSON
+# tokens `Infinity`/`-Infinity`/`NaN` on the way IN. That asymmetry is
+# exactly how a hostile/buggy client can hand this endpoint a value nothing
+# in this codebase can ever produce by calling `json.dumps` itself. The raw
+# bytes below reproduce that literally.
+
+
+@pytest.mark.parametrize("token", ["Infinity", "-Infinity", "NaN"])
+def test_post_settings_rejects_non_finite_interval(
+    handler_cls, control: ControlPlane, token: str
+) -> None:
+    status, _, body = _dispatch(
+        handler_cls,
+        "POST",
+        "/api/settings",
+        body=("{\"interval\": %s}" % token).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    assert status == 400
+    assert b"Traceback" not in body
+    # Must not have been stored -- same boundary-rejects-it guarantee as the
+    # negative-interval test above.
+    assert control.interval == 300
+
+
+# ---------------------------------------------------------------------------
 # POST /api/settings/revert
 # ---------------------------------------------------------------------------
 

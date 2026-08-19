@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from pathlib import Path
 
@@ -10,7 +11,14 @@ import pytest
 from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.pipeline import Pipeline
-from imageharbor.watcher import CONSECUTIVE_ABORT_WARNING_THRESHOLD, WatchStats, run_pass, watch
+from imageharbor.watcher import (
+    CONSECUTIVE_ABORT_WARNING_THRESHOLD,
+    WatchStats,
+    _MAX_SLEEP_SECONDS,
+    _safe_sleep,
+    run_pass,
+    watch,
+)
 
 
 def _make_jpeg(path: Path, content: bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9") -> Path:
@@ -419,6 +427,84 @@ def test_watch_paused_control_skips_the_pass_and_sleeps(
     assert calls["n"] == 0           # no pass was ever started
     assert slept == [1.0]            # but the loop did sleep the interval
     assert wstats.passes == 0
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL finding #1 (belt-and-braces): a non-finite interval reaching
+# sleep() must never crash the watch loop, even if it somehow got past
+# ControlPlane's own math.isfinite validation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [math.inf, -math.inf, math.nan])
+def test_safe_sleep_replaces_non_finite_seconds_with_the_ceiling(bad: float) -> None:
+    calls: list[float] = []
+
+    def _sleep(seconds: float) -> bool:
+        calls.append(seconds)
+        return True
+
+    _safe_sleep(_sleep, bad)
+    assert calls == [_MAX_SLEEP_SECONDS]
+
+
+def test_safe_sleep_catches_overflow_error_from_the_underlying_sleep() -> None:
+    """The pre-check (`math.isfinite` + clamping to `_MAX_SLEEP_SECONDS`)
+    already prevents an out-of-range value from reaching `sleep` in every
+    case this module can construct -- but the call itself is *also* wrapped
+    in `try/except OverflowError`, as a second, independent guard against a
+    platform whose real `Event.wait` overflows even for an in-range value
+    this module considers safe. This test exercises that second guard
+    directly, since nothing in this module's own clamping can trigger it.
+    """
+    calls: list[float] = []
+
+    def _sleep(seconds: float) -> bool:
+        calls.append(seconds)
+        raise OverflowError("timestamp out of range for platform time_t")
+
+    with pytest.raises(OverflowError):
+        # The retry itself calls `sleep(_MAX_SLEEP_SECONDS)`, which this
+        # fake still rejects unconditionally -- confirming _safe_sleep does
+        # not swallow a *persistent* failure, only retries it once with the
+        # ceiling value, exactly like the real call site is expected to.
+        _safe_sleep(_sleep, 5.0)
+    assert calls == [5.0, _MAX_SLEEP_SECONDS]
+
+
+def test_watch_survives_a_non_finite_interval_without_crashing(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """Even with `control=None` (bypassing `ControlPlane`'s own validation
+    entirely) and a `sleep` double that would raise `OverflowError` (as the
+    real `Event.wait` does) if it were ever actually handed a non-finite
+    value, `watch()` must not crash. `_safe_sleep` replaces the bad value
+    with `_MAX_SLEEP_SECONDS` before the call reaches `sleep` at all, so the
+    double's `OverflowError` branch is never triggered here -- proving the
+    watcher-side guard works end-to-end through the public `watch()` entry
+    point, on top of (not instead of) the control.py store-side fix.
+    """
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    stop = threading.Event()
+    calls: list[float] = []
+
+    def _sleep(seconds: float) -> bool:
+        calls.append(seconds)
+        if not math.isfinite(seconds):
+            raise OverflowError("timestamp out of range for platform time_t")
+        stop.set()
+        return True
+
+    # No exception escapes watch() -- this call itself is the assertion.
+    wstats = watch(
+        pipeline=pipeline,
+        catalog=catalog,
+        interval=math.inf,
+        stop_event=stop,
+        sleep=_sleep,
+    )
+    assert wstats.passes == 1
+    assert calls[-1] == _MAX_SLEEP_SECONDS
 
 
 def test_watch_reads_live_interval_from_control_each_iteration(

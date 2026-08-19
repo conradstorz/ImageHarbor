@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import shutil
 import threading
 from dataclasses import dataclass
@@ -36,6 +37,49 @@ logger = logging.getLogger(__name__)
 # slow probes against a flaky-but-recovering backend don't false-positive,
 # short enough that a genuinely stuck watcher gets flagged well within a day.
 CONSECUTIVE_ABORT_WARNING_THRESHOLD = 10
+
+# A defensive ceiling on any single `sleep()` call this loop makes, in
+# seconds (~1 year). `control.py` validates `interval` with `math.isfinite`
+# at both write time (`set_override`) and read time (`_parse_interval`), so
+# a non-finite value should never reach here -- but `_safe_sleep` below is a
+# second, independent guard: belt-and-braces, not the primary fix. Without
+# it, a value that somehow slips past the store (a future caller that
+# doesn't go through ControlPlane, a hand-rolled test double, `math.inf`
+# passed directly) would reach `Event.wait(math.inf)` and raise
+# `OverflowError` -- an unhandled exception in the middle of the watch loop,
+# taking the whole watcher down. A year is far longer than any real poll
+# interval and still short enough that a wedged watcher recovers within the
+# process's lifetime rather than sleeping until the process is manually
+# restarted anyway.
+_MAX_SLEEP_SECONDS = 365 * 24 * 3600.0
+
+
+def _safe_sleep(sleep: Callable[[float], bool | None], seconds: float) -> None:
+    """Call *sleep(seconds)* defensively -- a bad value must never crash the loop.
+
+    A non-finite (`inf`/`-inf`/`nan`) or negative *seconds* is replaced with
+    `_MAX_SLEEP_SECONDS` before the call. `Event.wait` (the default `sleep`)
+    additionally raises `OverflowError` for a `float` timeout too large for
+    the platform's `time_t` even when it IS finite -- e.g. a stored interval
+    of "1e400" parsed by `float()` -- so the call itself is also wrapped
+    rather than trusting the pre-check alone.
+    """
+    if not math.isfinite(seconds) or seconds < 0:
+        logger.warning(
+            "watch(): refusing to sleep(%r); using %.0fs instead",
+            seconds, _MAX_SLEEP_SECONDS,
+        )
+        seconds = _MAX_SLEEP_SECONDS
+    else:
+        seconds = min(seconds, _MAX_SLEEP_SECONDS)
+    try:
+        sleep(seconds)
+    except OverflowError:
+        logger.warning(
+            "watch(): sleep(%r) raised OverflowError; using %.0fs instead",
+            seconds, _MAX_SLEEP_SECONDS,
+        )
+        sleep(_MAX_SLEEP_SECONDS)
 
 
 @dataclass
@@ -519,12 +563,12 @@ def watch(
         # interval and runs NO pass at all, rather than starting one and
         # immediately breaking out.
         if control is not None and control.pause_check():
-            sleep(control.interval)
+            _safe_sleep(sleep, control.interval)
             continue
         if breaker is not None and breaker.is_open():
             wait = breaker.seconds_until_probe()
             if wait > 0:
-                sleep(wait)
+                _safe_sleep(sleep, wait)
                 continue
             breaker.begin_probe()
         # Same freshness requirement as the interval: read on every pass, not
@@ -568,7 +612,7 @@ def watch(
             if stop_event.is_set():
                 break
             current_interval = control.interval if control is not None else interval
-            sleep(current_interval)
+            _safe_sleep(sleep, current_interval)
             continue
         if enrich_stats is not None:
             if enrich_stats.aborted:
@@ -637,5 +681,5 @@ def watch(
         # dashboard interval change must take effect on THIS sleep, not
         # whatever value `watch()` happened to be called with.
         current_interval = control.interval if control is not None else interval
-        sleep(current_interval)
+        _safe_sleep(sleep, current_interval)
     return wstats
