@@ -171,11 +171,17 @@ def test_a_stale_history_does_not_project() -> None:
 
 
 def test_the_rate_is_always_one_a_pass_actually_achieved() -> None:
-    """An interpolated median invents a rate nobody ever ran at."""
+    """An interpolated median invents a rate nobody ever ran at.
+
+    Pinned to `== 10.0`, not `in {10.0, 1000.0}`: the code comments justify
+    `median_low` specifically as the conservative choice, and a test that
+    accepts either direction does not pin that reasoning -- it would still
+    pass if `median_low` were swapped for `median_high`.
+    """
     bimodal = ([_run((i + 1) * 15, 60.0, 10) for i in range(5)] +      # 10/hr
                [_run((i + 6) * 15, 6.0, 100) for i in range(5)])       # 1000/hr
     p = project(bimodal, backlog=100, breaker_open=False, paused=False, now=NOW)
-    assert p.rate_per_hour in {10.0, 1000.0}
+    assert p.rate_per_hour == 10.0
 
 
 def test_an_absurd_eta_is_reported_as_stalled() -> None:
@@ -185,3 +191,72 @@ def test_an_absurd_eta_is_reported_as_stalled() -> None:
     assert p.status == STATUS_STALLED
     assert p.rate_per_hour is not None     # the operator can still see the rate
     assert p.eta_seconds is None
+
+
+# --- the third round of defects ---------------------------------------------
+
+
+@pytest.mark.parametrize("bad_backlog", [None, "abc", float("nan"), -5])
+def test_an_unreadable_backlog_is_unknown_not_complete(bad_backlog) -> None:
+    """"Cannot read the backlog" must never be reported as "nothing left".
+
+    COMPLETE tells the operator there is nothing to watch; UNKNOWN tells them
+    the dashboard cannot currently say. Those are very different claims, and
+    only a genuinely-parsed 0 earns COMPLETE.
+    """
+    p = project(_steady(), backlog=bad_backlog, breaker_open=False, paused=False, now=NOW)
+    assert p.status == STATUS_UNKNOWN
+    assert p.status != STATUS_COMPLETE
+
+
+def test_a_genuine_zero_backlog_is_still_complete() -> None:
+    p = project(_steady(), backlog=0, breaker_open=False, paused=False, now=NOW)
+    assert p.status == STATUS_COMPLETE
+
+
+def test_a_stale_history_does_not_project_with_a_naive_now() -> None:
+    """Guards the staleness check's second failure vector.
+
+    The first fix made an unreadable-age list stalled/unknown when `now` was
+    aware and every row's `end` was naive (or vice versa). But when *every*
+    row mismatches, `ages` ends up empty either way -- and the original bug
+    was `if ages:` silently skipping the whole check on an empty list, which
+    let a 60-day-old history read as fresh again. This test pins that an
+    empty `ages` list refuses (STATUS_UNKNOWN), it does not fall through to
+    STATUS_PROJECTED, with a *naive* `now` against aware row timestamps --
+    the mirror image of the aware-`now`-vs-naive-rows case.
+    """
+    naive_now = NOW.replace(tzinfo=None)
+    stale = [_run(minutes_ago=60 * 24 * 60 + (i + 1) * 15, duration_min=10.0, enriched=10)
+             for i in range(10)]
+    p = project(stale, backlog=500, breaker_open=False, paused=False, now=naive_now)
+    assert p.status != STATUS_PROJECTED
+    assert p.status == STATUS_UNKNOWN
+    assert p.eta_seconds is None
+
+
+def test_sub_second_passes_do_not_produce_a_rate() -> None:
+    """Two 1-millisecond passes must not be read as an 18,000,000/hr rate."""
+    fast = [_run(minutes_ago=15, duration_min=1.0 / 60000.0, enriched=5),
+            _run(minutes_ago=30, duration_min=1.0 / 60000.0, enriched=5)]
+    p = project(fast, backlog=100, breaker_open=False, paused=False, now=NOW)
+    assert p.status != STATUS_PROJECTED
+    assert p.status == STATUS_UNKNOWN
+
+
+def test_runs_of_none_does_not_raise() -> None:
+    """`runs=None` is exactly what a failed DB query yields."""
+    p = project(None, backlog=500, breaker_open=False, paused=False, now=NOW)
+    assert p.status == STATUS_UNKNOWN
+
+
+@pytest.mark.parametrize("bad_now", ["2026-08-19T12:00:00Z", None, 12345])
+def test_a_non_datetime_now_does_not_raise(bad_now) -> None:
+    """A bad `now` disables the staleness check rather than crashing the page.
+
+    With a real rated history present, staleness cannot be established, so
+    the call must refuse (STATUS_UNKNOWN) rather than raise or silently
+    project as if the history were fresh.
+    """
+    p = project(_steady(), backlog=500, breaker_open=False, paused=False, now=bad_now)
+    assert p.status == STATUS_UNKNOWN

@@ -29,6 +29,15 @@ RECENT_PASSES = 10
 # Two samples is the minimum worth calling a trend. One pass is an anecdote.
 MIN_SAMPLES = 2
 
+# A pass that measured in under a second did not measure a sustainable rate:
+# dividing a real enriched-count by a near-zero duration produces an
+# arbitrarily large number that *looks* like a rate but is actually
+# measurement noise (clock resolution, a resumed pass, a test fixture).
+# This is a plausibility filter on the measurement itself, not an assumption
+# about how fast enrichment "should" run -- a row below the floor is
+# excluded from the rate sample exactly like an unparseable one.
+MIN_PASS_SECONDS = 1.0
+
 # If the most recent *completed* pass ended longer ago than this, the recent
 # history is not "recent" -- it's an artifact of a wedged watcher, and this
 # module has no way to know whether the world has changed since. This is the
@@ -119,14 +128,20 @@ def _rate(parsed: _ParsedRun) -> float | None:
     than treated as zero-length -- an unfinished pass is not evidence of a
     rate. So is a row a crashed pass left behind, which is the same shape.
     A row whose two timestamps disagree on timezone-awareness is likewise
-    excluded: it cannot be read, so it is not evidence either.
+    excluded: it cannot be read, so it is not evidence either. Nor is a row
+    that finished in under `MIN_PASS_SECONDS`: a duration that short cannot
+    have measured a sustainable rate, so it is excluded rather than divided.
     """
     if parsed.end is None:
         return None
-    hours = _safe_delta_seconds(parsed.end, parsed.start)
-    if hours is None:
+    seconds = _safe_delta_seconds(parsed.end, parsed.start)
+    if seconds is None:
         return None
-    hours /= 3600.0
+    if seconds < MIN_PASS_SECONDS:
+        # Sub-floor duration: not evidence of a rate, just noise amplified by
+        # a tiny denominator. See MIN_PASS_SECONDS above for the reasoning.
+        return None
+    hours = seconds / 3600.0
     if hours <= 0:
         return None
     try:
@@ -134,6 +149,28 @@ def _rate(parsed: _ParsedRun) -> float | None:
     except (TypeError, ValueError):
         return None
     return enriched / hours
+
+
+def _parse_backlog(value: Any) -> int | None:
+    """Coerce *value* to a non-negative int backlog, or None if unreadable.
+
+    None is deliberately distinct from 0. `int(None)`/`int("abc")` raise, and
+    `int(float('nan'))` also raises (checked explicitly below rather than
+    assumed, since the exact failure mode of NaN-to-int is easy to get
+    wrong) -- all of those mean "we could not read the backlog", which is a
+    different fact than "the backlog is genuinely zero". A negative count is
+    equally nonsensical and is treated the same way: unreadable, not "done".
+    Only a value that actually parses to >= 0 is a real backlog.
+    """
+    try:
+        if isinstance(value, float) and value != value:  # NaN != NaN
+            return None
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
 
 
 def _format_age(seconds: float) -> str:
@@ -146,7 +183,7 @@ def _format_age(seconds: float) -> str:
 
 
 def project(
-    runs: Sequence[Any],
+    runs: Sequence[Any] | None,
     backlog: int,
     *,
     breaker_open: bool,
@@ -158,7 +195,12 @@ def project(
     """Project completion of *backlog* from the *runs* history.
 
     Returns a stalled or unknown status rather than a number whenever the
-    evidence does not support one. Never raises.
+    evidence does not support one. Never raises -- including when `runs` is
+    `None` or otherwise not iterable (a failed DB query is treated as an
+    empty history) and when `now` is not a `datetime` (the staleness check
+    cannot be evaluated and the call resolves to STATUS_UNKNOWN whenever a
+    history is present to be timestamped against it, exactly as if every row
+    in it were unreadable in time).
 
     `stale_after_seconds` is this module's own defense against a wedged
     watcher: if the most recent *completed* pass ended longer ago than this,
@@ -174,11 +216,22 @@ def project(
     the current rate, and it should read as one.
     """
     try:
-        backlog = int(backlog)
-    except (TypeError, ValueError):
-        backlog = 0
+        runs = list(runs) if runs is not None else []
+    except TypeError:
+        # Not iterable at all (e.g. a failed query returned something other
+        # than a sequence). Treated as "no history", not a crash.
+        runs = []
 
-    if backlog <= 0:
+    parsed_backlog = _parse_backlog(backlog)
+    if parsed_backlog is None:
+        # Cannot tell how much work is outstanding -- this is "unknown", not
+        # "nothing outstanding". Reporting COMPLETE here is exactly the
+        # confident-wrong-answer this module exists to refuse.
+        return Projection(0, None, None, STATUS_UNKNOWN,
+                          f"backlog value is unreadable: {backlog!r}")
+    backlog = parsed_backlog
+
+    if backlog == 0:
         return Projection(0, None, None, STATUS_COMPLETE, "nothing outstanding")
 
     # Refusals first: state beats history. A rate measured before the backend
@@ -205,14 +258,33 @@ def project(
     # Independent staleness defense: a history can be entirely well-formed
     # and still be too old to say anything about the present.
     ends = [p.end for p, r in rated if r is not None and p.end is not None]
-    ages = [age for age in (_safe_delta_seconds(now, end) for end in ends) if age is not None]
-    if ages:
-        most_recent_age = min(ages)
-        if most_recent_age > stale_after_seconds:
-            return Projection(
-                backlog, None, None, STATUS_STALLED,
-                f"most recent completed pass ended {_format_age(most_recent_age)} ago",
-            )
+    if isinstance(now, datetime):
+        ages = [age for age in (_safe_delta_seconds(now, end) for end in ends) if age is not None]
+    else:
+        # `now` cannot be compared to anything -- see below, same handling
+        # as every row mismatching.
+        ages = []
+
+    # `rated` is non-empty here (MIN_SAMPLES was already enforced above), so
+    # `ends` is always non-empty too -- every rated pass has an `end`. An
+    # empty `ages` therefore never means "no rows to check": it means every
+    # age was unreadable (a timezone-awareness mismatch against `now`, or
+    # `now` itself not being a usable datetime). An unreadable age must
+    # NEVER be treated as a fresh one -- that silent substitution is exactly
+    # how this defect returned after the staleness check was first added,
+    # so this branch must fail closed (refuse) rather than fail open (skip
+    # the check and fall through to projecting).
+    if not ages:
+        return Projection(backlog, None, None, STATUS_UNKNOWN,
+                          "recent passes have timestamps that cannot be "
+                          "compared to now")
+
+    most_recent_age = min(ages)
+    if most_recent_age > stale_after_seconds:
+        return Projection(
+            backlog, None, None, STATUS_STALLED,
+            f"most recent completed pass ended {_format_age(most_recent_age)} ago",
+        )
 
     # median_low, not median: with an even sample count `median` would
     # interpolate between the two middle samples, synthesizing a rate no
