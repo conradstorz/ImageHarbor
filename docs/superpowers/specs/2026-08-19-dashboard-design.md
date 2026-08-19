@@ -57,10 +57,20 @@ Measured against the current tree at `daaff10`.
 - **A record of passes.** The catalog knows about photos, not about runs. There
   is no way to ask "how many passes ran yesterday" or "what rate is enrichment
   achieving", which is precisely what history and projections need.
-- **`PRAGMA busy_timeout`.** `catalog.py:201` sets WAL but no busy timeout, so
-  any lock contention surfaces as an opaque `database is locked` abort. This was
-  flagged in the 2026-08-18 whole-branch review as a pre-existing gap; this
-  design fixes it because it introduces the first legitimate second writer.
+- **An explicit `PRAGMA busy_timeout`** — though **not** the gap it was claimed
+  to be. This spec originally asserted that without it, contention surfaces as
+  an opaque `database is locked` abort, and the 2026-08-18 whole-branch review
+  said the same. Both were wrong: CPython's `sqlite3.connect()` applies
+  `timeout=5.0` by default, which *is* `busy_timeout=5000`, so a contended write
+  already waits five seconds. Measured 2026-08-19 — a default connection and an
+  ImageHarbor `Catalog` both report `busy_timeout = 5000`.
+
+  The pragma is still added, for one honest reason: it pins the value at the
+  point of use, so a future `connect(timeout=0)` cannot silently remove the wait
+  (measured: that call yields `busy_timeout = 0`). It is belt-and-braces and
+  self-documenting, not a bug fix, and no test can distinguish its presence from
+  its absence — which the implementation reported rather than inventing a test
+  that would pass either way.
 - **Runtime dependencies for a web server.** The project runs on Pillow and
   Click alone.
 
