@@ -16,7 +16,7 @@ import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .ai_classifier import AIClassifier
 from .catalog import Catalog
@@ -24,6 +24,9 @@ from .circuit_breaker import CircuitBreaker
 from .discovery import discover_images
 from .enrich import EnrichStats, enrich_library
 from .pipeline import Pipeline
+
+if TYPE_CHECKING:
+    from .dashboard.control import ControlPlane
 
 logger = logging.getLogger(__name__)
 
@@ -306,12 +309,28 @@ def watch(
     enrich_enabled: bool = True,
     poison_max_fails: int = 5,
     quarantine_dir: Optional[Path] = None,
+    control: ControlPlane | None = None,
 ) -> WatchStats:
     """Run passes until stop_event is set. An immediate first pass runs before
     the first sleep. ``sleep`` defaults to ``stop_event.wait`` so a signal
     interrupts the wait promptly. When the breaker is OPEN, the between-pass
     wait is the breaker's remaining backoff instead of ``interval``; once it
     elapses the next pass runs as a half-open probe.
+
+    ``control``, when given, is a live :class:`~imageharbor.dashboard.control.
+    ControlPlane` consulted FRESH on every iteration for three dials:
+    ``control.pause_check()``, ``control.interval``, and
+    ``control.enrich_enabled``. This loop runs once and lives for the life of
+    the container, so anything captured as a plain *value* at call time would
+    be frozen at startup -- a dashboard edit would update the UI, persist to
+    the database, and never actually change behavior until a restart. Reading
+    the object on each pass instead of its values up front is what makes the
+    dashboard's dials live rather than decorative. A paused control makes this
+    loop sleep the interval and run NO pass at all, rather than starting one
+    and immediately breaking out -- pausing takes effect between photos (see
+    ``Pipeline.run``'s ``pause_check``), never mid-pass. When ``control`` is
+    ``None``, the ``interval``/``enrich_enabled`` parameters below are used
+    exactly as before this option existed.
 
     Each pass is a full facts-then-enrichment sweep (`run_once`): the facts
     phase always runs; the enrichment phase (and therefore the breaker) is
@@ -361,12 +380,25 @@ def watch(
     probe_offset = 0
     consecutive_aborted_passes = 0
     while not stop_event.is_set():
+        # Read the pause flag fresh every iteration -- see the docstring
+        # above for why a value captured once at startup would silently
+        # defeat this dial. A paused watcher sleeps the (also freshly-read)
+        # interval and runs NO pass at all, rather than starting one and
+        # immediately breaking out.
+        if control is not None and control.pause_check():
+            sleep(control.interval)
+            continue
         if breaker is not None and breaker.is_open():
             wait = breaker.seconds_until_probe()
             if wait > 0:
                 sleep(wait)
                 continue
             breaker.begin_probe()
+        # Same freshness requirement as the interval: read on every pass, not
+        # once at call time.
+        pass_enrich_enabled = (
+            control.enrich_enabled if control is not None else enrich_enabled
+        )
         facts, enrich_stats = run_once(
             pipeline.source_dir,
             pipeline.organized_dir,
@@ -376,7 +408,7 @@ def watch(
             pipeline=pipeline,
             write_sidecars=pipeline.write_sidecars,
             recursive=recursive,
-            enrich_enabled=enrich_enabled,
+            enrich_enabled=pass_enrich_enabled,
             poison_max_fails=poison_max_fails,
             quarantine_dir=quarantine_dir,
             offset=probe_offset,
@@ -444,5 +476,9 @@ def watch(
         # way — seconds_until_probe() is absolute-clock based.
         if breaker is not None and breaker.is_open():
             continue
-        sleep(interval)
+        # Read fresh, same as the pause/enrich_enabled reads above: a
+        # dashboard interval change must take effect on THIS sleep, not
+        # whatever value `watch()` happened to be called with.
+        current_interval = control.interval if control is not None else interval
+        sleep(current_interval)
     return wstats

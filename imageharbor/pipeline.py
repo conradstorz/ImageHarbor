@@ -16,7 +16,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from . import tiers
 from .catalog import Catalog
@@ -156,15 +156,31 @@ class Pipeline:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, recursive: bool = True) -> PipelineStats:
+    def run(
+        self,
+        recursive: bool = True,
+        *,
+        pause_check: Callable[[], bool] | None = None,
+    ) -> PipelineStats:
         """Process all images under :attr:`source_dir`.
 
         This pass never calls an AI backend, so there is no breaker to feed and
         no systemic-outage abort: it runs at disk speed and completes.
+
+        *pause_check*, when given, is consulted BEFORE each photo -- never
+        between the copy and the catalog write -- so a pause always leaves
+        the in-flight photo either untouched or fully copied, verified, and
+        catalogued. That per-photo sequence is the project's atomicity
+        guarantee; stopping inside it is precisely the state the
+        crash-recovery machinery exists to survive, not something to induce
+        on purpose.
         """
         stats = PipelineStats()
         self._dry_run_seen.clear()
         for image_path in discover_images(self.source_dir, recursive=recursive):
+            if pause_check is not None and pause_check():
+                logger.info("Paused after %d photo(s); stopping cleanly", stats.total)
+                break
             result = self._process_one(image_path)
             stats.record(result)
             _log_result(result)

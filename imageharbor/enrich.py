@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from . import concept_map, tiers
 from .ai_classifier import AIClassifier
@@ -63,6 +63,7 @@ def enrich_library(
     limit: int | None = None,
     offset: int = 0,
     reclassify: bool = False,
+    pause_check: Callable[[], bool] | None = None,
 ) -> EnrichStats:
     """Describe and classify organized images that have not been enriched yet.
 
@@ -71,6 +72,11 @@ def enrich_library(
     is passed straight through to `catalog.iter_unenriched`; the watcher uses
     it to rotate a half-open probe past a stuck head cluster (see
     `watcher.watch`).
+
+    *pause_check*, when given, is consulted BEFORE each row -- never in the
+    middle of a row's describe/classify/catalog/rename sequence -- so a
+    pause always stops between photos, mirroring the facts pass's guarantee
+    in `Pipeline.run`.
     """
     stats = EnrichStats()
     taxonomy = Taxonomy(catalog)
@@ -97,6 +103,9 @@ def enrich_library(
     classes = [(n.code, n.label) for n in taxonomy.children(None)]
 
     for row in rows:
+        if pause_check is not None and pause_check():
+            logger.info("Paused after %d row(s); stopping cleanly", stats.total)
+            break
         stats.total += 1
         digest = row["sha256_b64url"]
         recorded = Path(row["organized_path"])

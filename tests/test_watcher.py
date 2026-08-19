@@ -371,3 +371,152 @@ def test_watch_warns_once_after_many_consecutive_aborted_passes(
         f"{watcher.CONSECUTIVE_ABORT_WARNING_THRESHOLD} consecutive"
         in progress_warnings[0].message
     )
+
+
+# ---------------------------------------------------------------------------
+# Pause plumbing (dashboard Task 4)
+# ---------------------------------------------------------------------------
+
+
+def test_watch_paused_control_skips_the_pass_and_sleeps(
+    source_dir: Path, organized_dir: Path, catalog: Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paused watcher must sleep the interval and run NO pass at all --
+    not start one and immediately break out.
+    """
+    from imageharbor import watcher as watcher_module
+    from imageharbor.dashboard.control import ControlPlane
+
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    control = ControlPlane(catalog, env_interval=1.0, env_enrich=True)
+    control.set_paused(True)
+    stop = threading.Event()
+    slept: list[float] = []
+    calls = {"n": 0}
+
+    real_run_once = watcher_module.run_once
+
+    def _counting_run_once(*args, **kwargs):
+        calls["n"] += 1
+        return real_run_once(*args, **kwargs)
+
+    monkeypatch.setattr(watcher_module, "run_once", _counting_run_once)
+
+    def _sleep(interval: float) -> bool:
+        slept.append(interval)
+        stop.set()
+        return True
+
+    wstats = watch(
+        pipeline=pipeline,
+        catalog=catalog,
+        interval=1.0,
+        stop_event=stop,
+        sleep=_sleep,
+        control=control,
+    )
+
+    assert calls["n"] == 0           # no pass was ever started
+    assert slept == [1.0]            # but the loop did sleep the interval
+    assert wstats.passes == 0
+
+
+def test_watch_reads_live_interval_from_control_each_iteration(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """A dashboard interval change must take effect on the very next sleep,
+    not stay frozen at whatever `watch()` was started with.
+
+    If `watch` only ever read `control.interval` once before the loop (instead
+    of on each iteration), the second sleep below would still see 1.0, not
+    the 9.0 written mid-loop.
+    """
+    from imageharbor.dashboard.control import ControlPlane
+
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    control = ControlPlane(catalog, env_interval=1.0, env_enrich=True)
+    stop = threading.Event()
+    slept: list[float] = []
+
+    def _sleep(interval: float) -> bool:
+        slept.append(interval)
+        if len(slept) == 1:
+            # A dashboard edit lands between the first and second pass.
+            control.set_override("interval", 9.0)
+        else:
+            stop.set()
+        return True
+
+    watch(
+        pipeline=pipeline,
+        catalog=catalog,
+        interval=1.0,
+        stop_event=stop,
+        sleep=_sleep,
+        control=control,
+    )
+
+    assert slept == [1.0, 9.0]
+
+
+def test_watch_control_enrich_enabled_read_live(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """enrich_enabled must also be read from `control` each iteration -- a
+    dashboard toggle that only took effect at startup would silently defeat
+    that dial exactly the way a frozen interval would.
+    """
+    from imageharbor.dashboard.control import ControlPlane
+
+    src = _src_with(tmp_path, 1)
+    pipeline = Pipeline(src, organized_dir, catalog)
+    control = ControlPlane(catalog, env_interval=1.0, env_enrich=True)
+    control.set_override("enrich", False)
+
+    describe_calls = {"n": 0}
+
+    class _CountingClassifier(_AlwaysFails):
+        def describe(self, image_path, exif_data):
+            describe_calls["n"] += 1
+            return super().describe(image_path, exif_data)
+
+    stop = threading.Event()
+
+    def _sleep(interval: float) -> bool:
+        stop.set()
+        return True
+
+    watch(
+        pipeline=pipeline,
+        catalog=catalog,
+        interval=1.0,
+        stop_event=stop,
+        sleep=_sleep,
+        classifier=_CountingClassifier(),
+        control=control,
+    )
+
+    assert describe_calls["n"] == 0  # enrichment never ran: control says off
+
+
+def test_watch_control_none_behaves_exactly_as_before(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """No `control` supplied -> the existing `interval`/`enrich_enabled`
+    parameters govern the loop exactly as they did before this feature.
+    """
+    pipeline = Pipeline(source_dir, organized_dir, catalog)
+    stop = threading.Event()
+
+    def _sleep(_interval: float) -> bool:
+        stop.set()
+        return True
+
+    wstats = watch(
+        pipeline=pipeline,
+        catalog=catalog,
+        interval=1.0,
+        stop_event=stop,
+        sleep=_sleep,
+    )
+    assert wstats.passes == 1

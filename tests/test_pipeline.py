@@ -811,3 +811,66 @@ def test_consume_source_cleans_up_when_the_destination_already_exists(
     assert second.status == "copied"
     assert not staged_twice.exists()      # consumed, not leaked
     assert first.organized_path.exists()  # destination untouched
+
+
+# ---------------------------------------------------------------------------
+# Pause plumbing (dashboard Task 4)
+# ---------------------------------------------------------------------------
+
+
+def test_pause_stops_between_photos_never_mid_photo(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The guarantee is copy -> verify -> catalog as an atomic unit per photo.
+
+    Pausing must therefore leave the in-flight photo complete and the next one
+    untouched -- never a half-copied file, which is the state the crash-recovery
+    machinery exists to survive rather than something to induce deliberately.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(5):
+        _make_jpeg(src / f"photo{i}.jpg", b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
+
+    seen = 0
+
+    def _pause_after_two() -> bool:
+        nonlocal seen
+        seen += 1
+        return seen > 2
+
+    stats = Pipeline(src, organized_dir, catalog).run(pause_check=_pause_after_two)
+
+    organized = list(organized_dir.rglob("*.jpg"))
+    assert len(organized) == 2                         # both complete
+    assert all(verify_pcs_file(p) for p in organized)   # neither half-written
+    assert catalog.count() == 2                         # and both catalogued
+    assert stats.total == 2
+
+
+def test_no_pause_check_processes_everything(
+    source_dir: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """The default path is unchanged for every existing caller."""
+    assert Pipeline(source_dir, organized_dir, catalog).run().copied == 2
+
+
+def test_pause_check_consulted_before_each_photo_not_after(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """A pause_check that fires on the very first call must process nothing.
+
+    This pins the check to happen BEFORE _process_one, not after: if it were
+    checked after processing (or between copy and catalog), the first photo
+    would already be organized by the time pause_check is consulted.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(3):
+        _make_jpeg(src / f"photo{i}.jpg", b"\xff\xd8\xff\xe0" + bytes([i]) * 16 + b"\xff\xd9")
+
+    stats = Pipeline(src, organized_dir, catalog).run(pause_check=lambda: True)
+
+    assert stats.total == 0
+    assert list(organized_dir.rglob("*.jpg")) == []
+    assert catalog.count() == 0
