@@ -409,6 +409,51 @@ def test_iter_unenriched_respects_limit(tmp_path):
         assert len(cat.iter_unenriched(limit=2)) == 2
 
 
+# ---------------------------------------------------------------------------
+# count_unenriched -- IMPORTANT finding #5
+# ---------------------------------------------------------------------------
+
+
+def test_count_unenriched_matches_len_of_iter_unenriched(tmp_path):
+    """`count_unenriched()` (a real `COUNT(*)`) must agree with
+    `len(iter_unenriched())` in every case the row-fetching version covers --
+    see `Catalog.count_unenriched`'s docstring on why the WHERE clause is
+    kept byte-for-byte identical rather than hand-duplicated.
+    """
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        for i in range(5):
+            cat.upsert(
+                sha256_b64url=f"D{i}",
+                original_path=f"/{i}.jpg",
+                organized_path=f"/lib/{i}.jpg",
+            )
+        assert cat.count_unenriched() == len(cat.iter_unenriched()) == 5
+
+        cat.mark_enriched(
+            "D0", pcs_primary="330", pcs_name="beach", secondary_tags=[],
+            ai_caption="", objects=[], ocr_text="", model_version="stub",
+        )
+        assert cat.count_unenriched() == len(cat.iter_unenriched()) == 4
+
+
+def test_count_unenriched_excludes_quarantined_content(tmp_path):
+    """Same exclusion `iter_unenriched_excludes_quarantined_content` pins,
+    for the COUNT(*) version -- a quarantined digest must not be counted."""
+    from imageharbor.catalog import Catalog
+
+    with Catalog(tmp_path / "c.db") as cat:
+        cat.upsert(sha256_b64url="D1", original_path="/a.jpg", organized_path="/lib/a.jpg")
+        cat.record_source("D1", "/a.jpg", 10, 111)
+        assert cat.count_unenriched() == 1
+
+        cat.record_file_failure("/a.jpg", 10, 111, "boom")
+        cat.quarantine_file("/a.jpg")
+
+        assert cat.count_unenriched() == 0
+
+
 def test_iter_unenriched_excludes_quarantined_content(tmp_path):
     """Quarantine means "stop asking the model", so the row leaves the queue.
 
@@ -823,3 +868,268 @@ def test_takeout_tables_do_not_bump_the_schema_version(tmp_path) -> None:
     # Reopening must not raise LegacyCatalogError or lose the row.
     with Catalog(tmp_path / "c.db") as cat:
         assert cat.takeout_archive_get("A" * 43) is not None
+
+
+# ---------------------------------------------------------------------------
+# runs
+# ---------------------------------------------------------------------------
+
+
+def test_run_start_returns_id_with_ended_at_null_and_is_unfinished(catalog: Catalog) -> None:
+    run_id = catalog.run_start("facts")
+    assert isinstance(run_id, int)
+    unfinished = catalog.unfinished_runs()
+    assert len(unfinished) == 1
+    assert unfinished[0]["id"] == run_id
+    assert unfinished[0]["ended_at"] is None
+    assert unfinished[0]["kind"] == "facts"
+
+
+def test_run_finish_populates_counters_and_clears_unfinished(catalog: Catalog) -> None:
+    run_id = catalog.run_start("enrich")
+    catalog.run_finish(
+        run_id,
+        scanned=10,
+        copied=3,
+        duplicates=2,
+        errors=1,
+        enriched=4,
+        enrich_failed=1,
+        breaker_state="OPEN",
+        paused=False,
+    )
+    assert catalog.unfinished_runs() == []
+    rows = catalog.recent_runs()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["id"] == run_id
+    assert row["ended_at"] is not None
+    assert row["scanned"] == 10
+    assert row["copied"] == 3
+    assert row["duplicates"] == 2
+    assert row["errors"] == 1
+    assert row["enriched"] == 4
+    assert row["enrich_failed"] == 1
+    assert row["breaker_state"] == "OPEN"
+    assert row["paused"] == 0  # stored as an INTEGER, False -> 0
+
+
+def test_recent_runs_is_newest_first_and_respects_limit(catalog: Catalog) -> None:
+    ids = []
+    for i in range(5):
+        run_id = catalog.run_start("facts")
+        catalog.run_finish(
+            run_id, scanned=i, copied=0, duplicates=0, errors=0,
+            enriched=0, enrich_failed=0, breaker_state="CLOSED", paused=False,
+        )
+        ids.append(run_id)
+    rows = catalog.recent_runs(limit=3)
+    assert len(rows) == 3
+    assert [r["id"] for r in rows] == list(reversed(ids))[:3]
+
+
+def test_unfinished_runs_only_returns_runs_with_ended_at_null(catalog: Catalog) -> None:
+    finished_id = catalog.run_start("facts")
+    catalog.run_finish(
+        finished_id, scanned=1, copied=0, duplicates=0, errors=0,
+        enriched=0, enrich_failed=0, breaker_state="CLOSED", paused=False,
+    )
+    unfinished_id = catalog.run_start("enrich")
+    unfinished = catalog.unfinished_runs()
+    assert [r["id"] for r in unfinished] == [unfinished_id]
+
+
+# ---------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------
+
+
+def test_setting_roundtrip(catalog: Catalog) -> None:
+    assert catalog.setting_get("interval") is None
+    catalog.setting_set("interval", "120")
+    assert catalog.setting_get("interval") == "120"
+
+
+def test_setting_set_overwrites_existing_value(catalog: Catalog) -> None:
+    catalog.setting_set("enrich", "1")
+    catalog.setting_set("enrich", "0")
+    assert catalog.setting_get("enrich") == "0"
+
+
+def test_setting_delete_removes_the_row_not_blanks_it(catalog: Catalog) -> None:
+    """A revert must DELETE the row so the env var is consulted again -- see
+    the `settings` table comment. Writing an empty string instead would look
+    identical today and silently shadow every future compose change."""
+    catalog.setting_set("interval", "300")
+    catalog.setting_delete("interval")
+    assert catalog.setting_get("interval") is None
+    # Confirm the row is truly gone, not present with an empty/old value.
+    row = catalog._conn.execute(
+        "SELECT * FROM settings WHERE key='interval'"
+    ).fetchone()
+    assert row is None
+
+
+def test_setting_delete_of_missing_key_is_a_noop(catalog: Catalog) -> None:
+    catalog.setting_delete("does-not-exist")  # must not raise
+    assert catalog.setting_get("does-not-exist") is None
+
+
+def test_settings_all_returns_dict_of_all_settings(catalog: Catalog) -> None:
+    catalog.setting_set("interval", "60")
+    catalog.setting_set("enrich", "1")
+    assert catalog.settings_all() == {"interval": "60", "enrich": "1"}
+
+
+def test_settings_all_empty(catalog: Catalog) -> None:
+    assert catalog.settings_all() == {}
+
+
+# ---------------------------------------------------------------------------
+# busy timeout
+#
+# No test here: `sqlite3.connect()`'s default `timeout=5.0` already calls
+# `sqlite3_busy_timeout(db, 5000)` on every connection, so `PRAGMA
+# busy_timeout` reads 5000 whether or not `Catalog.__init__` sets it
+# explicitly -- a test asserting that value would pass identically with the
+# line removed. See the mutation-testing note in the Task 2 report.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# runs / settings: schema version and legacy safety
+# ---------------------------------------------------------------------------
+
+
+def test_a_catalog_predating_runs_and_settings_reopens_without_raising(tmp_path):
+    """A catalog written before this change has `photos`/`sources` but no
+    `runs`/`settings` tables at all. Opening it must add both tables
+    additively (not raise `LegacyCatalogError`), and they must be usable
+    immediately.
+    """
+    import sqlite3
+
+    from imageharbor.catalog import Catalog
+
+    db = tmp_path / "pre_runs_settings.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(_OLD_PHOTOS_TABLE_DDL)
+    conn.execute(
+        "INSERT INTO photos (sha256_b64url, original_path, created_at) VALUES ('OLD', '/x.jpg', 'now')"
+    )
+    conn.execute(
+        "CREATE TABLE sources (sha256_b64url TEXT NOT NULL, source_path TEXT NOT NULL, "
+        "size INTEGER, mtime_ns INTEGER, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, "
+        "PRIMARY KEY (sha256_b64url, source_path))"
+    )
+    conn.execute(
+        "INSERT INTO sources (sha256_b64url, source_path, size, mtime_ns, first_seen_at, last_seen_at) "
+        "VALUES ('OLD', '/x.jpg', 1, 1, 'now', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    with Catalog(db) as cat:  # must not raise LegacyCatalogError
+        assert cat.get_by_sha256("OLD") is not None
+        run_id = cat.run_start("facts")
+        assert cat.unfinished_runs()[0]["id"] == run_id
+        cat.setting_set("interval", "120")
+        assert cat.setting_get("interval") == "120"
+
+
+def test_runs_and_settings_tables_do_not_bump_the_schema_version(tmp_path: Path) -> None:
+    from imageharbor.catalog import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == "2"
+    with Catalog(tmp_path / "c.db") as cat:
+        run_id = cat.run_start("facts")
+        cat.setting_set("interval", "120")
+    # Reopening must not raise LegacyCatalogError or lose the rows.
+    with Catalog(tmp_path / "c.db") as cat:
+        assert cat.setting_get("interval") == "120"
+        assert cat.unfinished_runs()[0]["id"] == run_id
+
+
+# ---------------------------------------------------------------------------
+# Concurrency -- CRITICAL finding #2
+#
+# `cli.py` passes ONE `Catalog` to `ControlPlane`, the dashboard HTTP server
+# (`daemon_threads = True`, one thread per request), and the watcher loop.
+# `check_same_thread=False` PERMITS concurrent access from multiple threads;
+# it does not make it safe. Measured under realistic load before the fix (4
+# pollers at 5 Hz + pause POSTs, 25s): 55 exceptions out of the writer,
+# including "cannot commit - no transaction is active", "cannot start a
+# transaction within a transaction", "another row available", and
+# "SystemError: error return without exception set" out of `run_finish`.
+# `Catalog.lock` (a `threading.RLock`) now guards every public method.
+#
+# This test is deterministic on purpose -- a FIXED thread count and a FIXED
+# operation count per thread, not a timed loop -- so it fails the same way
+# every time it fails, rather than being a flaky proxy for real contention.
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_reads_and_writes_from_multiple_threads_raise_nothing(tmp_path: Path) -> None:
+    import queue
+    import threading
+
+    THREADS_EACH = 4          # writer threads and reader threads, each
+    OPS_PER_THREAD = 40        # fixed, not time-based
+
+    cat = Catalog(tmp_path / "concurrent.db")
+    errors: "queue.Queue[BaseException]" = queue.Queue()
+
+    def _writer(thread_id: int) -> None:
+        try:
+            for i in range(OPS_PER_THREAD):
+                digest = f"W{thread_id}-{i}"
+                cat.upsert(
+                    sha256_b64url=digest,
+                    original_path=f"/w{thread_id}/{i}.jpg",
+                    organized_path=f"/lib/w{thread_id}/{i}.jpg",
+                )
+                run_id = cat.run_start("facts")
+                cat.run_finish(
+                    run_id, scanned=1, copied=1, duplicates=0, errors=0,
+                    enriched=0, enrich_failed=0, breaker_state="CLOSED", paused=False,
+                )
+                cat.setting_set("interval", str(100 + i))
+                cat.record_file_failure(f"/w{thread_id}/{i}.jpg", 10, i, "boom")
+        except BaseException as exc:  # noqa: BLE001 -- captured for the assertion below
+            errors.put(exc)
+
+    def _reader(thread_id: int) -> None:
+        try:
+            for _ in range(OPS_PER_THREAD):
+                cat.recent_runs(limit=5)
+                cat.unfinished_runs()
+                cat.iter_unenriched()
+                cat.count_unenriched()
+                cat.settings_all()
+                list(cat.iter_all())
+        except BaseException as exc:  # noqa: BLE001
+            errors.put(exc)
+
+    threads = [
+        threading.Thread(target=_writer, args=(n,), name=f"writer-{n}")
+        for n in range(THREADS_EACH)
+    ] + [
+        threading.Thread(target=_reader, args=(n,), name=f"reader-{n}")
+        for n in range(THREADS_EACH)
+    ]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        assert all(not t.is_alive() for t in threads), "a thread did not finish within 60s"
+
+        collected: list[BaseException] = []
+        while not errors.empty():
+            collected.append(errors.get_nowait())
+        assert collected == [], (
+            f"{len(collected)} exception(s) raised by concurrent Catalog access: "
+            f"{[repr(e) for e in collected]}"
+        )
+    finally:
+        cat.close()

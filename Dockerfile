@@ -24,6 +24,12 @@ ENV IMAGEHARBOR_SOURCE=/data/source \
 RUN mkdir -p /data/source /data/dest /data/catalog \
     && chown -R harbor:harbor /data
 
+# Operational dashboard (see docker-compose.yml's `ports`/`healthcheck` and
+# `imageharbor watch --dashboard-port`). Documentation only -- EXPOSE does
+# not itself publish the port -- but keeps the image's own contract visible
+# without cross-referencing compose.
+EXPOSE 8080
+
 USER harbor
 
 ENTRYPOINT ["imageharbor"]

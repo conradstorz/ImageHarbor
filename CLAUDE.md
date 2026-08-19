@@ -340,6 +340,48 @@ Module responsibilities:
   `failed`) back Takeout ingestion's four idempotency layers. Both are purely
   additive, so `SCHEMA_VERSION` stays `"2"` and an existing catalog upgrades in
   place.
+  Two more additive tables back the operational dashboard (`dashboard/`,
+  below), also without bumping `SCHEMA_VERSION`: a `runs` table (`id`, `kind`
+  'facts'|'enrich', `started_at`, `ended_at` NULL while a pass is in flight or
+  was interrupted by a crash, `scanned`/`copied`/`duplicates`/`errors`/
+  `enriched`/`enrich_failed`, `breaker_state`, `paused`) is one row per pass,
+  inserted at start and updated at end, and is the sole evidence
+  `dashboard/projections.py` reasons from; and a `settings` table (`key`,
+  `value`, `updated_at`) holding at most three rows — `paused` ('0'/'1', no
+  env counterpart), `interval` (seconds), `enrich` ('0'/'1') — where a
+  present row overrides the corresponding env var and an absent one means
+  "follow config". **`Catalog.lock`** (a public, reentrant `threading.RLock`)
+  guards every public `Catalog` method — added 2026-08-19 (final
+  whole-branch-review finding, pre-merge) after `cli.py`'s single shared
+  `Catalog` was found to be reached concurrently by the dashboard's
+  `daemon_threads=True` HTTP server and the watcher loop, which
+  `check_same_thread=False` *permits* but does not make *safe*: measured
+  under load, 55 raw `sqlite3`/`SystemError` exceptions out of the writer in
+  25 seconds. `RLock`, not `Lock`, because several methods call other
+  guarded methods on the same object from the same thread (e.g. `upsert`
+  calls `get_by_sha256`). A second connection (one for the dashboard, one
+  for the watcher) was considered and rejected: `ControlPlane` is read from
+  *both* threads, so splitting the connection would still leave that seam
+  unguarded — the lock is the smaller change that actually closes the gap.
+  `dashboard/stats.py`'s three sections that run aggregate SQL directly
+  against `catalog._conn` (no `Catalog` wrapper method covers them) acquire
+  this same lock around their query blocks.
+
+  **Corrected 2026-08-19** (this section previously described a
+  two-connection architecture — "the dashboard writes settings rows from its
+  own connection while the watcher writes photo rows from this one" — that
+  was never actually implemented; the spec's Concurrency section made the
+  same claim and has been corrected too): there has only ever been **one**
+  connection, now guarded end-to-end by `Catalog.lock` as described above.
+  `__init__` still sets `PRAGMA busy_timeout=5000` on that one connection,
+  but it governs contention *between separate SQLite connections* — with
+  only one connection in the process, sharing one `sqlite3.Connection`
+  object under one Python-level lock, this pragma is **inert for the
+  current topology**: two threads never reach SQLite concurrently in the
+  first place, so there is nothing for SQLite's own busy-wait to arbitrate.
+  It is kept anyway as an explicit pin at the point of use, for the day a
+  second connection is added (e.g. as a pure read-side optimization) and
+  this contention becomes real again.
 - **`discovery.py`** — yields supported image files (see `SUPPORTED_EXTENSIONS`);
   supports single-file or recursive directory mode and never mutates the source.
   Also defines `VIDEO_EXTENSIONS`, for **classification only** — `discover_images`
@@ -413,7 +455,87 @@ Module responsibilities:
   it passes `quarantine=False` to `sidecar.read_sidecar` for exactly that
   reason.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
-  `catalog list/get`, `takeout ingest/status`, `sidecar backfill`).
+  `catalog list/get`, `takeout ingest/status`, `sidecar backfill`). `watch`
+  gains two dashboard flags alongside its existing `--sidecar`-style options:
+  `--dashboard-port` (`IMAGEHARBOR_DASHBOARD_PORT`, default `8080`) and
+  `--no-dashboard` (a bare flag; the dashboard is on by default). `watch`
+  builds one `dashboard.control.ControlPlane` per run and passes the *object*
+  itself into `watcher.watch(..., control=control)` — see `dashboard/` below
+  for why that matters.
+- **`dashboard/`** — the operational dashboard and control gateway that
+  `watch` serves in-process on a daemon thread: library stats, evidence
+  quality, work queues, pass history, and a projection of remaining work, plus
+  pause/resume, a poll-interval override, and an AI-enrichment toggle. See
+  `docs/superpowers/specs/2026-08-19-dashboard-design.md` for the full design.
+  Four modules, split the same way `sidecar_schema.py` is split from
+  `sidecar.py`: `projections.py` (pure, no I/O — the logic most likely to be
+  wrong), `stats.py` (reads the catalog into the `/api/stats` document),
+  `control.py` (the pause flag and the `settings`-table override precedence),
+  `server.py` (`http.server`, routing, the page).
+  - **Never-stop-the-watcher rule.** A dashboard failure — the port already
+    bound, the server thread raising, a stats query failing — logs a warning
+    and lets organizing continue; it never aborts a pass or the process. This
+    is the same reasoning that keeps a sidecar failure from failing an image
+    that is already copied, verified, and cataloged: observability is
+    subordinate to the work. Concretely: `server.serve()` catches the bind
+    `OSError` and returns `None` instead of raising; every request handler in
+    `server.py` catches its own failures and returns a JSON error rather than
+    ever raising into `http.server`'s default 500-with-traceback; and every
+    section function in `stats.collect()` is wrapped by `_safe()`, so one
+    failing query (e.g. `queues`) reports itself as `None` in the document
+    instead of taking the whole page down.
+  - **Pause is between photos, never mid-photo, in both passes.** Copy →
+    verify → catalog is atomic per photo (facts pass) and the equivalent
+    describe → resolve → catalog-write → tier-gated-rename is atomic per row
+    (enrichment pass); `ControlPlane.pause_check()` is consulted only at
+    those boundaries, never inside either atomic unit. `watcher.watch()`
+    forwards `control.pause_check` into `run_once`/`run_pass`/
+    `enrich_library` for exactly this reason — a pause landing mid-pass still
+    only takes effect at the next file/row boundary, and that pass's `runs`
+    row is recorded with `paused=1`. Pause also survives a process restart:
+    `ControlPlane.__init__` seeds its in-memory flag from the `settings`
+    table's `paused` row, so a container that comes back after being
+    deliberately paused stays paused rather than silently resuming.
+  - **`watch()` takes the `ControlPlane` object, not `interval`/
+    `enrich_enabled` values.** The loop runs once for the life of the
+    container, so `control.pause_check()`, `control.interval`, and
+    `control.enrich_enabled` are re-read fresh on every iteration rather than
+    captured once at call time — a plain float/bool argument would freeze at
+    startup, and a dashboard edit would update the UI and persist to the
+    database while never actually changing runtime behavior until a restart.
+    The `interval`/`enrich_enabled` parameters still exist on `watch()` for
+    callers that pass `control=None` (tests, and any future non-dashboard
+    caller); they behave exactly as before the dashboard existed.
+  - **Projections refuse to guess.** `dashboard/projections.py` returns a
+    `stalled` or `unknown` status — never a fabricated ETA — whenever the
+    breaker is OPEN, the system is paused, there has been no recent progress,
+    the run history is stale (older than the caller's derived staleness
+    window) or unparseable, or the computed rate is implausible (e.g. a pass
+    measured under `MIN_PASS_SECONDS`). A confident wrong ETA sends an
+    operator away when they should have looked; this is the same instinct
+    that puts a photo in `Undated/` rather than guessing a year.
+  - **`sqlite3.Row` is not a `collections.abc.Mapping`.** `projections.project()`
+    filters incoming run rows with `isinstance(r, Mapping)` before trusting
+    them, and a bare `sqlite3.Row` — which supports index/name lookup but not
+    the full `Mapping` protocol — fails that check. A real production bug
+    during implementation passed `Catalog.recent_runs()` rows straight into
+    `project()` without converting them first: every test used plain dicts
+    and stayed green, while every real row was silently discarded and the
+    projection reported `unknown` forever. `dashboard/stats.py` now converts
+    with `dict(row)` at the catalog boundary before rows reach `projections`
+    or the JSON document — do the same at any new call site that crosses
+    from a `sqlite3.Row` into code that expects a `Mapping`.
+  - **The projections module conflates readability with meaning — a known,
+    not-yet-fixed gap.** Across three review rounds, eight defects were found
+    in `projections.py`, every one an unreadable or implausible input (an
+    unparseable timestamp, a negative backlog, a sub-second pass duration, a
+    timezone-naive/aware mismatch) treated as if it were a valid one, because
+    `None`/`0`/an empty collection each did double duty for "absent",
+    "unreadable", *and* "genuinely zero" at different call sites. An explicit
+    `Unreadable` sentinel at each parse site, distinct from a real `None`
+    and a real `0`, would turn the next such defect into a type error
+    instead of a silent misread — this is a deliberate follow-up, not done
+    here.
 
 ## Critical invariants — do not break these
 

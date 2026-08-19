@@ -33,6 +33,33 @@ Organizing is split into two independent passes:
 
 `imageharbor watch` runs both passes continuously against a source directory.
 
+## Operational dashboard
+
+`imageharbor watch` serves a small operational dashboard on
+`http://<host>:8080/` by default (`--dashboard-port` to change the port,
+`--no-dashboard` to disable it). It reports library stats, evidence quality
+(the date/descriptor tier tables above, as live counts), work queues, pass
+history, and a projection of when the remaining backlog will clear — or an
+honest `stalled`/`unknown` when the evidence doesn't support a number (AI
+backend unreachable, paused, no recent progress). It also exposes three
+controls:
+
+- **Pause / Resume** — stops the watcher between photos (never mid-photo) in
+  both passes, and survives a container restart.
+- **Poll interval** — overrides `IMAGEHARBOR_INTERVAL` at runtime.
+- **AI enrichment on/off** — lets the facts pass keep organizing at full speed
+  while the AI backend is down or intentionally disabled.
+
+Any override is shown with a warning line naming the config value it is
+currently overriding (e.g. `⚠ overriding IMAGEHARBOR_INTERVAL=300`), with a
+one-click revert back to that value. A dashboard failure (port already bound,
+a query error) never stops organizing — it logs a warning and the watcher
+carries on. See
+[`docs/superpowers/specs/2026-08-19-dashboard-design.md`](docs/superpowers/specs/2026-08-19-dashboard-design.md)
+for the full design and
+[`docs/deploy-docker.md`](docs/deploy-docker.md) for reaching it in a
+container.
+
 ## Filename grammar
 
 ```

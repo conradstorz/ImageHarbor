@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -121,6 +122,32 @@ CREATE TABLE IF NOT EXISTS takeout_members (
 );
 CREATE INDEX IF NOT EXISTS idx_takeout_members_status  ON takeout_members(status);
 CREATE INDEX IF NOT EXISTS idx_takeout_members_archive ON takeout_members(archive_id);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT    NOT NULL,          -- 'facts' | 'enrich'
+    started_at    TEXT    NOT NULL,
+    ended_at      TEXT,                      -- NULL while in flight
+    scanned       INTEGER NOT NULL DEFAULT 0,
+    copied        INTEGER NOT NULL DEFAULT 0,
+    duplicates    INTEGER NOT NULL DEFAULT 0,
+    errors        INTEGER NOT NULL DEFAULT 0,
+    enriched      INTEGER NOT NULL DEFAULT 0,
+    enrich_failed INTEGER NOT NULL DEFAULT 0,
+    breaker_state TEXT    NOT NULL DEFAULT 'CLOSED',
+    paused        INTEGER NOT NULL DEFAULT 0  -- pass ended because of a pause
+);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+
+-- Keys: 'paused' ('0'|'1'), 'interval' (seconds), 'enrich' ('0'|'1').
+-- A key present here overrides the env-var value; absent means "follow config".
+-- Reverting an override DELETES the row rather than writing the env value, so
+-- a later compose change is picked up instead of being shadowed by a stale copy.
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 # Bumped when a catalog schema change is significant enough that opening an
@@ -191,14 +218,70 @@ def _from_json(text: str) -> Any:
 
 
 class Catalog:
-    """Thin wrapper around a SQLite database for the ImageHarbor catalog."""
+    """Thin wrapper around a SQLite database for the ImageHarbor catalog.
+
+    ``self.lock`` (a ``threading.RLock``, public and reentrant on purpose) is
+    the single guard around every touch of ``self._conn`` from any thread.
+    CRITICAL finding #2 (2026-08-19 whole-branch review, pre-merge): the
+    operational dashboard's HTTP server (``imageharbor/dashboard/server.py``,
+    ``daemon_threads = True``) and the watcher loop both reach this same
+    ``sqlite3.Connection`` concurrently -- ``check_same_thread=False``
+    *permits* that, it does not make it *safe*. Measured under realistic
+    load (4 pollers at 5 Hz + pause POSTs, 25s): 55 exceptions out of the
+    writer, including ``cannot commit - no transaction is active``, ``cannot
+    start a transaction within a transaction``, ``another row available``,
+    and ``SystemError: error return without exception set`` out of
+    ``run_finish``. The lock serializes every access, and it is `RLock`
+    rather than a plain `Lock` because several methods below call other
+    guarded methods on the same object from the same thread (e.g. `upsert`
+    calls `get_by_sha256`) -- a plain `Lock` would deadlock on that
+    reentrant call.
+
+    A second connection (one for the dashboard, one for the watcher) was
+    considered and rejected: `ControlPlane` (`dashboard/control.py`) is read
+    from *both* threads (the HTTP handler serving `/api/stats`, and the
+    watch loop reading `control.interval`/`control.enrich_enabled`/
+    `control.pause_check()` every iteration), so splitting the connection in
+    two would still leave that shared seam unguarded -- the lock is the
+    smaller change that actually closes the gap, and a second connection
+    remains available later as a pure optimization rather than a
+    correctness requirement.
+
+    `dashboard/stats.py`'s three sections that run ad hoc aggregate SQL
+    directly against `catalog._conn` (`_library_section`, `_evidence_section`,
+    `_queues_section`) acquire this same `self.lock` around their query
+    blocks rather than going through a wrapped method -- see that module's
+    comments at each call site. Every other section reaches the catalog only
+    through the guarded public methods below.
+    """
 
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self.lock = threading.RLock()
+        # In-memory only (never persisted): the `runs.id` values THIS
+        # process has itself started via `run_start`, backing
+        # `run_started_by_this_process` -- see that method's docstring and
+        # IMPORTANT finding #4. Cleared on every fresh `Catalog()`, which is
+        # exactly the point: a `runs` row with `ended_at IS NULL` that this
+        # process did not itself start can only be a row a PREVIOUS process
+        # left open (SIGKILLed mid-pass) -- there is no other way for an
+        # unfinished row to exist that this object doesn't already know
+        # about, since `run_finish` is always reached via a `finally` for
+        # any in-process failure (see `watcher.run_once`'s docstring).
+        self._own_run_ids: set[int] = set()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        # A single connection is now shared between the watcher and the
+        # dashboard, guarded by self.lock (see the class docstring) -- so
+        # every write and every settings read is fully serialized in-process
+        # and never actually contends at the SQLite level. This pragma is
+        # kept anyway as a pin against a future second connection (e.g. the
+        # "smaller change now, real second connection later" path noted
+        # above), which WOULD contend at the SQLite level and rely on this
+        # wait rather than the in-process lock.
+        self._conn.execute("PRAGMA busy_timeout=5000;")
         self._conn.executescript(_SCHEMA)
         self._ensure_photo_columns()
         self._conn.commit()
@@ -289,80 +372,81 @@ class Catalog:
         descriptor_source: str = "none",
     ) -> int:
         """Insert or update a photo record. Returns the row id."""
-        now = _now_iso()
-        existing = self.get_by_sha256(sha256_b64url)
+        with self.lock:
+            now = _now_iso()
+            existing = self.get_by_sha256(sha256_b64url)
 
-        if existing:
-            history = _from_json(existing["processing_history"])
-            if not isinstance(history, list):
+            if existing:
+                history = _from_json(existing["processing_history"])
+                if not isinstance(history, list):
+                    history = []
+            else:
                 history = []
-        else:
-            history = []
 
-        if processing_history:
-            history.extend(processing_history)
+            if processing_history:
+                history.extend(processing_history)
 
-        params = (
-            sha256_b64url,
-            # original_path is intentionally NOT in the ON CONFLICT DO UPDATE SET
-            # list below, so on conflict the first-seen path wins (never updated).
-            original_path,
-            organized_path,
-            pcs_version,
-            pcs_primary,
-            pcs_name,
-            _json(secondary_tags or []),
-            ai_caption,
-            _json(objects or []),
-            ocr_text,
-            _json(exif or {}),
-            model_version,
-            _json(history),
-            date_value,
-            date_tier,
-            date_source,
-            descriptor_value,
-            descriptor_tier,
-            descriptor_source,
-            now,  # created_at (preserved on UPDATE: not in the ON CONFLICT SET list)
-            now,  # processed_at
-        )
+            params = (
+                sha256_b64url,
+                # original_path is intentionally NOT in the ON CONFLICT DO UPDATE SET
+                # list below, so on conflict the first-seen path wins (never updated).
+                original_path,
+                organized_path,
+                pcs_version,
+                pcs_primary,
+                pcs_name,
+                _json(secondary_tags or []),
+                ai_caption,
+                _json(objects or []),
+                ocr_text,
+                _json(exif or {}),
+                model_version,
+                _json(history),
+                date_value,
+                date_tier,
+                date_source,
+                descriptor_value,
+                descriptor_tier,
+                descriptor_source,
+                now,  # created_at (preserved on UPDATE: not in the ON CONFLICT SET list)
+                now,  # processed_at
+            )
 
-        cursor = self._conn.execute(
-            """
-            INSERT INTO photos (
-                sha256_b64url, original_path, organized_path,
-                pcs_version, pcs_primary, pcs_name,
-                secondary_tags, ai_caption, objects, ocr_text, exif,
-                model_version, processing_history,
-                date_value, date_tier, date_source,
-                descriptor_value, descriptor_tier, descriptor_source,
-                created_at, processed_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(sha256_b64url) DO UPDATE SET
-                organized_path    = excluded.organized_path,
-                pcs_version       = excluded.pcs_version,
-                pcs_primary       = excluded.pcs_primary,
-                pcs_name          = excluded.pcs_name,
-                secondary_tags    = excluded.secondary_tags,
-                ai_caption        = excluded.ai_caption,
-                objects           = excluded.objects,
-                ocr_text          = excluded.ocr_text,
-                exif              = excluded.exif,
-                model_version     = excluded.model_version,
-                processing_history = excluded.processing_history,
-                date_value        = excluded.date_value,
-                date_tier         = excluded.date_tier,
-                date_source       = excluded.date_source,
-                descriptor_value  = excluded.descriptor_value,
-                descriptor_tier   = excluded.descriptor_tier,
-                descriptor_source = excluded.descriptor_source,
-                processed_at      = excluded.processed_at
-            """,
-            params,
-        )
-        self._conn.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+            cursor = self._conn.execute(
+                """
+                INSERT INTO photos (
+                    sha256_b64url, original_path, organized_path,
+                    pcs_version, pcs_primary, pcs_name,
+                    secondary_tags, ai_caption, objects, ocr_text, exif,
+                    model_version, processing_history,
+                    date_value, date_tier, date_source,
+                    descriptor_value, descriptor_tier, descriptor_source,
+                    created_at, processed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(sha256_b64url) DO UPDATE SET
+                    organized_path    = excluded.organized_path,
+                    pcs_version       = excluded.pcs_version,
+                    pcs_primary       = excluded.pcs_primary,
+                    pcs_name          = excluded.pcs_name,
+                    secondary_tags    = excluded.secondary_tags,
+                    ai_caption        = excluded.ai_caption,
+                    objects           = excluded.objects,
+                    ocr_text          = excluded.ocr_text,
+                    exif              = excluded.exif,
+                    model_version     = excluded.model_version,
+                    processing_history = excluded.processing_history,
+                    date_value        = excluded.date_value,
+                    date_tier         = excluded.date_tier,
+                    date_source       = excluded.date_source,
+                    descriptor_value  = excluded.descriptor_value,
+                    descriptor_tier   = excluded.descriptor_tier,
+                    descriptor_source = excluded.descriptor_source,
+                    processed_at      = excluded.processed_at
+                """,
+                params,
+            )
+            self._conn.commit()
+            return cursor.lastrowid  # type: ignore[return-value]
 
     def mark_duplicate(self, sha256_b64url: str, duplicate_path: str) -> None:
         """Append a duplicate-detection event to the processing history.
@@ -375,31 +459,32 @@ class Catalog:
         timestamp differs) and rewrite the whole JSON blob on every single
         pass, forever, growing `processing_history` without bound.
         """
-        row = self.get_by_sha256(sha256_b64url)
-        if row is None:
-            return
-        history = _from_json(row["processing_history"])
-        if not isinstance(history, list):
-            history = []
-        if (
-            history
-            and isinstance(history[-1], dict)
-            and history[-1].get("event") == "duplicate_detected"
-            and history[-1].get("duplicate_path") == duplicate_path
-        ):
-            return
-        history.append(
-            {
-                "event": "duplicate_detected",
-                "duplicate_path": duplicate_path,
-                "at": _now_iso(),
-            }
-        )
-        self._conn.execute(
-            "UPDATE photos SET processing_history=? WHERE sha256_b64url=?",
-            (_json(history), sha256_b64url),
-        )
-        self._conn.commit()
+        with self.lock:
+            row = self.get_by_sha256(sha256_b64url)
+            if row is None:
+                return
+            history = _from_json(row["processing_history"])
+            if not isinstance(history, list):
+                history = []
+            if (
+                history
+                and isinstance(history[-1], dict)
+                and history[-1].get("event") == "duplicate_detected"
+                and history[-1].get("duplicate_path") == duplicate_path
+            ):
+                return
+            history.append(
+                {
+                    "event": "duplicate_detected",
+                    "duplicate_path": duplicate_path,
+                    "at": _now_iso(),
+                }
+            )
+            self._conn.execute(
+                "UPDATE photos SET processing_history=? WHERE sha256_b64url=?",
+                (_json(history), sha256_b64url),
+            )
+            self._conn.commit()
 
     def record_source_seen(
         self,
@@ -409,19 +494,20 @@ class Catalog:
         sha256_b64url: str | None = None,
     ) -> None:
         """Record (or update) that a source file was processed, keyed by path."""
-        self._conn.execute(
-            """
-            INSERT INTO source_seen (source_path, size, mtime_ns, sha256_b64url, seen_at)
-            VALUES (?,?,?,?,?)
-            ON CONFLICT(source_path) DO UPDATE SET
-                size          = excluded.size,
-                mtime_ns      = excluded.mtime_ns,
-                sha256_b64url = excluded.sha256_b64url,
-                seen_at       = excluded.seen_at
-            """,
-            (source_path, size, mtime_ns, sha256_b64url, _now_iso()),
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                """
+                INSERT INTO source_seen (source_path, size, mtime_ns, sha256_b64url, seen_at)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(source_path) DO UPDATE SET
+                    size          = excluded.size,
+                    mtime_ns      = excluded.mtime_ns,
+                    sha256_b64url = excluded.sha256_b64url,
+                    seen_at       = excluded.seen_at
+                """,
+                (source_path, size, mtime_ns, sha256_b64url, _now_iso()),
+            )
+            self._conn.commit()
 
     def record_source(
         self, sha256_b64url: str, source_path: str, size: int, mtime_ns: int
@@ -441,37 +527,40 @@ class Catalog:
         exclusion on exactly this `(path, size, mtime_ns)` triple. Only
         `last_seen_at` moves.
         """
-        now = _now_iso()
-        self._conn.execute(
-            """
-            INSERT INTO sources (
-                sha256_b64url, source_path, size, mtime_ns, first_seen_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(sha256_b64url, source_path) DO UPDATE SET
-                last_seen_at = excluded.last_seen_at
-            """,
-            (sha256_b64url, source_path, size, mtime_ns, now, now),
-        )
-        self._conn.commit()
+        with self.lock:
+            now = _now_iso()
+            self._conn.execute(
+                """
+                INSERT INTO sources (
+                    sha256_b64url, source_path, size, mtime_ns, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sha256_b64url, source_path) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (sha256_b64url, source_path, size, mtime_ns, now, now),
+            )
+            self._conn.commit()
 
     def sources_for(self, sha256_b64url: str) -> list[sqlite3.Row]:
         """All known source paths for a digest, oldest first."""
-        return list(
-            self._conn.execute(
-                "SELECT * FROM sources WHERE sha256_b64url = ? ORDER BY first_seen_at",
-                (sha256_b64url,),
+        with self.lock:
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM sources WHERE sha256_b64url = ? ORDER BY first_seen_at",
+                    (sha256_b64url,),
+                )
             )
-        )
 
     def tiers_for(self, sha256_b64url: str) -> tuple[int, int]:
         """Return ``(date_tier, descriptor_tier)``; ``(0, 0)`` if unknown."""
-        row = self._conn.execute(
-            "SELECT date_tier, descriptor_tier FROM photos WHERE sha256_b64url = ?",
-            (sha256_b64url,),
-        ).fetchone()
-        if row is None:
-            return (0, 0)
-        return (row["date_tier"] or 0, row["descriptor_tier"] or 0)
+        with self.lock:
+            row = self._conn.execute(
+                "SELECT date_tier, descriptor_tier FROM photos WHERE sha256_b64url = ?",
+                (sha256_b64url,),
+            ).fetchone()
+            if row is None:
+                return (0, 0)
+            return (row["date_tier"] or 0, row["descriptor_tier"] or 0)
 
     def set_placement(
         self,
@@ -486,21 +575,22 @@ class Catalog:
         descriptor_source: str,
     ) -> None:
         """Record a new organized path and the tiers that justified it."""
-        self._conn.execute(
-            """
-            UPDATE photos SET
-                organized_path = ?, date_value = ?, date_tier = ?, date_source = ?,
-                descriptor_value = ?, descriptor_tier = ?, descriptor_source = ?,
-                processed_at = ?
-            WHERE sha256_b64url = ?
-            """,
-            (
-                organized_path, date_value, date_tier, date_source,
-                descriptor_value, descriptor_tier, descriptor_source,
-                _now_iso(), sha256_b64url,
-            ),
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                """
+                UPDATE photos SET
+                    organized_path = ?, date_value = ?, date_tier = ?, date_source = ?,
+                    descriptor_value = ?, descriptor_tier = ?, descriptor_source = ?,
+                    processed_at = ?
+                WHERE sha256_b64url = ?
+                """,
+                (
+                    organized_path, date_value, date_tier, date_source,
+                    descriptor_value, descriptor_tier, descriptor_source,
+                    _now_iso(), sha256_b64url,
+                ),
+            )
+            self._conn.commit()
 
     def iter_unenriched(
         self, limit: int | None = None, offset: int = 0
@@ -562,7 +652,41 @@ class Catalog:
             if offset:
                 sql += " OFFSET ?"
                 params.append(offset)
-        return list(self._conn.execute(sql, tuple(params)))
+        with self.lock:
+            return list(self._conn.execute(sql, tuple(params)))
+
+    def count_unenriched(self) -> int:
+        """``COUNT(*)`` version of `iter_unenriched`'s WHERE clause.
+
+        IMPORTANT finding #5 (2026-08-19 whole-branch review): the dashboard
+        called `len(catalog.iter_unenriched())` -- a `SELECT *` that
+        materializes and fetches every unenriched row just to throw the rows
+        away and keep the count -- from BOTH `dashboard/stats.py`'s
+        `_queues_section` and `_projection_section`, i.e. twice per
+        `/api/stats` poll. Measured 0.32s per call at 15k photos, linear (so
+        roughly 2s at 100k), every 5 seconds by default, on the connection
+        the watcher writes through. This method exists so both call sites
+        can ask SQLite to do the counting instead, and so `collect()` can
+        compute it once and pass it to both sections. The WHERE clause is
+        kept byte-for-byte identical to `iter_unenriched`'s (see that
+        method's docstring for what each condition means and why) -- a
+        hand-duplicated definition that quietly drifted from the row query
+        would make `len(iter_unenriched())` and `count_unenriched()` disagree,
+        which is exactly the kind of silent drift CLAUDE.md already warns
+        about for the digest-parsing logic.
+        """
+        sql = (
+            "SELECT COUNT(*) AS n FROM photos p WHERE p.enriched_at IS NULL "
+            "AND p.organized_path IS NOT NULL "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM sources s"
+            "  JOIN failed_files f ON f.source_path = s.source_path"
+            "   AND f.size = s.size AND f.mtime_ns = s.mtime_ns"
+            "  WHERE s.sha256_b64url = p.sha256_b64url AND f.quarantined = 1"
+            ")"
+        )
+        with self.lock:
+            return self._conn.execute(sql).fetchone()["n"]
 
     def mark_enriched(
         self,
@@ -578,63 +702,76 @@ class Catalog:
         scene: str = "",
     ) -> None:
         """Store the AI's perception and stamp the row as enriched."""
-        self._conn.execute(
-            """
-            UPDATE photos SET
-                pcs_primary = ?, pcs_name = ?, secondary_tags = ?, ai_caption = ?,
-                objects = ?, ocr_text = ?, model_version = ?, scene = ?,
-                enriched_at = ?
-            WHERE sha256_b64url = ?
-            """,
-            (
-                pcs_primary, pcs_name, _json(secondary_tags), ai_caption,
-                _json(objects), ocr_text, model_version, scene,
-                _now_iso(), sha256_b64url,
-            ),
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                """
+                UPDATE photos SET
+                    pcs_primary = ?, pcs_name = ?, secondary_tags = ?, ai_caption = ?,
+                    objects = ?, ocr_text = ?, model_version = ?, scene = ?,
+                    enriched_at = ?
+                WHERE sha256_b64url = ?
+                """,
+                (
+                    pcs_primary, pcs_name, _json(secondary_tags), ai_caption,
+                    _json(objects), ocr_text, model_version, scene,
+                    _now_iso(), sha256_b64url,
+                ),
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
 
     def get_by_sha256(self, sha256_b64url: str) -> sqlite3.Row | None:
-        cursor = self._conn.execute(
-            "SELECT * FROM photos WHERE sha256_b64url=?", (sha256_b64url,)
-        )
-        return cursor.fetchone()
+        with self.lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM photos WHERE sha256_b64url=?", (sha256_b64url,)
+            )
+            return cursor.fetchone()
 
     def get_by_original_path(self, original_path: str) -> sqlite3.Row | None:
-        cursor = self._conn.execute(
-            "SELECT * FROM photos WHERE original_path=?", (original_path,)
-        )
-        return cursor.fetchone()
+        with self.lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM photos WHERE original_path=?", (original_path,)
+            )
+            return cursor.fetchone()
 
     def iter_all(self) -> Iterator[sqlite3.Row]:
-        cursor = self._conn.execute("SELECT * FROM photos ORDER BY id")
-        yield from cursor
+        # Materialized inside the lock, then yielded outside it: holding
+        # `self.lock` for as long as a caller takes to consume a lazy
+        # generator (which could be arbitrarily long -- there is no
+        # guarantee a caller drains this promptly) would block every other
+        # thread's catalog access for that entire span, which is worse than
+        # the O(n) memory cost of a list here.
+        with self.lock:
+            rows = list(self._conn.execute("SELECT * FROM photos ORDER BY id"))
+        yield from rows
 
     def count(self) -> int:
-        cursor = self._conn.execute("SELECT COUNT(*) FROM photos")
-        return cursor.fetchone()[0]
+        with self.lock:
+            cursor = self._conn.execute("SELECT COUNT(*) FROM photos")
+            return cursor.fetchone()[0]
 
     def is_known(self, sha256_b64url: str) -> bool:
-        cursor = self._conn.execute(
-            "SELECT 1 FROM photos WHERE sha256_b64url=? LIMIT 1", (sha256_b64url,)
-        )
-        return cursor.fetchone() is not None
+        with self.lock:
+            cursor = self._conn.execute(
+                "SELECT 1 FROM photos WHERE sha256_b64url=? LIMIT 1", (sha256_b64url,)
+            )
+            return cursor.fetchone() is not None
 
     def source_is_unchanged(self, source_path: str, size: int, mtime_ns: int) -> bool:
         """Return True if this source path was seen before with the same size
         and mtime (so it can be skipped without re-hashing)."""
-        cur = self._conn.execute(
-            "SELECT size, mtime_ns FROM source_seen WHERE source_path=?",
-            (source_path,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return False
-        return row["size"] == size and row["mtime_ns"] == mtime_ns
+        with self.lock:
+            cur = self._conn.execute(
+                "SELECT size, mtime_ns FROM source_seen WHERE source_path=?",
+                (source_path,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            return row["size"] == size and row["mtime_ns"] == mtime_ns
 
     # ------------------------------------------------------------------
     # Google Takeout ingestion
@@ -646,9 +783,10 @@ class Catalog:
     # ------------------------------------------------------------------
 
     def takeout_archive_get(self, archive_id: str) -> sqlite3.Row | None:
-        return self._conn.execute(
-            "SELECT * FROM takeout_archives WHERE archive_id = ?", (archive_id,)
-        ).fetchone()
+        with self.lock:
+            return self._conn.execute(
+                "SELECT * FROM takeout_archives WHERE archive_id = ?", (archive_id,)
+            ).fetchone()
 
     def takeout_archive_get_by_stat(
         self, last_path: str, size: int, mtime_ns: int
@@ -660,18 +798,20 @@ class Catalog:
         already hashed at that exact path/size/mtime. Any change to any of the
         three falls through to the digest.
         """
-        return self._conn.execute(
-            """
-            SELECT * FROM takeout_archives
-            WHERE last_path = ? AND size = ? AND mtime_ns = ?
-            """,
-            (last_path, size, mtime_ns),
-        ).fetchone()
+        with self.lock:
+            return self._conn.execute(
+                """
+                SELECT * FROM takeout_archives
+                WHERE last_path = ? AND size = ? AND mtime_ns = ?
+                """,
+                (last_path, size, mtime_ns),
+            ).fetchone()
 
     def takeout_archives_all(self) -> list[sqlite3.Row]:
-        return list(
-            self._conn.execute("SELECT * FROM takeout_archives ORDER BY last_path")
-        )
+        with self.lock:
+            return list(
+                self._conn.execute("SELECT * FROM takeout_archives ORDER BY last_path")
+            )
 
     def takeout_archive_upsert(
         self,
@@ -692,40 +832,42 @@ class Catalog:
         `archive_id` never does, so a renamed archive is recognised rather
         than re-ingested. `first_seen_at` is written once.
         """
-        now = _now_iso()
-        self._conn.execute(
-            """
-            INSERT INTO takeout_archives (
-                archive_id, last_path, size, mtime_ns, member_count, status,
-                last_error, first_seen_at, last_seen_at
-            ) VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(archive_id) DO UPDATE SET
-                last_path    = excluded.last_path,
-                mtime_ns     = excluded.mtime_ns,
-                member_count = excluded.member_count,
-                status       = excluded.status,
-                last_error   = excluded.last_error,
-                last_seen_at = excluded.last_seen_at
-            """,
-            (
-                archive_id, last_path, size, mtime_ns, member_count, status,
-                last_error, now, now,
-            ),
-        )
-        self._conn.commit()
+        with self.lock:
+            now = _now_iso()
+            self._conn.execute(
+                """
+                INSERT INTO takeout_archives (
+                    archive_id, last_path, size, mtime_ns, member_count, status,
+                    last_error, first_seen_at, last_seen_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(archive_id) DO UPDATE SET
+                    last_path    = excluded.last_path,
+                    mtime_ns     = excluded.mtime_ns,
+                    member_count = excluded.member_count,
+                    status       = excluded.status,
+                    last_error   = excluded.last_error,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    archive_id, last_path, size, mtime_ns, member_count, status,
+                    last_error, now, now,
+                ),
+            )
+            self._conn.commit()
 
     def takeout_archive_set_status(
         self, archive_id: str, status: str, last_error: str = ""
     ) -> None:
-        self._conn.execute(
-            """
-            UPDATE takeout_archives
-            SET status = ?, last_error = ?, last_seen_at = ?
-            WHERE archive_id = ?
-            """,
-            (status, last_error, _now_iso(), archive_id),
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                """
+                UPDATE takeout_archives
+                SET status = ?, last_error = ?, last_seen_at = ?
+                WHERE archive_id = ?
+                """,
+                (status, last_error, _now_iso(), archive_id),
+            )
+            self._conn.commit()
 
     def takeout_member_add(
         self,
@@ -746,16 +888,17 @@ class Catalog:
         an archive must never drag an already-ingested member back to 'pending'
         and re-extract it.
         """
-        self._conn.execute(
-            """
-            INSERT INTO takeout_members (
-                archive_id, member_path, kind, size, crc32, status, updated_at
-            ) VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(archive_id, member_path) DO NOTHING
-            """,
-            (archive_id, member_path, kind, size, crc32, status, _now_iso()),
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                """
+                INSERT INTO takeout_members (
+                    archive_id, member_path, kind, size, crc32, status, updated_at
+                ) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(archive_id, member_path) DO NOTHING
+                """,
+                (archive_id, member_path, kind, size, crc32, status, _now_iso()),
+            )
+            self._conn.commit()
 
     def takeout_member_set(
         self,
@@ -784,19 +927,20 @@ class Catalog:
         already-recorded `taken_at` -- would silently null it out; such a
         caller must re-read and re-pass the existing value itself.
         """
-        self._conn.execute(
-            """
-            UPDATE takeout_members SET
-                status = ?, sha256_b64url = ?, taken_at = ?, sidecar_path = ?,
-                last_error = ?, updated_at = ?
-            WHERE archive_id = ? AND member_path = ?
-            """,
-            (
-                status, sha256_b64url, taken_at, sidecar_path, last_error,
-                _now_iso(), archive_id, member_path,
-            ),
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                """
+                UPDATE takeout_members SET
+                    status = ?, sha256_b64url = ?, taken_at = ?, sidecar_path = ?,
+                    last_error = ?, updated_at = ?
+                WHERE archive_id = ? AND member_path = ?
+                """,
+                (
+                    status, sha256_b64url, taken_at, sidecar_path, last_error,
+                    _now_iso(), archive_id, member_path,
+                ),
+            )
+            self._conn.commit()
 
     def takeout_members_pending(self, archive_id: str) -> list[sqlite3.Row]:
         """Members still owed work: 'pending' (never tried) or 'failed' (retry).
@@ -805,24 +949,26 @@ class Catalog:
         outage, so a failed member is simply retried next run -- there is no
         quarantine ladder and no backoff here.
         """
-        return list(
-            self._conn.execute(
-                """
-                SELECT * FROM takeout_members
-                WHERE archive_id = ? AND status IN ('pending', 'failed')
-                ORDER BY member_path
-                """,
-                (archive_id,),
+        with self.lock:
+            return list(
+                self._conn.execute(
+                    """
+                    SELECT * FROM takeout_members
+                    WHERE archive_id = ? AND status IN ('pending', 'failed')
+                    ORDER BY member_path
+                    """,
+                    (archive_id,),
+                )
             )
-        )
 
     def takeout_members_all(self, archive_id: str) -> list[sqlite3.Row]:
-        return list(
-            self._conn.execute(
-                "SELECT * FROM takeout_members WHERE archive_id = ? ORDER BY member_path",
-                (archive_id,),
+        with self.lock:
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM takeout_members WHERE archive_id = ? ORDER BY member_path",
+                    (archive_id,),
+                )
             )
-        )
 
     def takeout_members_unskip_trash(self, archive_id: str) -> int:
         """Restore each trash member to the status its KIND warrants; returns
@@ -836,51 +982,162 @@ class Catalog:
         image/video rows), so those kinds go back to their own terminal
         status ('parsed') instead, and anything else goes back to 'ignored'.
         """
-        cur = self._conn.execute(
-            """
-            UPDATE takeout_members SET status = CASE
-                WHEN kind IN ('image', 'video')    THEN 'pending'
-                WHEN kind IN ('metadata', 'album') THEN 'parsed'
-                ELSE 'ignored'
-            END,
-            updated_at = ?
-            WHERE archive_id = ? AND status = 'skipped_trash'
-            """,
-            (_now_iso(), archive_id),
-        )
-        self._conn.commit()
-        return cur.rowcount
+        with self.lock:
+            cur = self._conn.execute(
+                """
+                UPDATE takeout_members SET status = CASE
+                    WHEN kind IN ('image', 'video')    THEN 'pending'
+                    WHEN kind IN ('metadata', 'album') THEN 'parsed'
+                    ELSE 'ignored'
+                END,
+                updated_at = ?
+                WHERE archive_id = ? AND status = 'skipped_trash'
+                """,
+                (_now_iso(), archive_id),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def takeout_status_counts(self) -> dict[str, Any]:
         """Aggregates for `imageharbor takeout status`."""
-        archives = {
-            row["status"]: row["n"]
-            for row in self._conn.execute(
-                "SELECT status, COUNT(*) AS n FROM takeout_archives GROUP BY status"
+        with self.lock:
+            archives = {
+                row["status"]: row["n"]
+                for row in self._conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM takeout_archives GROUP BY status"
+                )
+            }
+            members = {
+                row["status"]: row["n"]
+                for row in self._conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM takeout_members GROUP BY status"
+                )
+            }
+            missing = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM takeout_members
+                WHERE kind = 'image' AND status IN ('ingested', 'duplicate')
+                  AND sidecar_path IS NULL
+                """
+            ).fetchone()["n"]
+            return {"archives": archives, "members": members, "missing_metadata": missing}
+
+    # ------------------------------------------------------------------
+    # Runs and settings
+    #
+    # Both tables are purely additive: no existing row is reinterpreted and no
+    # existing column changes meaning, so SCHEMA_VERSION stays "2" and
+    # `_guard_legacy_catalog` correctly does not fire for a catalog that
+    # predates them.
+    # ------------------------------------------------------------------
+
+    def run_start(self, kind: str) -> int:
+        with self.lock:
+            cursor = self._conn.execute(
+                "INSERT INTO runs (kind, started_at) VALUES (?,?)",
+                (kind, _now_iso()),
             )
-        }
-        members = {
-            row["status"]: row["n"]
-            for row in self._conn.execute(
-                "SELECT status, COUNT(*) AS n FROM takeout_members GROUP BY status"
+            self._conn.commit()
+            run_id = cursor.lastrowid
+            self._own_run_ids.add(run_id)
+            return run_id
+
+    def run_finish(
+        self,
+        run_id: int,
+        *,
+        scanned: int,
+        copied: int,
+        duplicates: int,
+        errors: int,
+        enriched: int,
+        enrich_failed: int,
+        breaker_state: str,
+        paused: bool,
+    ) -> None:
+        with self.lock:
+            self._conn.execute(
+                """
+                UPDATE runs
+                SET ended_at=?, scanned=?, copied=?, duplicates=?, errors=?,
+                    enriched=?, enrich_failed=?, breaker_state=?, paused=?
+                WHERE id=?
+                """,
+                (
+                    _now_iso(), scanned, copied, duplicates, errors,
+                    enriched, enrich_failed, breaker_state, int(paused),
+                    run_id,
+                ),
             )
-        }
-        missing = self._conn.execute(
-            """
-            SELECT COUNT(*) AS n FROM takeout_members
-            WHERE kind = 'image' AND status IN ('ingested', 'duplicate')
-              AND sidecar_path IS NULL
-            """
-        ).fetchone()["n"]
-        return {"archives": archives, "members": members, "missing_metadata": missing}
+            self._conn.commit()
+
+    def recent_runs(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self.lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
+            )
+            return cursor.fetchall()
+
+    def unfinished_runs(self) -> list[sqlite3.Row]:
+        with self.lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM runs WHERE ended_at IS NULL ORDER BY id"
+            )
+            return cursor.fetchall()
+
+    def run_started_by_this_process(self, run_id: int) -> bool:
+        """True if THIS process (this ``Catalog`` instance) called
+        ``run_start`` for *run_id* since it opened -- see ``__init__``'s
+        ``_own_run_ids`` for why that is exactly the test for "is this
+        unfinished row genuinely the current in-flight pass, or a died-
+        mid-pass row a previous process left open." Used by
+        ``dashboard/stats.py``'s ``_now_section`` (IMPORTANT finding #4).
+        """
+        with self.lock:
+            return run_id in self._own_run_ids
+
+    def setting_get(self, key: str) -> str | None:
+        with self.lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            ).fetchone()
+            return row["value"] if row is not None else None
+
+    def setting_set(self, key: str, value: str) -> None:
+        with self.lock:
+            self._conn.execute(
+                """
+                INSERT INTO settings (key, value, updated_at) VALUES (?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, value, _now_iso()),
+            )
+            self._conn.commit()
+
+    def setting_delete(self, key: str) -> None:
+        """Delete the override row so the env var is consulted again.
+
+        Writing an empty string instead would look identical today and
+        silently shadow every future compose change -- see the comment on
+        `settings` in `_SCHEMA`.
+        """
+        with self.lock:
+            self._conn.execute("DELETE FROM settings WHERE key=?", (key,))
+            self._conn.commit()
+
+    def settings_all(self) -> dict[str, str]:
+        with self.lock:
+            cursor = self._conn.execute("SELECT key, value FROM settings")
+            return {row["key"]: row["value"] for row in cursor}
 
     # ------------------------------------------------------------------
     # Taxonomy
     # ------------------------------------------------------------------
 
     def taxonomy_is_empty(self) -> bool:
-        cur = self._conn.execute("SELECT 1 FROM taxonomy LIMIT 1")
-        return cur.fetchone() is None
+        with self.lock:
+            cur = self._conn.execute("SELECT 1 FROM taxonomy LIMIT 1")
+            return cur.fetchone() is None
 
     def taxonomy_insert(
         self,
@@ -891,68 +1148,76 @@ class Catalog:
         aliases: list[str] | None = None,
         alias_of: str | None = None,
     ) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO taxonomy (code, parent_code, label, folder_name,
-                                  aliases, alias_of, active, created_at)
-            VALUES (?,?,?,?,?,?,1,?)
-            ON CONFLICT(code) DO NOTHING
-            """,
-            (code, parent_code, label, folder_name, _json(aliases or []), alias_of, _now_iso()),
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                """
+                INSERT INTO taxonomy (code, parent_code, label, folder_name,
+                                      aliases, alias_of, active, created_at)
+                VALUES (?,?,?,?,?,?,1,?)
+                ON CONFLICT(code) DO NOTHING
+                """,
+                (code, parent_code, label, folder_name, _json(aliases or []), alias_of, _now_iso()),
+            )
+            self._conn.commit()
 
     def taxonomy_get(self, code: str) -> sqlite3.Row | None:
-        cur = self._conn.execute("SELECT * FROM taxonomy WHERE code=?", (code,))
-        return cur.fetchone()
+        with self.lock:
+            cur = self._conn.execute("SELECT * FROM taxonomy WHERE code=?", (code,))
+            return cur.fetchone()
 
     def taxonomy_children(self, parent_code: str | None) -> list[sqlite3.Row]:
-        cur = self._conn.execute(
-            "SELECT * FROM taxonomy WHERE parent_code IS ? ORDER BY code", (parent_code,)
-        )
-        return cur.fetchall()
+        with self.lock:
+            cur = self._conn.execute(
+                "SELECT * FROM taxonomy WHERE parent_code IS ? ORDER BY code", (parent_code,)
+            )
+            return cur.fetchall()
 
     def taxonomy_all(self) -> list[sqlite3.Row]:
-        cur = self._conn.execute("SELECT * FROM taxonomy WHERE active=1 ORDER BY code")
-        return cur.fetchall()
+        with self.lock:
+            cur = self._conn.execute("SELECT * FROM taxonomy WHERE active=1 ORDER BY code")
+            return cur.fetchall()
 
     def taxonomy_set_alias(self, from_code: str, to_code: str) -> None:
-        self._conn.execute(
-            "UPDATE taxonomy SET alias_of=?, active=0 WHERE code=?", (to_code, from_code)
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                "UPDATE taxonomy SET alias_of=?, active=0 WHERE code=?", (to_code, from_code)
+            )
+            self._conn.commit()
 
     def taxonomy_set_aliases(self, code: str, aliases: list[str]) -> None:
-        self._conn.execute(
-            "UPDATE taxonomy SET aliases=? WHERE code=?", (_json(aliases), code)
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                "UPDATE taxonomy SET aliases=? WHERE code=?", (_json(aliases), code)
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Learned concepts
     # ------------------------------------------------------------------
 
     def learned_concept_get(self, subject: str) -> str | None:
-        cur = self._conn.execute(
-            "SELECT class_code FROM learned_concepts WHERE subject=?", (subject,)
-        )
-        row = cur.fetchone()
-        return row["class_code"] if row else None
+        with self.lock:
+            cur = self._conn.execute(
+                "SELECT class_code FROM learned_concepts WHERE subject=?", (subject,)
+            )
+            row = cur.fetchone()
+            return row["class_code"] if row else None
 
     def learned_concept_remember(self, subject: str, class_code: str) -> None:
-        now = _now_iso()
-        self._conn.execute(
-            """
-            INSERT INTO learned_concepts (subject, class_code, hits, created_at, updated_at)
-            VALUES (?,?,1,?,?)
-            ON CONFLICT(subject) DO UPDATE SET
-                class_code = excluded.class_code,
-                hits       = hits + 1,
-                updated_at = excluded.updated_at
-            """,
-            (subject, class_code, now, now),
-        )
-        self._conn.commit()
+        with self.lock:
+            now = _now_iso()
+            self._conn.execute(
+                """
+                INSERT INTO learned_concepts (subject, class_code, hits, created_at, updated_at)
+                VALUES (?,?,1,?,?)
+                ON CONFLICT(subject) DO UPDATE SET
+                    class_code = excluded.class_code,
+                    hits       = hits + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (subject, class_code, now, now),
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Failed files (poison-file tracking)
@@ -966,71 +1231,76 @@ class Catalog:
         If the stored size/mtime differ from the incoming values the file has
         changed on disk, so the count resets to 1 and any quarantine is cleared.
         """
-        now = _now_iso()
-        row = self._conn.execute(
-            "SELECT size, mtime_ns, fail_count FROM failed_files WHERE source_path=?",
-            (source_path,),
-        ).fetchone()
-        if row is None:
+        with self.lock:
+            now = _now_iso()
+            row = self._conn.execute(
+                "SELECT size, mtime_ns, fail_count FROM failed_files WHERE source_path=?",
+                (source_path,),
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO failed_files
+                        (source_path, size, mtime_ns, fail_count, last_error,
+                         first_failed_at, last_failed_at, quarantined)
+                    VALUES (?,?,?,?,?,?,?,0)
+                    """,
+                    (source_path, size, mtime_ns, 1, error, now, now),
+                )
+                self._conn.commit()
+                return 1
+            if row["size"] != size or row["mtime_ns"] != mtime_ns:
+                self._conn.execute(
+                    """
+                    UPDATE failed_files
+                       SET size=?, mtime_ns=?, fail_count=1, last_error=?,
+                           last_failed_at=?, quarantined=0
+                     WHERE source_path=?
+                    """,
+                    (size, mtime_ns, error, now, source_path),
+                )
+                self._conn.commit()
+                return 1
+            new_count = row["fail_count"] + 1
             self._conn.execute(
-                """
-                INSERT INTO failed_files
-                    (source_path, size, mtime_ns, fail_count, last_error,
-                     first_failed_at, last_failed_at, quarantined)
-                VALUES (?,?,?,?,?,?,?,0)
-                """,
-                (source_path, size, mtime_ns, 1, error, now, now),
+                "UPDATE failed_files SET fail_count=?, last_error=?, last_failed_at=? "
+                "WHERE source_path=?",
+                (new_count, error, now, source_path),
             )
             self._conn.commit()
-            return 1
-        if row["size"] != size or row["mtime_ns"] != mtime_ns:
-            self._conn.execute(
-                """
-                UPDATE failed_files
-                   SET size=?, mtime_ns=?, fail_count=1, last_error=?,
-                       last_failed_at=?, quarantined=0
-                 WHERE source_path=?
-                """,
-                (size, mtime_ns, error, now, source_path),
-            )
-            self._conn.commit()
-            return 1
-        new_count = row["fail_count"] + 1
-        self._conn.execute(
-            "UPDATE failed_files SET fail_count=?, last_error=?, last_failed_at=? "
-            "WHERE source_path=?",
-            (new_count, error, now, source_path),
-        )
-        self._conn.commit()
-        return new_count
+            return new_count
 
     def quarantine_file(self, source_path: str) -> None:
-        self._conn.execute(
-            "UPDATE failed_files SET quarantined=1 WHERE source_path=?", (source_path,)
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                "UPDATE failed_files SET quarantined=1 WHERE source_path=?", (source_path,)
+            )
+            self._conn.commit()
 
     def is_quarantined(self, source_path: str, size: int, mtime_ns: int) -> bool:
-        row = self._conn.execute(
-            "SELECT quarantined, size, mtime_ns FROM failed_files WHERE source_path=?",
-            (source_path,),
-        ).fetchone()
-        if row is None:
-            return False
-        return bool(row["quarantined"]) and row["size"] == size and row["mtime_ns"] == mtime_ns
+        with self.lock:
+            row = self._conn.execute(
+                "SELECT quarantined, size, mtime_ns FROM failed_files WHERE source_path=?",
+                (source_path,),
+            ).fetchone()
+            if row is None:
+                return False
+            return bool(row["quarantined"]) and row["size"] == size and row["mtime_ns"] == mtime_ns
 
     def clear_file_failure(self, source_path: str) -> None:
-        self._conn.execute(
-            "DELETE FROM failed_files WHERE source_path=?", (source_path,)
-        )
-        self._conn.commit()
+        with self.lock:
+            self._conn.execute(
+                "DELETE FROM failed_files WHERE source_path=?", (source_path,)
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        self._conn.close()
+        with self.lock:
+            self._conn.close()
 
     def __enter__(self) -> "Catalog":
         return self

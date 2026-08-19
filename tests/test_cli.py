@@ -648,7 +648,15 @@ def test_cli_watch_wires_args(monkeypatch, tmp_path):
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["watch", "--source", str(src), "--dest", str(dest), "--interval", "5"],
+        # --no-dashboard: this test is about arg wiring into `_watcher.watch`,
+        # not the dashboard -- without it, a real `serve()` call would bind
+        # an actual port 8080 as an unrelated side effect of running this
+        # test (see the dashboard-specific tests below for real bind/port
+        # coverage).
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--interval", "5", "--no-dashboard",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert captured["interval"] == 5.0
@@ -656,6 +664,136 @@ def test_cli_watch_wires_args(monkeypatch, tmp_path):
     # pipeline, so that discovery and the pipeline can never disagree.
     assert "source" not in captured
     assert captured["pipeline"].source_dir == src
+    # Task 8: `watch()` now always receives the live control object (not a
+    # frozen `interval`/`enrich_enabled` value) so a dashboard change takes
+    # effect without a restart -- see watcher.watch's docstring.
+    from imageharbor.dashboard.control import ControlPlane
+
+    assert isinstance(captured["control"], ControlPlane)
+
+
+# ---------------------------------------------------------------------------
+# dashboard flags and wiring (Task 8)
+# ---------------------------------------------------------------------------
+
+
+def _fake_watch_cli(monkeypatch, tmp_path):
+    """Patch `_watcher.watch` so `watch` returns immediately without running
+    the real (blocking) loop -- these tests are about the dashboard/CLI
+    wiring around it, not about the loop itself (see test_watcher.py)."""
+    from imageharbor import watcher as _watcher
+    from imageharbor.watcher import WatchStats
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "beach.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9")
+    dest = tmp_path / "dest"
+
+    monkeypatch.setattr(_watcher, "watch", lambda **kwargs: WatchStats(passes=1))
+    return src, dest
+
+
+def test_watch_no_dashboard_starts_no_server(monkeypatch, tmp_path):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        dashboard_server, "serve", lambda *a, **k: calls.__setitem__("n", calls["n"] + 1)
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["watch", "--source", str(src), "--dest", str(dest), "--no-dashboard"],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls["n"] == 0
+
+
+def test_watch_dashboard_port_is_accepted_and_forwarded(monkeypatch, tmp_path):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(catalog, control, *, port, breaker=None, stop_event):
+        captured["port"] = port
+        return None  # a dashboard failure must never stop the watcher
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-port", "12345",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 12345
+
+
+def test_watch_still_runs_when_the_dashboard_port_is_already_bound(monkeypatch, tmp_path):
+    """The important one: a real, already-bound port must not stop `watch`
+    from organizing photos -- it degrades to a warning (see
+    dashboard/server.py's module docstring: "A dashboard failure must never
+    stop the watcher"). `serve()` itself already guarantees this (see
+    tests/test_dashboard_server.py::
+    test_serve_on_already_bound_port_returns_none_and_does_not_raise); this
+    test exercises that guarantee THROUGH the CLI, using a real bound socket
+    and the real (unpatched) `serve()`, so a regression in either `serve()`
+    or in how `watch` calls it is caught here too.
+
+    Mutation-tested manually: forcing the bind failure to propagate (e.g. by
+    calling the socket-binding server constructor directly instead of going
+    through `serve()`'s guarded bind) makes this test fail with a non-zero
+    exit code instead of passing -- confirming the assertions below actually
+    depend on the "never raises" contract rather than passing vacuously.
+    """
+    import socket
+
+    from imageharbor import watcher as _watcher
+    from imageharbor.watcher import WatchStats
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "beach.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9")
+    dest = tmp_path / "dest"
+
+    watch_calls = {"n": 0}
+
+    def _fake_watch(**kwargs):
+        watch_calls["n"] += 1
+        return WatchStats(passes=1)
+
+    monkeypatch.setattr(_watcher, "watch", _fake_watch)
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Wildcard bind, matching what `serve()` itself binds -- see
+    # test_dashboard_server.py's identical comment for why "127.0.0.1"
+    # would not actually conflict on Windows.
+    blocker.bind(("0.0.0.0", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "watch", "--source", str(src), "--dest", str(dest),
+                "--dashboard-port", str(port),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # The watcher still ran (organized photos) despite the bind failure.
+        assert watch_calls["n"] == 1
+        assert "could not bind" in result.output.lower()
+    finally:
+        blocker.close()
 
 
 # ---------------------------------------------------------------------------

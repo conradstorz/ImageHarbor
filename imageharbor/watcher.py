@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .ai_classifier import AIClassifier
 from .catalog import Catalog
@@ -24,6 +25,9 @@ from .circuit_breaker import CircuitBreaker
 from .discovery import discover_images
 from .enrich import EnrichStats, enrich_library
 from .pipeline import Pipeline
+
+if TYPE_CHECKING:
+    from .dashboard.control import ControlPlane
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +38,63 @@ logger = logging.getLogger(__name__)
 # short enough that a genuinely stuck watcher gets flagged well within a day.
 CONSECUTIVE_ABORT_WARNING_THRESHOLD = 10
 
+# A defensive ceiling on any single `sleep()` call this loop makes, in
+# seconds (~1 year). `control.py` validates `interval` with `math.isfinite`
+# at both write time (`set_override`) and read time (`_parse_interval`), so
+# a non-finite value should never reach here -- but `_safe_sleep` below is a
+# second, independent guard: belt-and-braces, not the primary fix. Without
+# it, a value that somehow slips past the store (a future caller that
+# doesn't go through ControlPlane, a hand-rolled test double, `math.inf`
+# passed directly) would reach `Event.wait(math.inf)` and raise
+# `OverflowError` -- an unhandled exception in the middle of the watch loop,
+# taking the whole watcher down. A year is far longer than any real poll
+# interval and still short enough that a wedged watcher recovers within the
+# process's lifetime rather than sleeping until the process is manually
+# restarted anyway.
+_MAX_SLEEP_SECONDS = 365 * 24 * 3600.0
+
+
+def _safe_sleep(sleep: Callable[[float], bool | None], seconds: float) -> None:
+    """Call *sleep(seconds)* defensively -- a bad value must never crash the loop.
+
+    A non-finite (`inf`/`-inf`/`nan`) or negative *seconds* is replaced with
+    `_MAX_SLEEP_SECONDS` before the call. `Event.wait` (the default `sleep`)
+    additionally raises `OverflowError` for a `float` timeout too large for
+    the platform's `time_t` even when it IS finite -- e.g. a stored interval
+    of "1e400" parsed by `float()` -- so the call itself is also wrapped
+    rather than trusting the pre-check alone.
+    """
+    if not math.isfinite(seconds) or seconds < 0:
+        logger.warning(
+            "watch(): refusing to sleep(%r); using %.0fs instead",
+            seconds, _MAX_SLEEP_SECONDS,
+        )
+        seconds = _MAX_SLEEP_SECONDS
+    else:
+        seconds = min(seconds, _MAX_SLEEP_SECONDS)
+    try:
+        sleep(seconds)
+    except OverflowError:
+        logger.warning(
+            "watch(): sleep(%r) raised OverflowError; using %.0fs instead",
+            seconds, _MAX_SLEEP_SECONDS,
+        )
+        sleep(_MAX_SLEEP_SECONDS)
+
 
 @dataclass
 class WatchStats:
     passes: int = 0
-    # Facts-phase counts.
+    # Facts-phase counts. `processed` is the pre-existing combined counter
+    # (copied + duplicate, kept for backward compatibility with every
+    # existing caller/test); `copied`/`duplicates` are the same two cases
+    # split out, added so `runs.copied`/`runs.duplicates` (see
+    # `Catalog.run_finish`) can be populated without guessing -- the design
+    # doc's "Now" panel example ("12 copied - 3 duplicates - 0 errors")
+    # requires the split, which `processed` alone cannot provide.
     processed: int = 0
+    copied: int = 0
+    duplicates: int = 0
     skipped_unchanged: int = 0
     errors: int = 0
     # Enrichment-phase counts (0 whenever enrichment did not run this pass,
@@ -71,6 +126,8 @@ def run_pass(
     catalog: Catalog,
     source: Path,
     recursive: bool = True,
+    pause_check: Optional[Callable[[], bool]] = None,
+    stats: Optional[WatchStats] = None,
 ) -> WatchStats:
     """Process new/changed files once (the facts phase only).
 
@@ -79,10 +136,29 @@ def run_pass(
     never feeds one. Every error it can return is an I/O error (a permissions
     problem, an unreadable file, a full disk), and feeding those into the AI
     breaker would let a filesystem fault masquerade as a backend outage.
+
+    *pause_check*, when given, is consulted BEFORE each file -- mirroring
+    `Pipeline.run`'s own guarantee -- so a pause always stops between files,
+    never mid-copy.
+
+    *stats*, when given, is mutated in place and also returned, instead of a
+    fresh `WatchStats` being created. This lets a caller (`run_once`) keep a
+    reference to the counts reached so far even if this function raises
+    partway through an iteration (e.g. a catalog write failure) -- an
+    exception here loses nothing already recorded in the shared object,
+    which is what makes "the counts recorded so far" in a crashed pass's
+    `runs` row possible.
     """
-    stats = WatchStats()
+    if stats is None:
+        stats = WatchStats()
     try:
         for path in discover_images(source, recursive=recursive):
+            if pause_check is not None and pause_check():
+                logger.info(
+                    "Paused after %d file(s) this pass; stopping cleanly",
+                    stats.processed,
+                )
+                break
             try:
                 st = path.stat()
             except OSError:
@@ -103,6 +179,10 @@ def run_pass(
                     str(path), st.st_size, st.st_mtime_ns, result.sha256_b64url
                 )
                 stats.processed += 1
+                if result.status == "copied":
+                    stats.copied += 1
+                else:
+                    stats.duplicates += 1
             elif result.status == "error":
                 stats.errors += 1
             # any other status (e.g. a future "skipped") is neither counted as an
@@ -225,8 +305,32 @@ def run_once(
     poison_max_fails: int = 5,
     quarantine_dir: Optional[Path] = None,
     offset: int = 0,
+    pause_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[WatchStats, Optional[EnrichStats]]:
     """One full sweep: the facts phase, then the enrichment phase.
+
+    Each phase that actually runs writes exactly one `runs` row
+    (`Catalog.run_start`/`run_finish`) -- 'facts' always, 'enrich' only when
+    the enrichment phase is entered below (not when it is skipped because
+    enrichment is disabled, no classifier is configured, or the breaker is
+    OPEN: a row should mean a pass actually happened). `run_finish` is
+    always reached via a `finally`, so a phase that raises still closes its
+    row -- with whatever counts had accumulated in the *shared* `WatchStats`/
+    `EnrichStats` object before the crash (see `run_pass`'s `stats` param),
+    plus one additional error for the crash itself -- rather than leaving
+    `ended_at` NULL forever (which the dashboard reads as "this process
+    died"). The exception itself is NOT swallowed here: it re-raises after
+    the row is closed, so a facts-phase crash also skips the enrichment
+    phase this sweep (same as before this feature: a badly broken source
+    tree should not go on to also attempt enrichment). `watch()` is what
+    catches it, logs it, and moves on to the next pass -- see its docstring.
+
+    *pause_check* is forwarded to both `run_pass` and `enrich_library`; each
+    is consulted BEFORE that phase's next file/row, never mid-item. Whether
+    a given phase's row is recorded `paused=1` is decided by re-reading
+    *pause_check* right after that phase returns (or raises) -- since a
+    phase's own pause_check is what caused it to stop early, if it is still
+    true immediately afterward, this pass ended because of a pause.
 
     The facts leg MUST go through `run_pass`, not `Pipeline.run()`: `run_pass`
     consults `catalog.source_is_unchanged` (a cheap os.stat) and only
@@ -264,19 +368,104 @@ def run_once(
             write_sidecars=write_sidecars,
         )
 
-    facts = run_pass(pipeline=pipeline, catalog=catalog, source=source, recursive=recursive)
+    def _breaker_state() -> str:
+        # Read fresh at each call site rather than once: the enrichment
+        # phase below can trip/close the breaker while it runs, so "the
+        # breaker state at pass end" must be read AFTER that phase, not
+        # before. Lower-case to match `BreakerState.value` (see
+        # `circuit_breaker.py`) and `dashboard/stats.py`'s own use of it --
+        # NOT the schema's upper-case SQL `DEFAULT 'CLOSED'`, which is never
+        # actually written by application code (this function always
+        # supplies an explicit value).
+        return breaker.state.value if breaker is not None else "closed"
 
+    def _paused_now() -> bool:
+        return bool(pause_check()) if pause_check is not None else False
+
+    # -- facts phase -------------------------------------------------------
+    facts = WatchStats()
+    facts_run_id = catalog.run_start("facts")
+    facts_crashed = False
+    try:
+        run_pass(
+            pipeline=pipeline,
+            catalog=catalog,
+            source=source,
+            recursive=recursive,
+            pause_check=pause_check,
+            stats=facts,
+        )
+    except Exception:
+        facts_crashed = True
+        raise
+    finally:
+        if facts_crashed:
+            facts.errors += 1
+        catalog.run_finish(
+            facts_run_id,
+            scanned=facts.processed + facts.skipped_unchanged + facts.errors,
+            copied=facts.copied,
+            duplicates=facts.duplicates,
+            errors=facts.errors,
+            enriched=0,
+            enrich_failed=0,
+            breaker_state=_breaker_state(),
+            paused=_paused_now(),
+        )
+
+    # -- enrichment phase ----------------------------------------------------
     enrich_stats: Optional[EnrichStats] = None
     if enrich_enabled and classifier is not None:
         if breaker is not None and breaker.is_open():
             logger.info("Breaker open — skipping the enrichment phase this pass")
         else:
-            enrich_stats = enrich_library(
-                catalog, dest, classifier,
-                write_sidecars=write_sidecars,
-                breaker=breaker,
-                offset=offset,
-            )
+            enrich_run_id = catalog.run_start("enrich")
+            enrich_crashed = False
+            try:
+                enrich_stats = enrich_library(
+                    catalog, dest, classifier,
+                    write_sidecars=write_sidecars,
+                    breaker=breaker,
+                    offset=offset,
+                    pause_check=pause_check,
+                )
+            except Exception:
+                enrich_crashed = True
+                raise
+            finally:
+                # `enrich_library` returns nothing on a crash (unlike
+                # `run_pass`, it owns its own EnrichStats internally rather
+                # than accepting one to mutate -- out of scope for this
+                # module to change), so the counts reached so far are
+                # unknowable here; only the crash itself is recorded.
+                row_stats = enrich_stats if enrich_stats is not None else EnrichStats()
+                row_errors = row_stats.errors + (1 if enrich_crashed else 0)
+                # IMPORTANT finding #7 (2026-08-19 whole-branch review): this
+                # used to pass `row_errors` into BOTH `errors` and
+                # `enrich_failed`, so the dashboard history panel's 24h error
+                # figure (which sums `errors` across runs -- see
+                # `dashboard/stats.py`'s `_window_summary`) counted every
+                # enrichment failure twice: once as itself (`enrich_failed`)
+                # and once again as if it were a facts-phase error
+                # (`errors`). `errors` on a `runs` row means "facts-phase
+                # errors"; an 'enrich'-kind row has no facts phase at all, so
+                # it is always 0 here. `enrich_failed` alone carries every
+                # AI-perception and post-perception failure this pass hit
+                # (`EnrichStats.errors`, which already sums `ai_failed` +
+                # `io_failed`, plus the crash-in-flight count) -- see
+                # `EnrichStats`'s own fields in enrich.py.
+                catalog.run_finish(
+                    enrich_run_id,
+                    scanned=row_stats.total,
+                    copied=0,
+                    duplicates=0,
+                    errors=0,
+                    enriched=row_stats.enriched,
+                    enrich_failed=row_errors,
+                    breaker_state=_breaker_state(),
+                    paused=_paused_now(),
+                )
+
             failed_buffer = _failed_buffer_from_digests(
                 catalog, enrich_stats.ai_failed, "enrichment failed"
             )
@@ -306,12 +495,33 @@ def watch(
     enrich_enabled: bool = True,
     poison_max_fails: int = 5,
     quarantine_dir: Optional[Path] = None,
+    control: ControlPlane | None = None,
 ) -> WatchStats:
     """Run passes until stop_event is set. An immediate first pass runs before
     the first sleep. ``sleep`` defaults to ``stop_event.wait`` so a signal
     interrupts the wait promptly. When the breaker is OPEN, the between-pass
     wait is the breaker's remaining backoff instead of ``interval``; once it
     elapses the next pass runs as a half-open probe.
+
+    ``control``, when given, is a live :class:`~imageharbor.dashboard.control.
+    ControlPlane` consulted FRESH on every iteration for three dials:
+    ``control.pause_check()``, ``control.interval``, and
+    ``control.enrich_enabled``. This loop runs once and lives for the life of
+    the container, so anything captured as a plain *value* at call time would
+    be frozen at startup -- a dashboard edit would update the UI, persist to
+    the database, and never actually change behavior until a restart. Reading
+    the object on each pass instead of its values up front is what makes the
+    dashboard's dials live rather than decorative. When ``control`` is
+    already paused BEFORE a pass starts, this loop sleeps the interval and
+    runs NO pass at all, rather than starting one and immediately breaking
+    out. ``control.pause_check`` is also forwarded into ``run_once`` (and
+    from there into ``run_pass``/``enrich_library``), so a pause that lands
+    WHILE a pass is running still takes effect between files/rows, never
+    mid-item (see ``Pipeline.run``'s and ``enrich_library``'s own
+    ``pause_check`` guarantee) -- that pass's ``runs`` row is then recorded
+    ``paused=1`` (see ``run_once``). When ``control`` is ``None``, the
+    ``interval``/``enrich_enabled`` parameters below are used exactly as
+    before this option existed, and no ``pause_check`` is forwarded at all.
 
     Each pass is a full facts-then-enrichment sweep (`run_once`): the facts
     phase always runs; the enrichment phase (and therefore the breaker) is
@@ -361,26 +571,63 @@ def watch(
     probe_offset = 0
     consecutive_aborted_passes = 0
     while not stop_event.is_set():
+        # Read the pause flag fresh every iteration -- see the docstring
+        # above for why a value captured once at startup would silently
+        # defeat this dial. A paused watcher sleeps the (also freshly-read)
+        # interval and runs NO pass at all, rather than starting one and
+        # immediately breaking out.
+        if control is not None and control.pause_check():
+            _safe_sleep(sleep, control.interval)
+            continue
         if breaker is not None and breaker.is_open():
             wait = breaker.seconds_until_probe()
             if wait > 0:
-                sleep(wait)
+                _safe_sleep(sleep, wait)
                 continue
             breaker.begin_probe()
-        facts, enrich_stats = run_once(
-            pipeline.source_dir,
-            pipeline.organized_dir,
-            catalog,
-            classifier=classifier,
-            breaker=breaker,
-            pipeline=pipeline,
-            write_sidecars=pipeline.write_sidecars,
-            recursive=recursive,
-            enrich_enabled=enrich_enabled,
-            poison_max_fails=poison_max_fails,
-            quarantine_dir=quarantine_dir,
-            offset=probe_offset,
+        # Same freshness requirement as the interval: read on every pass, not
+        # once at call time.
+        pass_enrich_enabled = (
+            control.enrich_enabled if control is not None else enrich_enabled
         )
+        try:
+            facts, enrich_stats = run_once(
+                pipeline.source_dir,
+                pipeline.organized_dir,
+                catalog,
+                classifier=classifier,
+                breaker=breaker,
+                pipeline=pipeline,
+                write_sidecars=pipeline.write_sidecars,
+                recursive=recursive,
+                enrich_enabled=pass_enrich_enabled,
+                poison_max_fails=poison_max_fails,
+                quarantine_dir=quarantine_dir,
+                offset=probe_offset,
+                pause_check=control.pause_check if control is not None else None,
+            )
+        except Exception:
+            # `run_once` already closed this pass's `runs` row(s) in a
+            # `finally` (with the counts reached plus one for the crash
+            # itself) before re-raising -- see its docstring. Catching here
+            # is what keeps a single bad pass from taking the whole watch
+            # loop down with it: the dashboard server thread is independent
+            # of this loop regardless, but a dead loop would still freeze
+            # every *future* pass's data (a new `current_run` would never
+            # start), which is exactly what an operator watching the page
+            # during an incident must not see.
+            logger.exception(
+                "watch pass %d crashed; its run row was still closed with "
+                "the counts reached, and the loop continues to the next pass",
+                wstats.passes + 1,
+            )
+            wstats.passes += 1
+            wstats.errors += 1
+            if stop_event.is_set():
+                break
+            current_interval = control.interval if control is not None else interval
+            _safe_sleep(sleep, current_interval)
+            continue
         if enrich_stats is not None:
             if enrich_stats.aborted:
                 # Skip past a whole cluster rather than crawling it one row
@@ -444,5 +691,9 @@ def watch(
         # way — seconds_until_probe() is absolute-clock based.
         if breaker is not None and breaker.is_open():
             continue
-        sleep(interval)
+        # Read fresh, same as the pause/enrich_enabled reads above: a
+        # dashboard interval change must take effect on THIS sleep, not
+        # whatever value `watch()` happened to be called with.
+        current_interval = control.interval if control is not None else interval
+        _safe_sleep(sleep, current_interval)
     return wstats

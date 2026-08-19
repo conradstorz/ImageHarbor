@@ -266,3 +266,62 @@ def test_reclassify_forces_a_second_pass(tmp_path):
     assert stats.total == 1
     assert cat.get_by_sha256(result.sha256_b64url)["pcs_name"]
     cat.close()
+
+
+# ---------------------------------------------------------------------------
+# Pause plumbing (dashboard Task 4)
+# ---------------------------------------------------------------------------
+
+
+def test_pause_stops_enrichment_between_rows(tmp_path):
+    """pause_check must be consulted between rows, never mid-row.
+
+    Same guarantee Task 4 protects in the facts pass: pausing stops the NEXT
+    row from starting, but never leaves a row half-processed.
+    """
+    src = _make(tmp_path, "IMG_1.jpg", b"one")
+    (src / "IMG_2.jpg").write_bytes(b"two")
+    (src / "IMG_3.jpg").write_bytes(b"three")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    seen = 0
+
+    def _pause_after_two():
+        nonlocal seen
+        seen += 1
+        return seen > 2
+
+    stats = enrich_library(cat, dest, FixedClassifier(), pause_check=_pause_after_two)
+
+    assert stats.total == 2
+    assert stats.enriched == 2
+    cat.close()
+
+
+def test_no_pause_check_enriches_everything(tmp_path):
+    """The default path is unchanged for every existing caller."""
+    src = _make(tmp_path, "IMG_1.jpg", b"one")
+    (src / "IMG_2.jpg").write_bytes(b"two")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    stats = enrich_library(cat, dest, FixedClassifier())
+
+    assert stats.total == 2
+    assert stats.enriched == 2
+    cat.close()
+
+
+def test_pause_check_true_from_the_start_enriches_nothing(tmp_path):
+    """Pins the check to BEFORE a row is processed, not after."""
+    cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
+
+    stats = enrich_library(cat, dest, FixedClassifier(), pause_check=lambda: True)
+
+    assert stats.total == 0
+    assert stats.enriched == 0
+    assert cat.get_by_sha256(result.sha256_b64url)["enriched_at"] is None
+    cat.close()
