@@ -19,11 +19,18 @@ services:
       IMAGEHARBOR_AI_MODEL: llava
       IMAGEHARBOR_AI_API_KEY: not-needed
       IMAGEHARBOR_AI_TIMEOUT: "60"
+    ports:
+      - "8080:8080"     # operational dashboard (see docs/superpowers/specs/2026-08-19-dashboard-design.md)
     volumes:
       - /mnt/nas/photos:/data/source:ro          # read-only source
       - /mnt/nas/photos-organized:/data/dest     # read-write organized library
       - imageharbor-catalog:/data/catalog        # local catalog volume (NOT on NAS)
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   imageharbor-catalog:

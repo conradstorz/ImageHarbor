@@ -470,6 +470,20 @@ def enrich(
     type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
     help="If set, copy quarantined originals here.",
 )
+@click.option(
+    "--dashboard-port",
+    envvar="IMAGEHARBOR_DASHBOARD_PORT",
+    default=8080,
+    show_default=True,
+    type=int,
+    help="Port for the operational dashboard.",
+)
+@click.option(
+    "--no-dashboard",
+    is_flag=True,
+    default=False,
+    help="Disable the operational dashboard.",
+)
 def watch(
     source: Path,
     dest: Path,
@@ -488,12 +502,16 @@ def watch(
     breaker_backoff_cap: float,
     poison_max_fails: int,
     quarantine_dir: Path | None,
+    dashboard_port: int,
+    no_dashboard: bool,
 ) -> None:
     """Continuously watch SOURCE and organize new/changed photos into DEST."""
     import signal
     import threading
 
     from . import watcher as _watcher
+    from .dashboard import server as dashboard_server
+    from .dashboard.control import ControlPlane
 
     _guard_dest_not_inside_source(source, dest)
 
@@ -522,6 +540,36 @@ def watch(
         )
         click.echo(f"Watching {source} -> {dest} every {interval:.0f}s (Ctrl-C to stop).")
         breaker = _build_breaker(breaker_threshold, breaker_backoff, breaker_backoff_cap)
+
+        # `enrich` was always effectively enabled at the CLI layer (a
+        # classifier is always constructed above, defaulting to the stub
+        # backend), so that is the env-derived baseline for the dashboard's
+        # 'enrich' override too -- a dashboard toggle can still turn it off
+        # at runtime regardless of this default.
+        control = ControlPlane(catalog, env_interval=interval, env_enrich=True)
+
+        # A dashboard failure must NEVER stop the watcher (see
+        # dashboard/server.py's module docstring): `serve()` already binds
+        # the socket defensively and returns None instead of raising on a
+        # bind failure (e.g. the port is already in use, which matters even
+        # outside Docker since the dashboard is on by default). Nothing
+        # here needs its own try/except on top of that guarantee.
+        if no_dashboard:
+            click.echo("Dashboard disabled (--no-dashboard).")
+        else:
+            dashboard_thread = dashboard_server.serve(
+                catalog, control, port=dashboard_port, breaker=breaker,
+                stop_event=stop_event,
+            )
+            if dashboard_thread is None:
+                click.echo(
+                    f"Dashboard could not bind port {dashboard_port}; "
+                    "continuing without it.",
+                    err=True,
+                )
+            else:
+                click.echo(f"Dashboard listening on http://0.0.0.0:{dashboard_port}/")
+
         stats = _watcher.watch(
             pipeline=pipeline,
             catalog=catalog,
@@ -532,6 +580,7 @@ def watch(
             breaker=breaker,
             poison_max_fails=poison_max_fails,
             quarantine_dir=quarantine_dir,
+            control=control,
         )
 
     click.echo(
