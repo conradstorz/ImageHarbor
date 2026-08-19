@@ -69,12 +69,23 @@ def wheel_built_without_git(tmp_path_factory: pytest.TempPathFactory) -> Path:
     assert not (src / ".git").exists(), "the copy must have no git metadata"
 
     out = tmp_path_factory.mktemp("nogit_wheel")
-    proc = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(out), str(src)],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
+    cmd = ["uv", "build", "--wheel", "--out-dir", str(out), str(src)]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600
+        )
+    except FileNotFoundError:
+        # Fail loudly and legibly rather than surfacing a bare traceback --
+        # and still fail, never skip (see the fixture docstring).
+        pytest.fail(
+            "`uv` was not found on PATH, so this test could not build a wheel "
+            "and therefore could not check that runtime assets survive "
+            "packaging. Install uv (the project mandates it -- see CLAUDE.md) "
+            "rather than skipping: the bug this guards shipped as a silent "
+            "absence, and a silent absence in the test is the same failure."
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("`uv build` timed out after 600s: " + " ".join(cmd))
     if proc.returncode != 0:
         pytest.fail("`uv build` failed:\n" + proc.stdout + "\n" + proc.stderr)
     wheels = list(out.glob("*.whl"))
@@ -99,11 +110,22 @@ def test_runtime_asset_survives_a_gitless_wheel_build(
     )
 
 
-def test_the_dashboard_page_asset_is_non_empty_in_the_wheel(
-    wheel_built_without_git: Path,
+@pytest.mark.parametrize("member", REQUIRED_WHEEL_MEMBERS)
+def test_the_wheels_runtime_asset_is_actually_servable(
+    wheel_built_without_git: Path, member: str
 ) -> None:
-    """A zero-byte page would satisfy mere presence but still serve nothing."""
+    """Presence alone is not enough: a truncated or empty entry still 500s.
+
+    Asserted structurally rather than by byte count -- a size floor would be
+    an arbitrary number that fails the day the page is legitimately made
+    smaller. What actually matters is that the bytes parse as the HTML
+    document the server hands to a browser.
+    """
     with zipfile.ZipFile(wheel_built_without_git) as zf:
-        data = zf.read("imageharbor/dashboard/index.html")
-    assert len(data) > 1000, f"index.html in the wheel is only {len(data)} bytes"
-    assert b"<" in data, "index.html in the wheel does not look like HTML"
+        data = zf.read(member)
+    text = data.decode("utf-8").lower()
+    assert text.strip(), f"{member} is empty in the wheel"
+    assert "<html" in text, f"{member} in the wheel has no <html> element"
+    assert "</html>" in text, (
+        f"{member} in the wheel is truncated -- no closing </html>"
+    )
