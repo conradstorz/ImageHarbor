@@ -28,6 +28,7 @@ import re
 import zipfile
 import zlib
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 from .. import content_type
@@ -117,6 +118,9 @@ def survey_archives(archives_dir: Path) -> SurveyInventory:
 
     # --- pass one: central directories only ------------------------------
     members_by_zip: dict[Path, list[archive.MemberInfo]] = {}
+    # Where each archive's ArchiveFact sits in inv.archives, so a pass-two
+    # failure can annotate the SAME entry rather than leaving it looking clean.
+    fact_index: dict[Path, int] = {}
     for path in zips:
         match = _ZIP_PART_RE.match(path.name)
         if match:
@@ -132,6 +136,7 @@ def survey_archives(archives_dir: Path) -> SurveyInventory:
             logger.warning("survey: cannot read %s: %s", path.name, exc)
             continue
         members_by_zip[path] = members
+        fact_index[path] = len(inv.archives)
         inv.archives.append(
             ArchiveFact(name=path.name, size=_safe_size(path), members=len(members))
         )
@@ -156,6 +161,12 @@ def survey_archives(archives_dir: Path) -> SurveyInventory:
             zf = zipfile.ZipFile(path)
         except (zipfile.BadZipFile, OSError, zlib.error) as exc:
             inv.unreadable_archives += 1
+            # Annotate the entry pass one already created. Bumping only the
+            # counter would leave archives[] showing this archive as healthy,
+            # with a member count its members were never actually recorded
+            # under -- one report contradicting itself.
+            idx = fact_index[path]
+            inv.archives[idx] = replace(inv.archives[idx], error=str(exc))
             logger.warning("survey: cannot reopen %s: %s", path.name, exc)
             continue
         with zf:

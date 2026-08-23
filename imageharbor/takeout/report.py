@@ -210,6 +210,13 @@ def build_report(inv: SurveyInventory, *, distrust_threshold: int) -> dict[str, 
             "status": status,
             "count": len(inv.archives),
             "unreadable": inv.unreadable_archives,
+            # WHICH archive failed, not just how many. On a 175-part export a
+            # bare count is not actionable -- the operator cannot go look.
+            "unreadable_detail": [
+                {"name": a.name, "error": a.error}
+                for a in inv.archives
+                if a.error is not None
+            ],
             "unreadable_loose_files": inv.unreadable_loose_files,
             "bytes": sum(a.size for a in inv.archives),
             # None means gap detection never ran. It is NOT the same as [].
@@ -339,6 +346,10 @@ def format_summary(report: Mapping[str, Any]) -> str:
     add(f"  archives      {arc['count']:,}  ({_gib(arc['bytes'])})")
     add(f"  unreadable    {arc['unreadable']:,} archives, "
         f"{arc['unreadable_loose_files']:,} loose files")
+    for bad in arc["unreadable_detail"][:10]:
+        add(f"      {bad['name']}: {bad['error']}")
+    if len(arc["unreadable_detail"]) > 10:
+        add(f"      ... and {len(arc['unreadable_detail']) - 10:,} more")
     others = arc["non_archive_files"]
     add(f"  loose parts   {arc['loose_parts']:,}  "
         f"({others:,} other non-archive file{'' if others == 1 else 's'} ignored)")

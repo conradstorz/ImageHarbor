@@ -417,3 +417,54 @@ def test_a_zlib_error_while_sniffing_is_swallowed(tmp_path, monkeypatch):
     inv = survey.survey_archives(tmp_path)
     assert inv.kind_counts["other"] == 1
     assert inv.misnamed_counts == {}
+
+
+def test_an_archive_that_fails_on_reopen_is_named_not_just_counted(tmp_path, monkeypatch):
+    """A pass-two reopen failure must annotate its ArchiveFact, not only bump a counter.
+
+    Pass one lists central directories; pass two reopens to sniff and read
+    sidecars. An archive that dies in between was previously counted in
+    `unreadable_archives` while its ArchiveFact stayed clean -- so the report
+    said "1 unreadable" and the archive list showed nothing wrong, on a set
+    where 175 archives makes "which one?" the only useful question.
+    """
+    import zipfile as _zipfile
+
+    target = _archive(tmp_path / "takeout-20260818T012414Z-2-001.zip", {
+        "Takeout/Google Photos/a.jpg": JPEG,
+    })
+
+    real = _zipfile.ZipFile
+    seen: dict[str, int] = {}
+
+    def flaky(file, *args, **kwargs):
+        key = str(file)
+        seen[key] = seen.get(key, 0) + 1
+        if key == str(target) and seen[key] > 1:
+            raise OSError("archive vanished between passes")
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(survey.zipfile, "ZipFile", flaky)
+
+    inv = survey.survey_archives(tmp_path)
+
+    assert inv.unreadable_archives == 1
+    facts = [a for a in inv.archives if a.name == target.name]
+    assert len(facts) == 1, "the archive must not be listed twice"
+    assert facts[0].error is not None, "the failing archive must be named, not just counted"
+    assert "vanished" in facts[0].error
+
+
+def test_the_report_names_which_archives_were_unreadable(tmp_path):
+    from imageharbor.takeout import report as _report
+
+    inv = _report.SurveyInventory()
+    inv.archives.append(_report.ArchiveFact(name="good.zip", size=10, members=3))
+    inv.archives.append(_report.ArchiveFact(name="bad.zip", size=10, members=0, error="boom"))
+    inv.unreadable_archives = 1
+
+    doc = _report.build_report(inv, distrust_threshold=25)
+    detail = doc["archives"]["unreadable_detail"]
+    assert [d["name"] for d in detail] == ["bad.zip"]
+    assert detail[0]["error"] == "boom"
+    assert "bad.zip" in _report.format_summary(doc)

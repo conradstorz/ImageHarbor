@@ -1,7 +1,8 @@
 # Takeout Survey
 
 **Date:** 2026-08-23
-**Status:** Design approved, implementation not started
+**Status:** Implemented and merged as `imageharbor takeout survey` (PR #16). The
+items under "Deferred" below remain unbuilt.
 
 ## Why this exists
 
