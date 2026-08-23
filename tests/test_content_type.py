@@ -131,3 +131,49 @@ def test_mpegts_coincidental_sync_byte_is_not_media():
     positive on arbitrary data)."""
     assert content_type.sniff(b"\x12\x34\x56\x78G\x00\xab\x00") is None
     assert content_type.sniff(b"not media at all") is None
+
+
+# --- still brands that must not be counted as video (I4) ------------------
+
+@pytest.mark.parametrize(
+    "brand",
+    [
+        b"crx ",   # Canon CR3 raw
+        b"heif",   # generic HEIF still
+        b"mif2",   # HEIF image-item brand (successor to mif1)
+        b"jpeg",   # JPEG-in-ISO-BMFF
+    ],
+)
+def test_isobmff_still_brands_are_images_not_video(brand):
+    """A still in an ISO-BMFF container must not land in the video column.
+
+    An operator sizes the video problem from these bytes; a CR3 raw or a
+    HEIF variant counted as video puts them in the wrong column.
+    """
+    assert content_type.sniff(b"\x00\x00\x00\x18ftyp" + brand + b"\x00\x00\x00\x00") == "image"
+
+
+def test_isobmff_still_brand_canonical_extension_is_still_an_image_extension():
+    assert content_type.canonical_extension(b"\x00\x00\x00\x18ftypcrx \x00\x00\x00\x00") == ".heic"
+
+
+def test_isobmff_unknown_brand_still_defaults_to_video():
+    """The two real MVIMG_* Motion Photos depend on this default."""
+    assert content_type.sniff(b"\x00\x00\x00\x18ftypzzzz\x00\x00\x00\x00") == "video"
+
+
+def test_match_compares_kind_by_value_not_by_identity(monkeypatch):
+    """_match must compare kinds by value, not by ``is`` on a module-level str.
+
+    A container probe that returns an equal-but-distinct ``"image"`` -- which
+    any probe written without reaching for the module global would -- must
+    still get an image extension. Under ``kind is IMAGE`` it silently gets
+    ``.mp4`` instead.
+    """
+    distinct = "".join(["im", "age"])
+    assert distinct is not content_type.IMAGE
+    monkeypatch.setattr(content_type, "_isobmff", lambda head: distinct)
+    assert content_type.canonical_extension(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00") == ".heic"
+    monkeypatch.setattr(content_type, "_isobmff", lambda head: None)
+    monkeypatch.setattr(content_type, "_riff", lambda head: distinct)
+    assert content_type.canonical_extension(b"RIFF\x24\x00\x00\x00WEBPVP8 ") == ".webp"

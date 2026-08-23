@@ -48,8 +48,16 @@ _SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
 
 # ISO base media file format: the brand at offset 8 is the only thing
 # separating a HEIC still from an MP4 video -- the container is identical.
+# Note the trailing space in "crx ": an ISO-BMFF brand is exactly four bytes
+# and Canon pads. Never strip it -- "crx" would match nothing.
 _ISOBMFF_IMAGE_BRANDS = frozenset(
-    {"heic", "heix", "heim", "heis", "hevc", "mif1", "msf1", "avif", "avis"}
+    {
+        "heic", "heix", "heim", "heis", "hevc", "mif1", "msf1", "avif", "avis",
+        # Stills that a real export carries and that would otherwise fall
+        # through to the video default below: Canon CR3 raw ("crx "), the
+        # generic HEIF brands, and JPEG wrapped in an ISO-BMFF container.
+        "crx ", "heif", "mif2", "jpeg",
+    }
 )
 _ISOBMFF_VIDEO_BRANDS = frozenset(
     {
@@ -75,8 +83,16 @@ def _isobmff(head: bytes) -> str | None:
     if brand in _ISOBMFF_VIDEO_BRANDS:
         return VIDEO
     # An unknown brand in a well-formed ISO-BMFF container is far more often a
-    # video than a still. Guessing "video" here only ever affects reporting,
-    # never placement.
+    # video than a still, and the extensionless MVIMG_* Motion Photos in the
+    # real export land here, so the default stays VIDEO.
+    #
+    # The tradeoff, stated plainly: this is the one place in the module that
+    # guesses rather than returning None. A still under an unlisted brand is
+    # counted in the video column, which is exactly the wrong column for an
+    # operator sizing the video problem. The mitigation is the table above --
+    # every still brand actually observed belongs in _ISOBMFF_IMAGE_BRANDS, and
+    # a newly-encountered still brand is a bug to be fixed by adding it there,
+    # not by flipping this default.
     return VIDEO
 
 
@@ -136,10 +152,10 @@ def _match(head: bytes) -> tuple[str, str] | None:
         return None
     kind = _isobmff(head)
     if kind is not None:
-        return (kind, ".heic" if kind is IMAGE else ".mp4")
+        return (kind, ".heic" if kind == IMAGE else ".mp4")
     kind = _riff(head)
     if kind is not None:
-        return (kind, ".webp" if kind is IMAGE else ".avi")
+        return (kind, ".webp" if kind == IMAGE else ".avi")
     for prefix, sig_kind, ext in _SIGNATURES:
         if head.startswith(prefix):
             return (sig_kind, ext)
