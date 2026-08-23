@@ -28,6 +28,17 @@ imageharbor = "imageharbor.cli:main"
 where = ["."]
 include = ["imageharbor*"]
 
+# setuptools installs ONLY .py files unless non-Python files are declared here.
+# `dashboard/server.py` loads its page with `Path(__file__).parent /
+# "index.html"`, so without this the module imports fine, `/api/stats` serves
+# fine, and `GET /` returns "dashboard page unavailable" -- in the container
+# only. Found in production on the first real deploy (2026-08-19): every test
+# passed because the suite runs from the source tree, where index.html is on
+# disk regardless of what the wheel contains. Any future non-.py runtime asset
+# must be added here AND to tests/test_packaging.py.
+[tool.setuptools.package-data]
+imageharbor = ["dashboard/*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
