@@ -965,3 +965,45 @@ def test_takeout_group_has_no_default_subcommand() -> None:
     result = CliRunner().invoke(main, ["takeout"])
     assert "ingest" in result.output
     assert "status" in result.output
+
+
+_SURVEY_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01" + b"\x00" * 64
+
+
+def test_takeout_survey_runs_standalone_and_prints_a_summary(tmp_path):
+    """No catalog, no dest, no network -- an archive directory is enough."""
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    with zipfile.ZipFile(archives / "takeout-20260818T012414Z-2-001.zip", "w") as zf:
+        zf.writestr("Takeout/Google Photos/Photos from 2019/a.jpg", _SURVEY_JPEG)
+        zf.writestr("Takeout/Google Photos/Photos from 2019/x.screen", _SURVEY_JPEG)
+
+    out_json = tmp_path / "survey.json"
+    result = CliRunner().invoke(
+        main, ["takeout", "survey", "--archives", str(archives), "--json", str(out_json)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "INVENTORY" in result.output
+    doc = json.loads(out_json.read_text(encoding="utf-8"))
+    assert doc["inventory"]["by_kind"]["image"] == 1
+    assert doc["anomalies"]["misnamed_media"]["total"] == 1
+
+
+def test_takeout_survey_requires_an_existing_archives_dir(tmp_path):
+    result = CliRunner().invoke(
+        main, ["takeout", "survey", "--archives", str(tmp_path / "nope")]
+    )
+    assert result.exit_code != 0
+
+
+def test_takeout_survey_writes_nothing_when_json_is_omitted(tmp_path):
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    with zipfile.ZipFile(archives / "takeout-20260818T012414Z-2-001.zip", "w") as zf:
+        zf.writestr("Takeout/Google Photos/a.jpg", _SURVEY_JPEG)
+
+    before = sorted(p.name for p in archives.iterdir())
+    result = CliRunner().invoke(main, ["takeout", "survey", "--archives", str(archives)])
+    assert result.exit_code == 0, result.output
+    assert sorted(p.name for p in archives.iterdir()) == before
