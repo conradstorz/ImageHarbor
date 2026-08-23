@@ -23,6 +23,11 @@ from typing import Any, Mapping
 
 _PART_NUMBER_RE = re.compile(r"^\d+$")
 
+# Mirrors archive.KIND_IMAGE / KIND_VIDEO by value. Named here rather than
+# imported so this module stays free of any dependency on the rest of the
+# package -- it is pure and I/O-free by design.
+_MEDIA_KINDS = frozenset({"image", "video"})
+
 
 @dataclass(frozen=True)
 class ArchiveFact:
@@ -46,6 +51,8 @@ class LoosePart:
     name: str
     size: int
     part: str | None
+    # The sniffed content kind: "image", "video", or None for "not media".
+    # ONLY a media kind may cover a sequence gap -- see _missing_parts.
     kind: str | None
 
 
@@ -67,6 +74,12 @@ class SurveyInventory:
     # keyed by the *declared* extension.
     misnamed_counts: Counter = field(default_factory=Counter)
     misnamed_bytes: Counter = field(default_factory=Counter)
+    # The same members keyed by their SNIFFED kind ("image"/"video") instead.
+    # The projection needs this split: recovered stills and recovered video do
+    # not enter the same pipeline, so summing them into one number is what made
+    # the old `organized_estimate` describe a pipeline that does not exist.
+    misnamed_kind_counts: Counter = field(default_factory=Counter)
+    misnamed_kind_bytes: Counter = field(default_factory=Counter)
 
     # Exact photoTakenTime values, ISO 8601 to the second.
     timestamp_counts: Counter = field(default_factory=Counter)
@@ -88,6 +101,13 @@ class SurveyInventory:
     basename_collision_members: int = 0
 
     unreadable_archives: int = 0
+    # Loose files beside the archives that could not be opened or stat'd -- a
+    # mid-download file under a Windows byte-range lock is the expected cause.
+    # Counted so the number is visible rather than silently absent.
+    unreadable_loose_files: int = 0
+    # Non-zip files in the directory that did NOT sniff as media (checksums.txt,
+    # a survey.json written by a previous run). Visible, but never a "part".
+    non_archive_files: int = 0
 
 
 def find_distrusted_timestamps(
@@ -107,8 +127,20 @@ def find_distrusted_timestamps(
     return frozenset(ts for ts, n in counts.items() if n >= threshold)
 
 
-def _missing_parts(part_numbers: set[str], loose: list[LoosePart]) -> list[str]:
+def _missing_parts(part_numbers: set[str], loose: list[LoosePart]) -> list[str] | None:
     """Part numbers absent from the zip sequence and not covered by a loose file.
+
+    Returns ``None`` -- never ``[]`` -- when no part number could be parsed
+    from any archive at all. ``[]`` means "gap detection ran and found no
+    gap"; ``None`` means "gap detection never ran", and the two must not read
+    the same. An unrecognized or renamed naming scheme reported as "missing
+    parts none" is the refuse-to-guess rule inverted: it tells an operator
+    their set is complete on the strength of having learned nothing about it.
+
+    Only a loose part whose ``kind`` is media may cover a gap. Google delivers
+    an oversized *media* file as its own raw part; ``transfer-log-002.txt`` is
+    not a part, and letting it into the covered set erases a genuinely absent
+    part 002.
 
     Gap detection is done on parsed *integers*, never on zero-padded strings.
     ``part_numbers`` is an unordered ``set[str]``, so picking a padding width
@@ -124,18 +156,18 @@ def _missing_parts(part_numbers: set[str], loose: list[LoosePart]) -> list[str]:
     for membership comparisons.
     """
     if not part_numbers:
-        return []
+        return None
 
     def _to_int(s: str) -> int | None:
         return int(s) if _PART_NUMBER_RE.match(s) else None
 
     numeric = sorted(n for n in (_to_int(p) for p in part_numbers) if n is not None)
     if not numeric:
-        return []
+        return None
 
     covered_ints = set(numeric)
     for lp in loose:
-        if lp.part is not None:
+        if lp.part is not None and lp.kind in _MEDIA_KINDS:
             n = _to_int(lp.part)
             if n is not None:
                 covered_ints.add(n)
@@ -151,21 +183,40 @@ def _missing_parts(part_numbers: set[str], loose: list[LoosePart]) -> list[str]:
 def build_report(inv: SurveyInventory, *, distrust_threshold: int) -> dict[str, Any]:
     """Build the report document from a collected inventory."""
     total_members = sum(inv.kind_counts.values())
-    media = inv.kind_counts.get("image", 0) + inv.kind_counts.get("video", 0)
     recovered = sum(inv.misnamed_counts.values())
     described = inv.descriptor_human + inv.descriptor_machine
+
+    images = inv.kind_counts.get("image", 0)
+    videos = inv.kind_counts.get("video", 0)
+    image_bytes = inv.kind_bytes.get("image", 0)
+    video_bytes = inv.kind_bytes.get("video", 0)
+    sniffed_media = sum(inv.misnamed_kind_counts.values())
+    sniffed_media_bytes = sum(inv.misnamed_kind_bytes.values())
 
     distrusted = find_distrusted_timestamps(inv.timestamp_counts, distrust_threshold)
     distrusted_members = sum(inv.timestamp_counts[ts] for ts in distrusted)
 
+    missing = _missing_parts(inv.part_numbers, inv.loose_parts)
+
+    if not inv.archives:
+        status = "empty"
+    elif inv.unreadable_archives or inv.unreadable_loose_files:
+        status = "degraded"
+    else:
+        status = "ok"
+
     return {
         "archives": {
-            "status": "empty" if not inv.archives else "ok",
+            "status": status,
             "count": len(inv.archives),
             "unreadable": inv.unreadable_archives,
+            "unreadable_loose_files": inv.unreadable_loose_files,
             "bytes": sum(a.size for a in inv.archives),
-            "missing_parts": _missing_parts(inv.part_numbers, inv.loose_parts),
+            # None means gap detection never ran. It is NOT the same as [].
+            "missing_parts": missing,
+            "part_numbering": "unrecognized" if missing is None else "recognized",
             "loose_parts": len(inv.loose_parts),
+            "non_archive_files": inv.non_archive_files,
             "loose_part_detail": [
                 {"name": lp.name, "size": lp.size, "part": lp.part, "kind": lp.kind}
                 for lp in inv.loose_parts
@@ -194,9 +245,17 @@ def build_report(inv: SurveyInventory, *, distrust_threshold: int) -> dict[str, 
                 "human_tier30": inv.descriptor_human,
                 "machine_tier0": inv.descriptor_machine,
                 "human_share": round(inv.descriptor_human / described, 4) if described else 0.0,
+                "excluded_unrecognized_extension": recovered,
                 "note": (
                     "A tier-30 descriptor is permanent: tiers.is_upgrade forbids "
-                    "an AI subject from displacing it. Reported, not judged."
+                    "an AI subject from displacing it. Reported, not judged. "
+                    "excluded_unrecognized_extension media are NOT in this tally: "
+                    "their extension was unrecognized, so they were never "
+                    "classified as media to tier. They carry 19-digit machine "
+                    "names that descriptor.is_camera_generated does not match "
+                    "(its bare-digits pattern is 9-13 digits), so they are the "
+                    "files most likely to be wrongly pinned at tier 30 once "
+                    "content sniffing lands. Counted here rather than guessed at."
                 ),
             },
             "distrusted_date_clusters": {
@@ -221,17 +280,43 @@ def build_report(inv: SurveyInventory, *, distrust_threshold: int) -> dict[str, 
             },
         },
         "projection": {
-            "organized_estimate": media + recovered,
-            "destination_bytes": sum(inv.kind_bytes.values()),
+            # What TODAY's ingest actually organizes: recognized images only.
+            "organized_today": images,
+            "bytes_today": image_bytes,
+            # What it would organize once video ingestion and content sniffing
+            # land: recognized images + recognized video + sniffed media.
+            "organized_after_deferred_fixes": images + videos + sniffed_media,
+            "bytes_after_deferred_fixes": image_bytes + video_bytes + sniffed_media_bytes,
+            # Every member's bytes, media or not (.json, .txt, .html included).
+            # Named unambiguously: this is NOT a destination-space figure.
+            "archive_total_bytes": sum(inv.kind_bytes.values()),
+            "note": (
+                "organized_today counts recognized images only, because that "
+                "is all the current ingest copies: video is enumerated and "
+                "recorded as deferred with no bytes copied, and misnamed media "
+                "(extension says document, content says image) is filed to "
+                ".takeout-provenance/ rather than organized. "
+                "organized_after_deferred_fixes adds both, and is what to size "
+                "for once video ingestion and content sniffing land. "
+                "archive_total_bytes is every member's bytes including JSON, "
+                "text and HTML -- it is not a destination-space budget."
+            ),
             "by_year": dict(sorted(inv.year_counts.items())),
             "duplicates": {
                 "exact": None,
-                "name_collision_upper_bound": inv.basename_collision_members,
+                # The tight bound: N copies of one name are N-1 duplicates, not
+                # N. Summing whole colliding groups overstates it by the number
+                # of distinct names involved.
+                "name_collision_upper_bound": (
+                    inv.basename_collision_members - inv.basename_collisions
+                ),
+                "colliding_members": inv.basename_collision_members,
                 "distinct_colliding_names": inv.basename_collisions,
                 "note": (
-                    "An upper bound from filename collisions only. The exact "
-                    "duplicate count requires hashing every byte and is "
-                    "deliberately not guessed."
+                    "An upper bound from filename collisions only: for each "
+                    "colliding name, every copy but one. The exact duplicate "
+                    "count requires hashing every byte and is deliberately "
+                    "not guessed."
                 ),
             },
         },
@@ -250,10 +335,19 @@ def format_summary(report: Mapping[str, Any]) -> str:
     add = lines.append
 
     add("ARCHIVE SET")
+    add(f"  status        {arc['status']}")
     add(f"  archives      {arc['count']:,}  ({_gib(arc['bytes'])})")
-    add(f"  unreadable    {arc['unreadable']:,}")
-    add(f"  loose parts   {arc['loose_parts']:,}")
-    add(f"  missing parts {', '.join(arc['missing_parts']) or 'none'}")
+    add(f"  unreadable    {arc['unreadable']:,} archives, "
+        f"{arc['unreadable_loose_files']:,} loose files")
+    others = arc["non_archive_files"]
+    add(f"  loose parts   {arc['loose_parts']:,}  "
+        f"({others:,} other non-archive file{'' if others == 1 else 's'} ignored)")
+    # None is not []: gap detection never ran, so "none" would be a claim the
+    # survey cannot support.
+    if arc["missing_parts"] is None:
+        add("  missing parts not determined (part numbering unrecognized)")
+    else:
+        add(f"  missing parts {', '.join(arc['missing_parts']) or 'none'}")
 
     add("")
     add(f"INVENTORY  {inv['members']:,} members, {_gib(inv['bytes'])}")
@@ -280,14 +374,30 @@ def format_summary(report: Mapping[str, Any]) -> str:
         add(f"      {ts}")
     add(f"  media without sidecar   {an['media_without_sidecar']:,}")
     add(f"  orphan sidecars         {an['orphan_sidecars']:,}")
+    add(
+        f"  media not tiered        {desc['excluded_unrecognized_extension']:,} "
+        f"(unrecognized extension; excluded from the descriptor tally above)"
+    )
 
     add("")
     add("PROJECTION")
-    add(f"  organized estimate      {proj['organized_estimate']:,}")
-    add(f"  destination bytes       {_gib(proj['destination_bytes'])}")
+    add(
+        f"  organized today         {proj['organized_today']:,} files, "
+        f"{_gib(proj['bytes_today'])}   (images only; video deferred, "
+        f"misnamed media -> provenance)"
+    )
+    add(
+        f"  after deferred fixes    {proj['organized_after_deferred_fixes']:,} files, "
+        f"{_gib(proj['bytes_after_deferred_fixes'])}   (+ video, + sniffed media)"
+    )
+    add(
+        f"  archive total           {_gib(proj['archive_total_bytes'])}   "
+        f"(all members incl. JSON/text/HTML; not a destination budget)"
+    )
     dupes = proj["duplicates"]
     add(
         f"  duplicates              upper bound {dupes['name_collision_upper_bound']:,} "
+        f"across {dupes['distinct_colliding_names']:,} colliding names "
         f"(exact count not computed)"
     )
     if proj["by_year"]:
