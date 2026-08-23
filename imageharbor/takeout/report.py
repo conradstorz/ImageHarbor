@@ -16,9 +16,12 @@ exactly the failure ``dashboard/projections.py`` exists to avoid.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping
+
+_PART_NUMBER_RE = re.compile(r"^\d+$")
 
 
 @dataclass(frozen=True)
@@ -105,16 +108,43 @@ def find_distrusted_timestamps(
 
 
 def _missing_parts(part_numbers: set[str], loose: list[LoosePart]) -> list[str]:
-    """Part numbers absent from the zip sequence and not covered by a loose file."""
+    """Part numbers absent from the zip sequence and not covered by a loose file.
+
+    Gap detection is done on parsed *integers*, never on zero-padded strings.
+    ``part_numbers`` is an unordered ``set[str]``, so picking a padding width
+    from an arbitrary element (e.g. ``next(iter(part_numbers))``) is
+    non-deterministic across process runs -- Python's hash randomization
+    changes set iteration order for the same input data -- and whichever
+    width happened to win could silently mismatch the width the raw,
+    unpadded strings in ``covered`` actually used, producing a wrong
+    missing-parts list (false positives or false negatives) instead of an
+    error. Do not "simplify" this back to string padding: format only the
+    *output* strings, using a width derived deterministically (the max width
+    seen among valid part-number strings), and never use that padded form
+    for membership comparisons.
+    """
     if not part_numbers:
         return []
-    covered = part_numbers | {lp.part for lp in loose if lp.part}
-    numeric = sorted(int(p) for p in part_numbers)
-    width = len(next(iter(part_numbers)))
+
+    def _to_int(s: str) -> int | None:
+        return int(s) if _PART_NUMBER_RE.match(s) else None
+
+    numeric = sorted(n for n in (_to_int(p) for p in part_numbers) if n is not None)
+    if not numeric:
+        return []
+
+    covered_ints = set(numeric)
+    for lp in loose:
+        if lp.part is not None:
+            n = _to_int(lp.part)
+            if n is not None:
+                covered_ints.add(n)
+
+    width = max(len(p) for p in part_numbers if _PART_NUMBER_RE.match(p))
     return [
         str(n).zfill(width)
         for n in range(numeric[0], numeric[-1] + 1)
-        if str(n).zfill(width) not in covered
+        if n not in covered_ints
     ]
 
 

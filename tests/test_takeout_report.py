@@ -88,6 +88,37 @@ def test_a_genuinely_missing_part_is_reported():
     assert doc["archives"]["missing_parts"] == ["003"]
 
 
+def test_mixed_width_part_numbers_produce_a_deterministic_correct_gap():
+    """Width must not come from an arbitrary set element.
+
+    {"1", "2", "004"} mixes an unpadded "1"/"2" with a zero-padded "004".
+    Whatever order the set iterates in, the gap (3) must be reported using
+    the max width actually observed (3, from "004") -- and the result must
+    not vary run to run.
+    """
+    inv = report._missing_parts
+    for _ in range(20):
+        result = inv({"1", "2", "004"}, [])
+        assert result == ["003"]
+
+
+def test_mixed_width_part_numbers_via_build_report():
+    inv = _inv(part_numbers={"1", "2", "004"}, loose_parts=[])
+    doc = report.build_report(inv, distrust_threshold=25)
+    assert doc["archives"]["missing_parts"] == ["003"]
+
+
+def test_a_non_numeric_part_entry_does_not_crash():
+    inv = _inv(part_numbers={"001", "002", "004", "unknown"}, loose_parts=[])
+    doc = report.build_report(inv, distrust_threshold=25)
+    assert doc["archives"]["missing_parts"] == ["003"]
+
+
+def test_format_summary_does_not_raise_on_a_completely_empty_report():
+    text = report.format_summary(report.build_report(report.SurveyInventory(), distrust_threshold=25))
+    assert isinstance(text, str)
+
+
 # --- misnamed media -------------------------------------------------------
 
 def test_misnamed_media_is_surfaced_by_declared_extension():
