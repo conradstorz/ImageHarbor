@@ -83,3 +83,51 @@ def test_observed_takeout_bytes():
     assert content_type.sniff(b"\x00\x00\x00\x1cftypmp42\x00\x00\x00\x00mp42") == "video"
     # .vob / .mod are MPEG program streams
     assert content_type.sniff(b"\x00\x00\x01\xba\x21\x00\x01\x00") == "video"
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        # 00001.MTS -- 454,950,912 bytes, real archive set
+        b"\x00\xe0\xe8<G@\x00\x10",
+        # 00002.MTS -- 239,763,456 bytes, real archive set
+        b"\x00\xdb\xc90G@\x00\x10",
+        # 00000.MTS -- 834,994,176 bytes, real archive set
+        b"\x00\x00\x00\x00G@\x00\x10",
+    ],
+)
+def test_m2ts_real_archive_heads_are_video(head):
+    """AVCHD/M2TS: 4-byte timecode prefix, then the 0x47 TS sync byte at
+    offset 4, then a valid TS packet header (textbook PAT: error=0,
+    payload_unit_start=1, PID=0x0000, adaptation_field_control=01)."""
+    assert content_type.sniff(head) == "video"
+
+
+def test_plain_ts_sync_at_offset_zero_is_video():
+    """A bare .ts stream has no M2TS timecode prefix -- sync byte is at 0."""
+    assert content_type.sniff(b"\x47\x40\x00\x10\x00\x00\x00\x00") == "video"
+
+
+def test_m2ts_canonical_extension_is_mts():
+    assert content_type.canonical_extension(b"\x00\x00\x00\x00G@\x00\x10") == ".mts"
+
+
+def test_mpegts_transport_error_indicator_set_is_not_media():
+    """transport_error_indicator (bit 7 of byte 1) == 1 must not be treated
+    as a valid TS packet, even though the sync byte lines up at offset 4."""
+    assert content_type.sniff(b"\x00\x00\x00\x00G\xc0\x00\x10") is None
+
+
+def test_mpegts_adaptation_field_control_zero_is_not_media():
+    """adaptation_field_control == 0b00 is a reserved/invalid value."""
+    assert content_type.sniff(b"\x00\x00\x00\x00G@\x00\x00") is None
+
+
+def test_mpegts_coincidental_sync_byte_is_not_media():
+    """A 0x47 byte landing at offset 4 by chance, in data that is not an
+    actual TS packet, must not be classified as video -- proves the
+    predicate validates the header rather than matching the sync byte
+    alone (a bare ``head[4] == 0x47`` test would be a 1-in-256 false
+    positive on arbitrary data)."""
+    assert content_type.sniff(b"\x12\x34\x56\x78G\x00\xab\x00") is None
+    assert content_type.sniff(b"not media at all") is None

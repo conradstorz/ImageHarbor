@@ -92,6 +92,44 @@ def _riff(head: bytes) -> str | None:
     return None
 
 
+def _valid_ts_packet_header(head: bytes, offset: int) -> bool:
+    """Is there a well-formed MPEG-TS packet header at *offset*?
+
+    A TS packet header is 4 bytes: the sync byte ``0x47``, then byte 1
+    (transport_error_indicator / payload_unit_start_indicator /
+    transport_priority / PID high bits), byte 2 (PID low bits), byte 3
+    (transport_scrambling_control / adaptation_field_control /
+    continuity_counter). Matching the sync byte alone is a 1-in-256 false
+    positive on arbitrary data, so this also requires
+    transport_error_indicator == 0 and adaptation_field_control != 0 (0 is
+    a reserved/invalid value) before calling it a real header.
+    """
+    if len(head) < offset + 4:
+        return False
+    if head[offset] != 0x47:
+        return False
+    transport_error_indicator = head[offset + 1] & 0x80
+    if transport_error_indicator:
+        return False
+    adaptation_field_control = (head[offset + 3] >> 4) & 0x03
+    if adaptation_field_control == 0:
+        return False
+    return True
+
+
+def _mpegts(head: bytes) -> bool:
+    """Is *head* an MPEG transport stream (plain .ts or AVCHD/M2TS)?
+
+    AVCHD/M2TS files (Sony/Panasonic camcorders, and what a real Google
+    Takeout export carries as ``.MTS``) prefix every TS packet with a 4-byte
+    copyright/timecode field, so the ``0x47`` sync byte lands at offset 4,
+    not offset 0. Do NOT simplify this to checking offset 0 only -- that
+    silently stops recognizing every M2TS file again. A plain ``.ts``
+    elementary stream has no such prefix, so offset 0 is checked too.
+    """
+    return _valid_ts_packet_header(head, 4) or _valid_ts_packet_header(head, 0)
+
+
 def _match(head: bytes) -> tuple[str, str] | None:
     """Return (kind, canonical extension) for *head*, or None."""
     if not head:
@@ -105,6 +143,11 @@ def _match(head: bytes) -> tuple[str, str] | None:
     for prefix, sig_kind, ext in _SIGNATURES:
         if head.startswith(prefix):
             return (sig_kind, ext)
+    # Checked last, after every literal-prefix signature above: GIF87a/
+    # GIF89a also start with the byte 0x47 (ASCII 'G'), so an offset-0 TS
+    # sync-byte match must never be allowed to shadow the GIF entries.
+    if _mpegts(head):
+        return (VIDEO, ".mts")
     return None
 
 
