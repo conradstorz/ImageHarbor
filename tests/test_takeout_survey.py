@@ -5,8 +5,6 @@ import json
 import zipfile
 from datetime import datetime, timezone
 
-import pytest
-
 from imageharbor.takeout import survey
 
 JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" + b"\x00" * 64
@@ -73,20 +71,15 @@ def test_loose_part_filling_a_sequence_gap_is_identified(tmp_path):
 
 
 def test_timestamps_are_collected_for_clustering(tmp_path):
-    # Deliberately post-1970: datetime.fromtimestamp raises OSError for a
-    # negative epoch on Windows, which metadata._timestamp already catches
-    # and turns into None (existing, tested behavior, out of scope here) --
-    # a pre-epoch fixture date would fail on this platform for a reason
-    # unrelated to what this test is checking.
     _archive(tmp_path / "takeout-20260818T012414Z-2-001.zip", {
         "Takeout/Google Photos/a.jpg": JPEG,
-        "Takeout/Google Photos/a.jpg.supplemental-metadata.json": _sidecar("a.jpg", "1988-01-12T10:35:03Z"),
+        "Takeout/Google Photos/a.jpg.supplemental-metadata.json": _sidecar("a.jpg", "1968-01-12T10:35:03Z"),
         "Takeout/Google Photos/b.jpg": JPEG,
-        "Takeout/Google Photos/b.jpg.supplemental-metadata.json": _sidecar("b.jpg", "1988-01-12T10:35:03Z"),
+        "Takeout/Google Photos/b.jpg.supplemental-metadata.json": _sidecar("b.jpg", "1968-01-12T10:35:03Z"),
     })
     inv = survey.survey_archives(tmp_path)
-    assert inv.timestamp_counts["1988-01-12T10:35:03"] == 2
-    assert inv.year_counts["1988"] == 2
+    assert inv.timestamp_counts["1968-01-12T10:35:03"] == 2
+    assert inv.year_counts["1968"] == 2
 
 
 def test_descriptor_tiers_are_counted(tmp_path):

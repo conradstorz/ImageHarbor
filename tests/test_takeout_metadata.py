@@ -102,6 +102,35 @@ def test_implausible_timestamp_is_dropped() -> None:
     assert parse_photo_metadata(raw).photo_taken_at is None
 
 
+def test_pre_1970_timestamp_parses_on_every_platform() -> None:
+    """Pins a real production value: a 210-file cluster in the actual archive
+    set sits at exactly this epoch second, 1968-01-12T10:35:03Z.
+
+    `datetime.fromtimestamp(seconds, tz=timezone.utc)` raises `OSError` for
+    negative epoch values on Windows (but not Linux) -- a platform-dependent
+    bug that silently dropped every pre-1970 `photoTakenTime` on Windows.
+    This must parse identically on every host OS.
+    """
+    raw = json.dumps({"photoTakenTime": {"timestampSeconds": "-62169897"}}).encode()
+    meta = parse_photo_metadata(raw)
+    assert meta.photo_taken_at == datetime(1968, 1, 12, 10, 35, 3)
+
+
+def test_implausible_timestamp_before_min_year_is_dropped() -> None:
+    """Plausibility clamp: a year before 1826 (photography's origin) is dropped,
+    even though the epoch/timedelta arithmetic itself would succeed."""
+    # 1825-06-01 00:00:00 UTC
+    raw = json.dumps({"photoTakenTime": {"timestampSeconds": "-4562697600"}}).encode()
+    assert parse_photo_metadata(raw).photo_taken_at is None
+
+
+def test_implausible_timestamp_after_max_year_is_dropped() -> None:
+    """Plausibility clamp: a year after 2100 is dropped."""
+    # 2101-06-01 00:00:00 UTC
+    raw = json.dumps({"photoTakenTime": {"timestampSeconds": "4147027200"}}).encode()
+    assert parse_photo_metadata(raw).photo_taken_at is None
+
+
 def test_null_island_geodata_is_treated_as_absent() -> None:
     """Google writes 0.0/0.0 for 'no location', which is not a location."""
     raw = json.dumps({"geoData": {"latitude": 0.0, "longitude": 0.0}}).encode()
