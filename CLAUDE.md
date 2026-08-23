@@ -44,6 +44,7 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 | Describe/classify the organized copies | `uv run imageharbor enrich --dest DEST --ai openai` |
 | Ingest Google Takeout archives | `uv run imageharbor takeout ingest --archives DIR --dest DEST` |
 | Report Takeout ingestion progress | `uv run imageharbor takeout status --catalog DEST/catalog.db` |
+| Survey an archive set before ingesting (read-only, standalone) | `uv run imageharbor takeout survey --archives DIR --json report.json` |
 | Re-verify integrity | `uv run imageharbor verify DEST` |
 | Watch a library continuously (both passes) | `uv run imageharbor watch --source SRC --dest DEST` |
 | Build the Docker image | `docker build -t imageharbor:latest .` |
@@ -123,18 +124,14 @@ Module responsibilities:
   (an image/video with no `sidecar_path` on record), returning that member to
   `pending` so it re-ingests as a duplicate through
   `_maybe_upgrade_from_duplicate` and upgrades in place, handling the
-  photos-first-then-sidecars-later ordering with no new placement code. Five
-  modules: `metadata.py` (pure Google-JSON parser, never raises), `pairing.py`
-  (pure media→sidecar matcher that returns `None` rather than guess),
-  `archive.py` (identity, enumeration, classification, extraction), `ingest.py`
-  (orchestration — the primary module with side effects), and `provenance.py`
-  (preserves non-media members verbatim, below). Archives are opened `'r'` only
-  and are never modified. Makes **no AI calls**, so — exactly like the facts
-  pass — it never consults or feeds the circuit breaker. Videos are enumerated
-  and recorded as `deferred` with their capture date but no bytes are copied;
-  video ingestion is a deliberate later project. The global (not per-archive)
-  pairing index is load-bearing: Google's multi-part zips split by size across
-  the file list, so a photo and its `.json` routinely land in different parts.
+  photos-first-then-sidecars-later ordering with no new placement code. Archives
+  are opened `'r'` only and are never modified. Makes **no AI calls**, so —
+  exactly like the facts pass — it never consults or feeds the circuit breaker.
+  Videos are enumerated and recorded as `deferred` with their capture date but no
+  bytes are copied; video ingestion is a deliberate later project. The global
+  (not per-archive) pairing index is load-bearing: Google's multi-part zips split
+  by size across the file list, so a photo and its `.json` routinely land in
+  different parts.
   `ingest.py`'s `_index_albums` (reads `Albums.json` into an
   `(archive_id, folder) -> AlbumMetadata` map, activating
   `metadata.parse_album_metadata`) and `_preserve_provenance` (calls
@@ -143,7 +140,21 @@ Module responsibilities:
   late-sidecar-discovery case described above, and orphan detection needs the
   whole-batch pairing index, which isn't finished building until `_survey`
   returns; `_ingest_archive` is the point where a zip handle for that specific
-  archive is already open for the work it's about to do anyway.
+  archive is already open for the work it's about to do anyway. Seven
+  modules: `metadata.py` (pure Google-JSON parser, never raises; timestamp
+  parsing uses epoch + timedelta arithmetic instead of `datetime.fromtimestamp`
+  to remain platform-independent for pre-1970 dates — the latter raises `OSError`
+  on Windows while succeeding on Linux, which meant the same archive produced
+  different capture dates depending on host OS), `pairing.py`
+  (pure media→sidecar matcher that returns `None` rather than guess),
+  `archive.py` (identity, enumeration, classification, extraction), `ingest.py`
+  (orchestration — the primary module with side effects), `provenance.py`
+  (preserves non-media members verbatim, described below), `survey.py` (read-only
+  measurement of an archive set -- two passes: central directories to build the
+  whole-batch pairing index, then a reopen to sniff members whose extension is
+  unrecognized and read per-media sidecars), and `report.py` (pure: turns a
+  collected inventory into the report document, split from `survey.py` for the
+  same reason `projections.py` is split from `stats.py`).
 - **`takeout/provenance.py`** — preserves every archive member that is **not**
   an image or video, verbatim, under
   `<organized_dir>/.takeout-provenance/<archive_id>/` (keyed by the SHA-256 of
@@ -390,6 +401,14 @@ Module responsibilities:
   enumerate videos and record them as `deferred` with a capture date, so that
   later project starts from a complete work queue rather than from zero, but no
   video bytes are ever copied by any current code path.
+- **`content_type.py`** — pure, I/O-free identification of media by magic
+  bytes: `sniff(head) -> "image" | "video" | None` and
+  `canonical_extension(head)`. **The extension stays the first rung**; only a
+  file whose extension is unrecognized is read and sniffed, so no existing
+  classification changes. It exists because a real Google Takeout export
+  delivers thousands of genuine photographs under extensions like `.screen`,
+  `.tile`, and `.tmp`. Currently called only by `takeout/survey.py` — the
+  pipeline does not consult it yet.
 - **`exif_reader.py`** — best-effort EXIF/GPS extraction via Pillow; returns `{}`
   rather than raising on any failure.
 - **`sidecar_schema.py`** — the sidecar merge policy, pure and I/O-free (no

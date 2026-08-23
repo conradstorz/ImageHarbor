@@ -87,6 +87,7 @@ image's JSON sidecar, not in the path or filename.
 | `imageharbor enrich --dest DEST --ai openai` | Describe/classify already-organized images. |
 | `imageharbor takeout ingest --archives DIR --dest DEST` | Ingest Google Takeout archives. |
 | `imageharbor takeout status --catalog DEST/catalog.db` | Report Takeout ingestion progress. |
+| `imageharbor takeout survey --archives DIR` | Measure an archive set and report what ingestion would do with it. Read-only and standalone: no catalog, no destination, no AI backend, no network. |
 | `imageharbor watch --source SRC --dest DEST` | Continuously run both passes on an interval. |
 | `imageharbor verify DEST` | Re-verify every organized file's digest against its filename. |
 | `imageharbor sidecar backfill --dest DEST` | Rebuild/merge sidecars for a library organized before sidecars were the default. Cannot recover Google Takeout metadata for already-organized files — that requires re-ingesting the original archives. |
