@@ -550,16 +550,32 @@ def find_distrusted_timestamps(
 
 
 def _missing_parts(part_numbers: set[str], loose: list[LoosePart]) -> list[str]:
-    """Part numbers absent from the zip sequence and not covered by a loose file."""
+    """Part numbers absent from the zip sequence and not covered by a loose file.
+
+    The comparison is done on **integers**, deliberately. Padding both sides to
+    a width taken from an arbitrary set element is not merely untidy: with
+    mixed-width part numbers the chosen width varies between process runs
+    (string hash randomization reorders set iteration), and a padded candidate
+    compared against unpadded originals silently reports parts as missing that
+    are present. A confident wrong "your archive set is incomplete" is exactly
+    the failure this module's refuse-to-guess rule exists to prevent. Do not
+    simplify this back to string padding.
+    """
     if not part_numbers:
         return []
-    covered = part_numbers | {lp.part for lp in loose if lp.part}
-    numeric = sorted(int(p) for p in part_numbers)
-    width = len(next(iter(part_numbers)))
+
+    def _as_int(value: str | None) -> int | None:
+        return int(value) if value and value.isdigit() else None
+
+    known = {n for n in (_as_int(p) for p in part_numbers) if n is not None}
+    if not known:
+        return []
+    covered = known | {n for n in (_as_int(lp.part) for lp in loose) if n is not None}
+    width = max(len(p) for p in part_numbers if p.isdigit())
     return [
         str(n).zfill(width)
-        for n in range(numeric[0], numeric[-1] + 1)
-        if str(n).zfill(width) not in covered
+        for n in range(min(known), max(known) + 1)
+        if n not in covered
     ]
 
 
