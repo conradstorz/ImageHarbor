@@ -663,6 +663,54 @@ def takeout_cmd() -> None:
     """
 
 
+@takeout_cmd.command(name="survey")
+@click.option(
+    "--archives",
+    "archives_dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Directory holding Google Takeout archives (read-only).",
+)
+@click.option(
+    "--json",
+    "json_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Write the machine-readable report document here.",
+)
+@click.option(
+    "--distrust-threshold",
+    default=25,
+    show_default=True,
+    type=click.IntRange(min=0),
+    help=(
+        "How many files must share one photoTakenTime, to the second, before "
+        "that timestamp is reported as a stopped clock. 0 disables the check."
+    ),
+)
+def takeout_survey(archives_dir: Path, json_path: Path | None, distrust_threshold: int) -> None:
+    """Measure an archive set and report what ingestion would do with it.
+
+    Read-only and standalone: no catalog, no destination, no AI backend, no
+    network. Nothing is written except the optional --json document, so this is
+    safe to run against archives another process is still downloading.
+    """
+    import json as _json
+
+    from .takeout import report as takeout_report
+    from .takeout import survey as takeout_survey_mod
+
+    inventory = takeout_survey_mod.survey_archives(archives_dir)
+    document = takeout_report.build_report(inventory, distrust_threshold=distrust_threshold)
+
+    click.echo(takeout_report.format_summary(document))
+
+    if json_path is not None:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(_json.dumps(document, indent=2), encoding="utf-8")
+        click.echo(f"\nReport written to {json_path}")
+
+
 @takeout_cmd.command(name="ingest")
 @click.option(
     "--archives",

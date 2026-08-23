@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -139,8 +139,19 @@ def _timestamp(block: Any) -> datetime | None:
         except (TypeError, ValueError):
             continue
         try:
-            dt = datetime.fromtimestamp(seconds, tz=timezone.utc).replace(tzinfo=None)
+            # NOT datetime.fromtimestamp(seconds, tz=timezone.utc): that call
+            # is platform-dependent for negative (pre-1970) values -- it
+            # raises OSError on Windows and succeeds on Linux, which meant
+            # the same archive yielded different capture dates depending on
+            # the host OS. Epoch + timedelta arithmetic is platform-neutral.
+            dt = (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=seconds)).replace(
+                tzinfo=None
+            )
         except (OverflowError, OSError, ValueError):
+            # OSError is no longer reachable from the arithmetic above but is
+            # kept here at zero cost, since this function's contract is to
+            # never raise. OverflowError/ValueError remain reachable for a
+            # huge int overflowing timedelta.
             continue
         if _MIN_YEAR <= dt.year <= _MAX_YEAR:
             return dt
