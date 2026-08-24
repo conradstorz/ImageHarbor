@@ -16,7 +16,10 @@ prevent.
 
 Rung order:
 
-1. ``NAME(N).EXT`` -> ``NAME.EXT(N).json``  (the suffix moves AFTER .json)
+1. ``NAME(N).EXT`` -> ``NAME.EXT(N).json`` OR ``NAME.EXT.supplemental-metadata(N).json``
+   (the copy suffix moves AFTER the extension, either directly before
+   ``.json`` or after the ``supplemental-metadata`` tag -- both are exact,
+   newer exports use the latter spelling)
 2. ``NAME.EXT`` -> ``NAME.EXT.json``
 3. ``NAME.EXT`` -> ``NAME.EXT.supplemental-metadata.json``  (newer exports)
 4. ``-edited`` derivatives: strip the suffix and retry 1-3. Google emits no
@@ -125,6 +128,12 @@ def _candidates(media_path: str) -> list[str]:
         match = _PAREN_RE.match(base)
         if match and ext:
             out.append(f"{prefix}{match.group('base')}.{ext}({match.group('n')}){_JSON_SUFFIX}")
+            # Newer exports write the copy marker AFTER the supplemental-
+            # metadata tag instead: NAME.EXT.supplemental-metadata(N).json.
+            out.append(
+                f"{prefix}{match.group('base')}.{ext}"
+                f".supplemental-metadata({match.group('n')}){_JSON_SUFFIX}"
+            )
         out.append(f"{prefix}{variant}{_JSON_SUFFIX}")
         out.append(f"{prefix}{variant}{_SUPPLEMENTAL}")
     return out

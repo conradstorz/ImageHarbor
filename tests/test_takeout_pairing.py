@@ -213,3 +213,88 @@ def test_a_sidecar_appearing_once_still_pairs_normally() -> None:
     index = build_index(["d/IMG_1234.jpg", "d/IMG_1234.jpg.json"])
     assert index.ambiguous_sidecars == frozenset()
     assert sidecar_for("d/IMG_1234.jpg", index) == "d/IMG_1234.jpg.json"
+
+
+# -- Rung 1b: NAME(N).EXT -> NAME.EXT.supplemental-metadata(N).json --------
+#
+# The newer supplemental-metadata spelling of the copy-suffix displacement,
+# verified against a real 361 GiB export: the copy marker moves after the
+# extension AND after the "supplemental-metadata" tag.
+
+REAL_SUPPLEMENTAL_COPY_EXAMPLES = [
+    ("2019_01_24_086(1).jpg", "2019_01_24_086.jpg.supplemental-metadata(1).json"),
+    ("DSC_0002(1).JPG", "DSC_0002.JPG.supplemental-metadata(1).json"),
+    ("IMG_425785091311895(1).jpeg", "IMG_425785091311895.jpeg.supplemental-metadata(1).json"),
+    (
+        "Copy (4) of scan0105a_edited(1).jpg",
+        "Copy (4) of scan0105a_edited.jpg.supplemental-metadata(1).json",
+    ),
+]
+
+
+@pytest.mark.parametrize("media_name, sidecar_name", REAL_SUPPLEMENTAL_COPY_EXAMPLES)
+def test_supplemental_metadata_copy_suffix_pairs(media_name, sidecar_name) -> None:
+    """Real examples from the export: the copy marker after the tag pairs."""
+    media = f"{D}/{media_name}"
+    sidecar = f"{D}/{sidecar_name}"
+    index = build_index([media, sidecar])
+    assert sidecar_for(media, index) == sidecar
+
+
+def test_supplemental_copy_suffix_splits_on_the_last_parenthesised_group() -> None:
+    """An earlier `(4)` in the name must not be mistaken for the copy marker.
+
+    `_PAREN_RE` is greedy and anchored at the end, so it must take the LAST
+    parenthesised group (the real copy suffix) and leave the earlier `(4)`
+    embedded in the base name untouched.
+    """
+    media = f"{D}/Copy (4) of scan0105a_edited(1).jpg"
+    sidecar = f"{D}/Copy (4) of scan0105a_edited.jpg.supplemental-metadata(1).json"
+    index = build_index([media, sidecar])
+    assert sidecar_for(media, index) == sidecar
+
+
+def test_edited_variant_with_copy_suffix_inherits_supplemental_sidecar() -> None:
+    """`-edited` stripping (rung 4) must also see the supplemental-copy form."""
+    original = "d/photo(1).jpg"
+    edited = "d/photo(1)-edited.jpg"
+    sidecar = "d/photo.jpg.supplemental-metadata(1).json"
+    index = build_index([original, edited, sidecar])
+    assert sidecar_for(original, index) == sidecar
+    assert sidecar_for(edited, index) == sidecar
+
+
+def test_supplemental_copy_sidecar_shared_by_two_archives_is_never_paired() -> None:
+    """Ambiguity protection must cover the new candidate spelling too.
+
+    A sidecar path duplicated across the batch (as if two different media --
+    one from each archive -- both constructed it) is exactly the situation
+    `ambiguous_sidecars` exists to refuse, no matter which rung constructed
+    the candidate string.
+    """
+    media = "d/2019_01_24_086(1).jpg"
+    sidecar = "d/2019_01_24_086.jpg.supplemental-metadata(1).json"
+    index = build_index([media, sidecar, sidecar])
+    assert sidecar in index.ambiguous_sidecars
+    assert sidecar_for(media, index) is None
+
+
+def test_media_with_copy_suffix_shared_by_two_archives_is_never_paired() -> None:
+    """`ambiguous_media` protection also covers media using the new rung."""
+    media = "d/2019_01_24_086(1).jpg"
+    sidecar = "d/2019_01_24_086.jpg.supplemental-metadata(1).json"
+    index = build_index([media, media, sidecar])
+    assert media in index.ambiguous_media
+    assert sidecar_for(media, index) is None
+
+
+def test_no_supplemental_copy_sidecar_present_returns_none() -> None:
+    """No false positive: a `(N)` media with no sidecar at all is declined."""
+    index = build_index([f"{D}/2019_01_24_086(1).jpg"])
+    assert sidecar_for(f"{D}/2019_01_24_086(1).jpg", index) is None
+
+
+def test_plain_paren_json_spelling_still_pairs_no_regression() -> None:
+    """The original `NAME.EXT(N).json` spelling must be unaffected."""
+    index = build_index([f"{D}/2015-03-09(1).jpg", f"{D}/2015-03-09.jpg(1).json"])
+    assert sidecar_for(f"{D}/2015-03-09(1).jpg", index) == f"{D}/2015-03-09.jpg(1).json"
