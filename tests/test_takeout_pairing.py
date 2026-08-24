@@ -242,14 +242,16 @@ def test_supplemental_metadata_copy_suffix_pairs(media_name, sidecar_name) -> No
 
 
 def test_supplemental_copy_suffix_splits_on_the_last_parenthesised_group() -> None:
-    """An earlier `(4)` in the name must not be mistaken for the copy marker.
+    """An earlier parenthesised group must not be mistaken for the copy marker.
 
-    `_PAREN_RE` is greedy and anchored at the end, so it must take the LAST
-    parenthesised group (the real copy suffix) and leave the earlier `(4)`
-    embedded in the base name untouched.
+    `_PAREN_RE` is anchored at the end with `$` -- that anchor, not
+    greediness, is what forces it to take the LAST parenthesised group (the
+    real copy suffix) rather than an earlier one embedded in the base name: a
+    lazy `.*?` for the base group would backtrack to the exact same split,
+    since the anchor is what pins the match to the string's end.
     """
-    media = f"{D}/Copy (4) of scan0105a_edited(1).jpg"
-    sidecar = f"{D}/Copy (4) of scan0105a_edited.jpg.supplemental-metadata(1).json"
+    media = f"{D}/vacation (2019) day(1).jpg"
+    sidecar = f"{D}/vacation (2019) day.jpg.supplemental-metadata(1).json"
     index = build_index([media, sidecar])
     assert sidecar_for(media, index) == sidecar
 
@@ -288,13 +290,54 @@ def test_media_with_copy_suffix_shared_by_two_archives_is_never_paired() -> None
     assert sidecar_for(media, index) is None
 
 
-def test_no_supplemental_copy_sidecar_present_returns_none() -> None:
-    """No false positive: a `(N)` media with no sidecar at all is declined."""
-    index = build_index([f"{D}/2019_01_24_086(1).jpg"])
-    assert sidecar_for(f"{D}/2019_01_24_086(1).jpg", index) is None
+def test_supplemental_copy_suffix_declines_a_decoy_sidecar() -> None:
+    """No false positive: only the copy's OWN sidecar may pair with it.
+
+    An earlier version of this test built its index from one media member and
+    zero sidecars, so `index.sidecars` was empty and any implementation --
+    including a broken one -- returned `None`; it pinned nothing. This
+    version supplies a decoy sidecar in each case, so it fails if the new
+    candidate is constructed sloppily (e.g. if it ignored the copy index and
+    matched any supplemental sidecar for the base name).
+    """
+    media = f"{D}/2019_01_24_086(1).jpg"
+
+    # The non-copy's sidecar is present; the copy's own is not.
+    index = build_index([media, f"{D}/2019_01_24_086.jpg.supplemental-metadata.json"])
+    assert sidecar_for(media, index) is None
+
+    # A different copy index's sidecar is present.
+    index = build_index([media, f"{D}/2019_01_24_086.jpg.supplemental-metadata(2).json"])
+    assert sidecar_for(media, index) is None
 
 
 def test_plain_paren_json_spelling_still_pairs_no_regression() -> None:
     """The original `NAME.EXT(N).json` spelling must be unaffected."""
     index = build_index([f"{D}/2015-03-09(1).jpg", f"{D}/2015-03-09.jpg(1).json"])
     assert sidecar_for(f"{D}/2015-03-09(1).jpg", index) == f"{D}/2015-03-09.jpg(1).json"
+
+
+def test_supplemental_paren_form_is_not_shadowed_by_the_generic_supplemental_rule() -> None:
+    """`NAME(N).EXT.supplemental-metadata.json` also exists in some exports;
+    the displaced form (`NAME.EXT.supplemental-metadata(N).json`) still wins.
+
+    Mirrors `test_paren_form_is_not_shadowed_by_the_generic_rule` for the
+    newer spelling: the new candidate is emitted at index 1 of `_candidates`,
+    ahead of the generic supplemental rung for the same variant, so it must
+    not be shadowed.
+
+    NOTE: the real 361 GiB export this module was verified against contains
+    zero directories where both spellings co-occur -- this test pins a
+    precedence rule that is currently theoretical, not one observed in the
+    wild.
+    """
+    index = build_index(
+        [
+            "d/p.jpg",
+            "d/p.jpg.supplemental-metadata.json",
+            "d/p(1).jpg",
+            "d/p.jpg.supplemental-metadata(1).json",
+            "d/p(1).jpg.supplemental-metadata.json",
+        ]
+    )
+    assert sidecar_for("d/p(1).jpg", index) == "d/p.jpg.supplemental-metadata(1).json"

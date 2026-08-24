@@ -47,7 +47,8 @@ from typing import Iterable, Mapping
 logger = logging.getLogger(__name__)
 
 _JSON_SUFFIX = ".json"
-_SUPPLEMENTAL = ".supplemental-metadata.json"
+_SUPPLEMENTAL_TAG = ".supplemental-metadata"
+_SUPPLEMENTAL = f"{_SUPPLEMENTAL_TAG}{_JSON_SUFFIX}"
 _EDITED = "-edited"
 
 # Google's copy suffix, e.g. "2015-03-09(1)".
@@ -132,7 +133,7 @@ def _candidates(media_path: str) -> list[str]:
             # metadata tag instead: NAME.EXT.supplemental-metadata(N).json.
             out.append(
                 f"{prefix}{match.group('base')}.{ext}"
-                f".supplemental-metadata({match.group('n')}){_JSON_SUFFIX}"
+                f"{_SUPPLEMENTAL_TAG}({match.group('n')}){_JSON_SUFFIX}"
             )
         out.append(f"{prefix}{variant}{_JSON_SUFFIX}")
         out.append(f"{prefix}{variant}{_SUPPLEMENTAL}")
@@ -140,7 +141,22 @@ def _candidates(media_path: str) -> list[str]:
 
 
 def _media_part(sidecar_name: str) -> str:
-    """The media-name portion of a sidecar's basename."""
+    """The media-name portion of a sidecar's basename.
+
+    Deliberately does NOT recognize ``NAME.EXT.supplemental-metadata(N).json``
+    (rung 1b) as a supplemental sidecar -- only the un-suffixed
+    ``NAME.EXT.supplemental-metadata.json`` matches the `_SUPPLEMENTAL` check
+    below. A rung-1b sidecar falls through to the generic case and returns
+    ``NAME.EXT.supplemental-metadata(N)`` as its "media part", which a real
+    media stem can never prefix-match. That means a *truncated* rung-1b
+    sidecar can never be recovered by truncation recovery (rung 6) -- but
+    that is the safe direction: it costs only a missed pairing (the member
+    still organizes from EXIF and its filename), never a wrong one, and it is
+    exactly what keeps the `claimed`-set interaction inert for this spelling
+    (confirmed by differential fuzzing: zero truncation-pool entries added or
+    removed by the rung-1b candidate). Do not "fix" this to also strip the
+    copy suffix without re-verifying rung 6 end to end.
+    """
     lower = sidecar_name.lower()
     if lower.endswith(_SUPPLEMENTAL):
         return sidecar_name[: -len(_SUPPLEMENTAL)]
