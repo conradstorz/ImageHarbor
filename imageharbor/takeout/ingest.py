@@ -27,11 +27,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import tiers
 from ..catalog import Catalog
 from ..hashing import compute_sha256_b64url_bytes
 from ..pipeline import ExternalEvidence, Pipeline
 from ..sidecar import merge_sidecar
-from . import archive, metadata, pairing, provenance
+from . import archive, index_reader, metadata, pairing, provenance
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,17 @@ class IngestStats:
     missing_metadata: int = 0     # organized, but no sidecar could be paired
     per_archive: list[dict] = field(default_factory=list)
 
+    # Takeout index (optional). A run without one leaves all five at zero and
+    # reports "no index"; they are never a failure signal on their own.
+    # None when no index was used at all, which the summary reports on one
+    # line so "did it use the index?" is never answered by reading logs.
+    index_path: Path | None = None
+    index_archives_covered: int = 0
+    index_archives_fell_back: int = 0
+    index_members_fell_back: int = 0    # covered archive, member absent from index
+    index_sidecars_missing: int = 0     # index named a sidecar not on disk
+    pairings_related: int = 0
+
 
 def _initial_status(member: archive.MemberInfo, include_trash: bool) -> str:
     if archive.is_trash(member.path) and not include_trash:
@@ -137,8 +149,16 @@ def ingest_archives(
     include_trash: bool = False,
     write_sidecars: bool = False,
     dry_run: bool = False,
+    index_path: Path | None = None,
 ) -> IngestStats:
-    """Ingest every ``*.zip`` under *archives_dir* into *organized_dir*."""
+    """Ingest every ``*.zip`` under *archives_dir* into *organized_dir*.
+
+    *index_path* is an optional Takeout_Inventory pairing index. It is
+    verified against the archives actually on disk and used only for those
+    it covers; every other archive -- and the whole run, if the index is
+    absent, stale, or unreadable -- falls back to the built-in pairing rungs,
+    which are always a correct answer.
+    """
     return _Ingestor(
         archives_dir=archives_dir,
         organized_dir=organized_dir,
@@ -146,6 +166,7 @@ def ingest_archives(
         include_trash=include_trash,
         write_sidecars=write_sidecars,
         dry_run=dry_run,
+        index_path=index_path,
     ).run()
 
 
@@ -161,6 +182,7 @@ class _Ingestor:
         include_trash: bool,
         write_sidecars: bool,
         dry_run: bool,
+        index_path: Path | None = None,
     ) -> None:
         self.archives_dir = archives_dir
         self.organized_dir = organized_dir
@@ -168,12 +190,21 @@ class _Ingestor:
         self.include_trash = include_trash
         self.write_sidecars = write_sidecars
         self.dry_run = dry_run
+        self.index_path = index_path
         self.staging_dir = organized_dir / STAGING_DIR_NAME
         self.stats = IngestStats()
         # Which archive holds each member, so a sidecar in another part can be
         # read without re-surveying.
         self.owner: dict[str, Path] = {}
         self.pairing_index = pairing.PairingIndex()
+        # Set in `_survey`, once the batch's archives are known: the loaded
+        # Takeout_Inventory index (None if no `index_path` was given, or the
+        # file is absent/stale/unreadable -- see `_pairing_for`), and every
+        # member path in the batch, so `_pairing_for` can tell an index entry
+        # naming a real member from one naming a sidecar that never actually
+        # arrived (`index_sidecars_missing`).
+        self.index: index_reader.IndexPairings | None = None
+        self._all_members: frozenset[str] = frozenset()
         # Open zip handles, cached for the lifetime of run(). Re-opening a zip
         # re-parses its whole central directory (~91ms measured on a
         # 20,000-member archive), and every paired member triggers a
@@ -227,7 +258,27 @@ class _Ingestor:
         # "takeout-001 (1).zip" -- must be surveyed once, not once per path.
         seen_archive_ids: set[str] = set()
 
-        for path in sorted(p for p in self.archives_dir.glob("*.zip") if p.is_file()):
+        archive_paths = sorted(p for p in self.archives_dir.glob("*.zip") if p.is_file())
+
+        # Load the optional Takeout_Inventory index once, against every
+        # archive actually on disk. Any failure here -- missing file, wrong
+        # schema, an unreadable database, even a race where a listed archive
+        # vanishes before it can be stat()'d -- falls back to `self.index =
+        # None`, which makes `_pairing_for` behave exactly as if no index had
+        # been given. A broken index must never fail an ingest.
+        if self.index_path is not None:
+            self.stats.index_path = self.index_path
+            try:
+                archive_stats = {p.name: p.stat() for p in archive_paths}
+                self.index = index_reader.IndexPairings.open(self.index_path, archive_stats)
+            except Exception as exc:
+                logger.warning(
+                    "Takeout index %s is unusable (%s); falling back to built-in "
+                    "pairing for the whole run", self.index_path, exc,
+                )
+                self.index = None
+
+        for path in archive_paths:
             self.stats.archives_seen += 1
             identity = archive.identify(path, self.catalog)
 
@@ -246,6 +297,15 @@ class _Ingestor:
                 self.stats.archives_skipped += 1
                 continue
             seen_archive_ids.add(identity.archive_id)
+
+            # Counted once per archive identity actually surveyed this run --
+            # a stale or missing index must never be silent about which
+            # archives it covered.
+            if self.index_path is not None:
+                if self.index is not None and self.index.covers(identity.path.name):
+                    self.stats.index_archives_covered += 1
+                else:
+                    self.stats.index_archives_fell_back += 1
 
             row = self.catalog.takeout_archive_get(identity.archive_id)
 
@@ -322,6 +382,11 @@ class _Ingestor:
         # routinely land in different parts; a per-archive index would silently
         # lose metadata at every part boundary.
         self.pairing_index = pairing.build_index(all_members)
+        # Every member path in the batch -- built alongside `pairing_index`,
+        # from the same list, so `_pairing_for` can tell an index entry that
+        # names a real member from one naming a sidecar that never actually
+        # arrived in this batch (`index_sidecars_missing`).
+        self._all_members = frozenset(all_members)
 
         # Every sidecar path claimed by some media member, across the whole
         # batch. `pairing.sidecar_for` already returns a `Pairing` with
@@ -378,7 +443,7 @@ class _Ingestor:
                 # reason: none of them means "organized, but missing metadata".
                 and row["status"] in (_INGESTED, _DUPLICATE, _DEFERRED)
                 and not row["sidecar_path"]
-                and pairing.sidecar_for(row["member_path"], self.pairing_index).sidecar is not None
+                and self._pairing_for(row["member_path"], identity.path.name)[0].sidecar is not None
             ]
             if stale:
                 self.stats.archives_reopened += 1
@@ -449,6 +514,34 @@ class _Ingestor:
         return todo
 
     # -- phase 2 ------------------------------------------------------------
+
+    def _pairing_for(self, member_path: str, archive_name: str) -> tuple[pairing.Pairing, str]:
+        """The pairing for one member, from the index when it covers this
+        archive and knows this member, otherwise from the built-in rungs.
+
+        Returns the pairing together with `pair_rule`: the index's own rule
+        name when the index supplied the pairing, or the literal string
+        `"builtin"` when the built-in ladder did -- it does not name its
+        rungs, and inventing names for them here would be fiction.
+
+        Every fallback is counted. A silent fallback would make a stale index
+        indistinguishable from a working one.
+        """
+        if self.index is not None and self.index.covers(archive_name):
+            found = self.index.sidecar_for(member_path)
+            if found is None:
+                self.stats.index_members_fell_back += 1
+            elif found.sidecar is not None and found.sidecar not in self._all_members:
+                self.stats.index_sidecars_missing += 1
+            else:
+                result = pairing.Pairing(found.sidecar, found.confidence)
+                if result.confidence == pairing.RELATED:
+                    self.stats.pairings_related += 1
+                return result, found.rule
+        result = pairing.sidecar_for(member_path, self.pairing_index)
+        if result.confidence == pairing.RELATED:
+            self.stats.pairings_related += 1
+        return result, "builtin"
 
     def _zip_for(self, path: Path) -> zipfile.ZipFile:
         """Return a cached, open handle for *path*, opening it on first use.
@@ -596,8 +689,9 @@ class _Ingestor:
         member = archive.MemberInfo(
             path=member_path, size=row["size"], crc32=row["crc32"], kind=row["kind"]
         )
-        pairing_result = pairing.sidecar_for(member_path, self.pairing_index)
+        pairing_result, pair_rule = self._pairing_for(member_path, identity.path.name)
         sidecar_member = pairing_result.sidecar
+        confidence = pairing_result.confidence
         sidecar_raw = self._read_sidecar_bytes(sidecar_member) if sidecar_member else None
         meta = (
             metadata.parse_photo_metadata(sidecar_raw)
@@ -611,7 +705,21 @@ class _Ingestor:
                 staged,
                 source_label=self._label(identity.path, member_path),
                 evidence=ExternalEvidence(
-                    date=meta.photo_taken_at, original_name=meta.title
+                    date=meta.photo_taken_at,
+                    # A `related` sidecar's `title` is the ORIGINAL's
+                    # filename -- feeding it to the descriptor ladder would
+                    # rename an edit after its parent.
+                    original_name=(
+                        meta.title if confidence == pairing.OWN else None
+                    ),
+                    # A `related` sidecar's capture instant is still THIS
+                    # photograph's (it is usually the unedited original), but
+                    # it is trusted one rung lower than a sidecar that names
+                    # this file directly.
+                    date_tier=(
+                        tiers.DATE_RELATED_SIDECAR if confidence == pairing.RELATED
+                        else tiers.DATE_EXTERNAL_SIDECAR
+                    ),
                 ),
             )
         except Exception as exc:  # a member failure never fails the archive
@@ -667,12 +775,13 @@ class _Ingestor:
                     organized_path = Path(photo_row["organized_path"])
             if organized_path is not None:
                 self._merge_takeout_sidecar(organized_path, identity, member_path,
-                                            sidecar_member, sidecar_raw, meta)
+                                            sidecar_member, sidecar_raw, meta,
+                                            confidence, pair_rule)
 
     def _merge_takeout_sidecar(
         self, organized_path: Path, identity, member_path: str,
         sidecar_member: str | None, sidecar_raw: bytes | None,
-        meta: metadata.TakeoutMetadata,
+        meta: metadata.TakeoutMetadata, confidence: str, pair_rule: str,
     ) -> None:
         """Record Google's metadata as provenance. None of it is load-bearing.
 
@@ -707,6 +816,13 @@ class _Ingestor:
                     "archive": identity.path.name,
                     "member": sidecar_member,
                     "digest": _digest_bytes(sidecar_raw),
+                    # How this document came to be attached to this photo. A
+                    # `related` document describes a DIFFERENT file, so the
+                    # geoData inside `raw` is not this photo's location.
+                    # Recorded rather than deleted: dropping it would destroy
+                    # the audit trail.
+                    "confidence": confidence,
+                    "pair_rule": pair_rule,
                 }
                 parsed = _safe_json_loads(sidecar_raw)
                 if parsed is not None:
@@ -735,7 +851,9 @@ class _Ingestor:
                     ),
                 }]
 
-            if meta.people:
+            # Face tags belong to the file the sidecar names. A `related`
+            # sidecar names a different file.
+            if meta.people and confidence == pairing.OWN:
                 updates["people"] = [
                     {"name": n, "source": "google_photos_people"} for n in meta.people
                 ]
@@ -759,7 +877,7 @@ class _Ingestor:
         """
         member_path = row["member_path"]
         try:
-            pairing_result = pairing.sidecar_for(member_path, self.pairing_index)
+            pairing_result, _pair_rule = self._pairing_for(member_path, identity.path.name)
             sidecar_member = pairing_result.sidecar
             meta = self._read_sidecar(sidecar_member) if sidecar_member else metadata.EMPTY
             if sidecar_member is None:

@@ -25,15 +25,56 @@ def _jpeg(n: int) -> bytes:
     return b"\xff\xd8\xff\xe0" + bytes([n]) * 16 + b"\xff\xd9"
 
 
-def _sidecar(title: str, seconds: int) -> bytes:
-    return json.dumps(
-        {
-            "title": title,
-            "creationTime": {"timestampSeconds": str(seconds + 14836)},
-            "photoTakenTime": {"timestampSeconds": str(seconds)},
-            "geoData": {"latitude": 38.2768361, "longitude": -85.7357389},
-        }
-    ).encode()
+def _sidecar(title: str, seconds: int, people: tuple[str, ...] = ()) -> bytes:
+    doc = {
+        "title": title,
+        "creationTime": {"timestampSeconds": str(seconds + 14836)},
+        "photoTakenTime": {"timestampSeconds": str(seconds)},
+        "geoData": {"latitude": 38.2768361, "longitude": -85.7357389},
+    }
+    if people:
+        doc["people"] = [{"name": n} for n in people]
+    return json.dumps(doc).encode()
+
+
+def _read_sidecar(dest: Path, stem_contains: str) -> dict:
+    """The JSON sidecar ImageHarbor wrote beside the one organized file whose
+    name contains *stem_contains*.
+
+    Two departures from a naive `dest.rglob("*.json")` were needed to make
+    this find the right file:
+
+    - Case-insensitive: `normalize_descriptor` lowercases every descriptor
+      (and folds `_` into `-`), so an organized filename never contains a
+      member's original mixed-case stem verbatim.
+    - Excludes the provenance room (`.takeout-provenance/`): `_ingest_archive`
+      preserves every non-media member verbatim there, under its ORIGINAL
+      member name, regardless of `write_sidecars` -- so a photo's own Google
+      JSON sidecar (e.g. "IMG_1.jpg.json") sits there too, an unrelated file
+      that can share the same substring as the organized sidecar under test.
+    """
+    from imageharbor.takeout.provenance import ROOM_NAME
+
+    needle = stem_contains.lower()
+    hits = [
+        p for p in dest.rglob("*.json")
+        if ROOM_NAME not in p.parts and needle in p.name.lower()
+    ]
+    assert len(hits) == 1, [str(p.relative_to(dest)) for p in hits]
+    return json.loads(hits[0].read_text(encoding="utf-8"))
+
+
+def _make_stale_index(path: Path, *, name: str, size: int, mtime: int) -> Path:
+    """A minimal Takeout_Inventory index describing one archive whose stats
+    do not match what's actually on disk, so `covers()` refuses it and the
+    ingest falls back to the built-in pairing for that archive.
+
+    Built from the same schema literal `test_takeout_index_reader.py` uses --
+    that module owns the schema, so the SQL is not duplicated here.
+    """
+    from tests.test_takeout_index_reader import make_index
+
+    return make_index(path, archives=((name, size, mtime, 0, None),))
 
 
 def _zip(path: Path, entries: dict[str, bytes]) -> Path:
@@ -785,3 +826,79 @@ def test_a_photo_with_no_albums_json_in_its_directory_still_organizes(
     organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
     data = read_sidecar(organized)
     assert data["albums"][0]["title"] is None
+
+
+# --- Task 5: routing through the index, and the `related` policy -----------
+
+
+def test_related_pairing_keeps_the_date_and_drops_title_and_people(
+    dirs, catalog: Catalog
+) -> None:
+    """An -edited copy inherits its ORIGINAL's sidecar. The capture instant is
+    this photograph's; the title and the people are the original's."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1-edited.jpg": _jpeg(2),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792,
+                                        people=("Alice",)),
+    })
+    # `_read_sidecar` reads the JSON sidecar ingest writes beside the
+    # organized file, which only happens with `write_sidecars=True` -- the
+    # brief's own snippet omits this; every other provenance-block test in
+    # this module passes it explicitly, and without it there is no file for
+    # `_read_sidecar` to find.
+    ingest_archives(archives, dest, catalog, write_sidecars=True)
+
+    # "IMG_1" alone is a recognized camera pattern (see `descriptor.py`) and
+    # is discarded, so it never survives into an organized filename; "edited"
+    # does (the `-edited` suffix defeats the pattern), which is also exactly
+    # the substring that distinguishes this file's sidecar from IMG_1.jpg's.
+    edited = _read_sidecar(dest, "edited")
+    prov = edited["provenance"][0]
+    assert prov["confidence"] == "related"
+    assert prov["pair_rule"]                       # recorded, never blank
+    # The document is kept verbatim - deleting it would destroy the audit
+    # trail - but it is labelled, so the coordinates in it are not silently
+    # this photo's.
+    assert prov["raw"]["geoData"]["latitude"] == 38.2768361
+    assert "people" not in edited
+
+
+def test_own_pairing_keeps_title_and_people(dirs, catalog: Catalog) -> None:
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792,
+                                        people=("Alice",)),
+    })
+    ingest_archives(archives, dest, catalog, write_sidecars=True)
+
+    # "IMG_1" is a recognized camera pattern (see `descriptor.py`) and is
+    # discarded rather than kept as a descriptor, so the organized filename
+    # is bare `<date>_<digest>.jpg` -- there is no substring of "IMG_1" to
+    # match on. This archive organizes exactly one photo, so the empty
+    # needle (matches everything) still finds exactly one sidecar.
+    own = _read_sidecar(dest, "")
+    assert own["provenance"][0]["confidence"] == "own"
+    assert own["people"] == [{"name": "Alice", "source": "google_photos_people"}]
+
+
+def test_an_uncovered_archive_falls_back_and_is_counted(
+    dirs, catalog: Catalog, tmp_path: Path
+) -> None:
+    """A stale index must never fail an ingest, and never be silent about it."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792),
+    })
+    # An index describing an archive with the right name and the wrong size.
+    stale = _make_stale_index(tmp_path / "takeout-index.sqlite",
+                              name="takeout-001.zip", size=1, mtime=1)
+    stats = ingest_archives(archives, dest, catalog, index_path=stale)
+
+    assert stats.index_archives_covered == 0
+    assert stats.index_archives_fell_back == 1
+    assert stats.ingested == 1        # identical to a no-index run
+    assert stats.missing_metadata == 0

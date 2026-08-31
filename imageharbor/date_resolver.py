@@ -166,6 +166,7 @@ def resolve_date(
     exif_data: dict[str, Any],
     *,
     external_date: datetime | None = None,
+    external_date_tier: int = tiers.DATE_EXTERNAL_SIDECAR,
 ) -> ResolvedDate:
     """Resolve *source_path*'s capture date from EXIF, an external sidecar, then
     its filename.
@@ -181,6 +182,13 @@ def resolve_date(
     implausible value is ignored rather than asserted, exactly like an
     implausible EXIF value.
 
+    *external_date_tier* is the rung *external_date* is asserted at. Defaults
+    to ``DATE_EXTERNAL_SIDECAR`` (a sidecar that names this file). A caller
+    whose external date came from a `related` pairing's sidecar -- usually
+    this file's unedited original -- passes ``DATE_RELATED_SIDECAR`` instead:
+    the capture instant is trustworthy, but one rung lower than a sidecar that
+    names this file directly.
+
     Google's ``creationTime`` must NEVER be passed here: it records when a file
     was uploaded, which is the same category of claim as file mtime.
     """
@@ -195,8 +203,8 @@ def resolve_date(
     if external_date is not None and _plausible(external_date):
         return ResolvedDate(
             value=external_date,
-            tier=tiers.DATE_EXTERNAL_SIDECAR,
-            source=tiers.DATE_SOURCE_NAMES[tiers.DATE_EXTERNAL_SIDECAR],
+            tier=external_date_tier,
+            source=tiers.DATE_SOURCE_NAMES[external_date_tier],
         )
 
     for field in _EXIF_OTHER_FIELDS:
