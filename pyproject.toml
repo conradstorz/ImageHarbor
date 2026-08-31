@@ -44,3 +44,11 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# `corpus` matches the sibling Takeout_Inventory repo's own convention
+# (tests/test_corpus.py there): opt-in, excluded by default, run explicitly
+# with `pytest -m corpus`. A corpus test never asserts a count -- the real
+# export is not a fixture and changes over time.
+markers = [
+    "corpus: runs against a real Google Takeout export on disk. Opt-in, never in CI.",
+]
+addopts = "--strict-markers -m \"not corpus\""
