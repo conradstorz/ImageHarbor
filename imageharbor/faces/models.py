@@ -46,7 +46,7 @@ DETECTORS: dict[str, ModelInfo] = {
             "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/"
             "models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
         ),
-        sha256=None,
+        sha256="8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
         input_size=(640, 640),
         # YuNet consumes raw 0-255 BGR: OpenCV's FaceDetectorYN builds its blob
         # with every blobFromImage default, and those defaults are BGR with no
@@ -64,7 +64,7 @@ EMBEDDERS: dict[str, ModelInfo] = {
         kind="embedder",
         filename="auraface_v1_glintr100.onnx",
         url="https://huggingface.co/fal/AuraFace-v1/resolve/main/glintr100.onnx",
-        sha256=None,
+        sha256="a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60",
         input_size=(112, 112),
         # Every embedding model on the aligned crop takes RGB, normalized to
         # roughly [-1, 1] by (x - 127.5) / 128.
