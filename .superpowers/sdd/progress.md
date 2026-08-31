@@ -142,3 +142,32 @@ Any future "pre-existing failure" claim must first confirm
   bare 2-D input "so tests don't have to carry a batch axis", but the helper now always
   builds 3-D, so nothing exercises that path and the stated why is no longer true;
   the batch>1 ValueError path is untested.
+- Task 5: faces/align.py — COMPLETE (44c5f90..f37a4a3; 11 tests, suite 932 passed/2 skipped; review clean after 1 fix round)
+  The inversion trap was handled correctly FIRST TIME and, unusually, proven rather than
+  asserted: the implementer built a deliberately un-inverted variant and showed it yields
+  an all-black 112x112 crop (max 0) where the real one peaks at 255. Pillow's AFFINE takes
+  the OUTPUT->INPUT map, and passing the forward matrix produces a warp that still looks
+  face-ish and still embeds to something -- nothing raises. This is the defect that would
+  have silently degraded every embedding in the system.
+  IMPLEMENTER CAUGHT A FALSE NEGATIVE IN THE PLAN'S OWN TEST: a 1-pixel marker is diluted
+  to 63/255 by bilinear downsampling even when the transform is CORRECT, so the brief's
+  `> 100` assertion would have failed on good code. Widened the marker to 5x5 (255 vs 0)
+  rather than lowering the threshold -- the right instinct: it keeps the pass window tight
+  and the reviewer confirmed the 5x5 version still scores 0 against a wrong transform.
+  DEFECT FROM THE PLAN'S DRAFT, found by the reviewer empirically: the degeneracy guard
+  used matrix_rank(cov) < 2, i.e. machine-precision, so it caught only EXACTLY degenerate
+  input. Landmarks perturbed 1e-4 off a line sailed through and produced scale ~12.6 --
+  garbage, while DegenerateLandmarks' own docstring promised protection. Real detectors
+  emit near-collinear landmarks on extreme profiles, motion blur, and occlusion.
+  Replaced with a conditioning test on the singular values already computed. THRESHOLD
+  CHOSEN EMPIRICALLY, NOT GUESSED (1e-3), and independently re-verified by the controller:
+      pathological (1e-4 off a line)          1.15e-06   rejected
+      94%-compressed near-edge-on profile     0.0379     accepted  (38x margin)
+      ArcFace template, and rotated+scaled    0.632      accepted
+  Both directions matter: too loose feeds garbage crops to the embedder, too strict
+  silently shrinks the library's face coverage. The measured populations separate by ~4
+  orders of magnitude, so the choice is not a split-the-difference guess.
+  Minor rolled up for final review: the det(u)*det(vt) reflection branch is currently
+  unreachable-as-distinct (given the rank guard, sign(det(cov)) always agrees with it);
+  kept deliberately with a comment rather than deleted, since reflection handling is
+  subtle and the guard could change.
