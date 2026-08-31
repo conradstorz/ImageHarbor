@@ -119,7 +119,7 @@ class IngestStats:
     missing_metadata: int = 0     # organized, but no sidecar could be paired
     per_archive: list[dict] = field(default_factory=list)
 
-    # Takeout index (optional). A run without one leaves all five at zero and
+    # Takeout index (optional). A run without one leaves all these at zero and
     # reports "no index"; they are never a failure signal on their own.
     # None when no index was used at all, which the summary reports on one
     # line so "did it use the index?" is never answered by reading logs.
@@ -128,6 +128,19 @@ class IngestStats:
     index_archives_fell_back: int = 0
     index_members_fell_back: int = 0    # covered archive, member absent from index
     index_sidecars_missing: int = 0     # index named a sidecar not on disk
+    # The index covers this member and knows it, but reports NO sidecar for
+    # it (`found.sidecar is None`) -- distinct from `index_members_fell_back`
+    # (the member is absent from the index entirely). Falling through to the
+    # built-in ladder here is CRITICAL 1's fix: the index's "no sidecar"
+    # answer must never silently override a pairing the built-in ladder CAN
+    # still make.
+    index_no_sidecar_fell_back: int = 0
+    # The index knows this member and names a sidecar for it, but its
+    # `confidence` value is not one `pairing.py` recognizes ("own"/"related"/
+    # "none"). Fail-safe (falls back rather than trusting a value that would
+    # silently drop title/people and misfile the date tier), but a producer-
+    # side schema drift must still be visible, not merely invisible-safe.
+    index_bad_confidence_fell_back: int = 0
     pairings_related: int = 0
 
 
@@ -515,6 +528,12 @@ class _Ingestor:
 
     # -- phase 2 ------------------------------------------------------------
 
+    # The only `confidence` values `pairing.py` (and everything downstream
+    # that branches on them -- the RELATED date-tier/title/people policy)
+    # knows how to act on. An index row carrying anything else is a
+    # producer-side schema drift, not a pairing this code may trust.
+    _VALID_CONFIDENCES = frozenset({pairing.OWN, pairing.RELATED, pairing.NO_MATCH})
+
     def _pairing_for(self, member_path: str, archive_name: str) -> tuple[pairing.Pairing, str]:
         """The pairing for one member, from the index when it covers this
         archive and knows this member, otherwise from the built-in rungs.
@@ -526,13 +545,31 @@ class _Ingestor:
 
         Every fallback is counted. A silent fallback would make a stale index
         indistinguishable from a working one.
+
+        The built-in ladder is always a correct answer, so it is consulted --
+        not merely counted -- whenever the index cannot supply a trustworthy
+        pairing of its own: it is missing the member, reports an unrecognized
+        `confidence`, names a sidecar that never actually arrived in this
+        batch, or (CRITICAL 1) reports the member has no sidecar at all. That
+        last case is not proof the member is unpairable -- it is proof only
+        that THIS index has nothing to say about it -- so returning it
+        directly would let an incomplete index silently cost a photo its date
+        even though the built-in ladder could still have found one.
         """
         if self.index is not None and self.index.covers(archive_name):
             found = self.index.sidecar_for(member_path)
             if found is None:
                 self.stats.index_members_fell_back += 1
+            elif found.confidence not in self._VALID_CONFIDENCES:
+                logger.warning(
+                    "Takeout index has an unrecognized confidence %r for %s; "
+                    "falling back to built-in pairing", found.confidence, member_path,
+                )
+                self.stats.index_bad_confidence_fell_back += 1
             elif found.sidecar is not None and found.sidecar not in self._all_members:
                 self.stats.index_sidecars_missing += 1
+            elif found.sidecar is None:
+                self.stats.index_no_sidecar_fell_back += 1
             else:
                 result = pairing.Pairing(found.sidecar, found.confidence)
                 if result.confidence == pairing.RELATED:

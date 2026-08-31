@@ -204,7 +204,14 @@ def resolve_date(
         return ResolvedDate(
             value=external_date,
             tier=external_date_tier,
-            source=tiers.DATE_SOURCE_NAMES[external_date_tier],
+            # Every current caller passes DATE_RELATED_SIDECAR or
+            # DATE_EXTERNAL_SIDECAR, both of which are keys here -- but this
+            # int is caller-supplied, and date resolution must degrade for an
+            # unknown tier rather than raise KeyError out of the middle of
+            # placing a photo.
+            source=tiers.DATE_SOURCE_NAMES.get(
+                external_date_tier, f"external_tier_{external_date_tier}"
+            ),
         )
 
     for field in _EXIF_OTHER_FIELDS:
