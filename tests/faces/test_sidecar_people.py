@@ -44,6 +44,40 @@ def test_existing_google_entries_survive_the_widened_key():
     assert merged["people"] == [{"name": "Judy Storz", "source": "google_photos_people"}]
 
 
+def test_repeated_reconfirmation_with_differing_confirmed_at_does_not_grow_history():
+    """`propagate_sidecars` (Task 12) stamps a fresh `confirmed_at` on every
+    run. `_merge_keyed_list` must treat `confirmed_at` the way it already
+    treats `last_seen` -- advance to the newest observation, don't relocate
+    the superseded one -- or the history list grows by one entry per run,
+    forever. `_ANNOTATION_FIELDS` claiming `confirmed_at` is meaningless if
+    the keyed-list merge path never consults it.
+    """
+    doc: dict = {}
+    stable_keys: set[str] | None = None
+    for i in range(5):
+        updates = {
+            "people": [
+                {
+                    "name": "Emma",
+                    "source": "imageharbor_faces",
+                    "cluster_ids": [3],
+                    "confirmed_at": f"2026-08-31T00:00:0{i}+00:00",
+                }
+            ]
+        }
+        doc = sidecar_schema.merge(doc, updates, observed_at=f"2026-08-31T00:00:0{i}+00:00")
+        entry = doc["people"][0]
+        assert "history" not in entry
+        # The entry's shape must be stable from the second merge onward --
+        # not just history-free, but not silently accreting some other field.
+        if i == 1:
+            stable_keys = set(entry.keys())
+        elif i > 1:
+            assert set(entry.keys()) == stable_keys
+
+    assert doc["people"][0]["confirmed_at"] == "2026-08-31T00:00:04+00:00"
+
+
 def test_reconfirming_the_same_person_is_byte_identical():
     updates = {
         "people": [

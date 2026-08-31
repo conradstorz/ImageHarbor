@@ -2154,6 +2154,38 @@ git add imageharbor/sidecar_schema.py tests/faces/test_sidecar_people.py
 git commit -m "feat(faces): key people on (name, source) so evidence coexists"
 ```
 
+### Fix round 1: `confirmed_at` in `_ANNOTATION_FIELDS` was a no-op for `people`
+
+Step 3 as originally written (and as shipped) registered `confirmed_at` in
+`_ANNOTATION_FIELDS` and added `test_confirmed_at_is_registered_as_an_annotation`
+to assert it. Both were satisfied and both passed -- but they tested the wrong
+thing. `_ANNOTATION_FIELDS` only ever gated `_merge_tiered`, `_merge_versioned`,
+and `_relocate`'s own dedup (all via `_core()`); `_merge_keyed_list` -- the merge
+path `people`, `sources`, `albums`, and `provenance` all actually use -- never
+consulted it. Registering `confirmed_at` there did nothing to stop a `people`
+face-confirmation entry from growing one `history` entry per merge, forever,
+exactly the shape `propagate_sidecars` (Task 12) hits by re-stamping
+`confirmed_at` on every run.
+
+Investigation found this affects only the not-yet-shipped face `people` path:
+every currently-shipped keyed-list writer (`sources` via `pipeline._source_entry`,
+`albums` and `provenance` in `takeout/ingest.py`) writes only `first_seen`/
+`last_seen` as annotation-shaped fields, both already handled correctly by the
+pre-fix code; none of them write `observed_at`, `superseded_at`, or `rejected`
+onto a keyed-list entry. So this was not a live, already-shipped bug -- it was
+dormant until the `confirmed_at` field was introduced in this same task.
+
+**Fix:** generalized `_merge_keyed_list` so every `_ANNOTATION_FIELDS` member
+(other than `first_seen`, which keeps its earliest-wins semantics) advances to
+the newest observation without relocating the superseded value, the same
+treatment `last_seen` already had. `_ANNOTATION_FIELDS`'s comment and
+`_merge_keyed_list`'s docstring were updated to say the registry now governs
+all three merge paths. Four new tests were added (one pinning the growth fix,
+three guarding against the generalization over-reaching into first_seen or a
+non-annotation field); the property test
+`test_never_loses_a_value_over_a_random_merge_sequence` was re-run and still
+passes. Full report: `.superpowers/sdd/task-8-report.md` under "Fix round 1".
+
 **Milestone B complete.**
 
 ---

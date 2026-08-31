@@ -437,7 +437,16 @@ Module responsibilities:
   match itself on a later merge and the list grows unboundedly. This is not a
   hypothetical failure mode — a `rejected` flag left out of this set once
   shipped as a Critical bug that grew a history entry per `watch` cycle,
-  forever. `migrate()` upgrades a v1 sidecar to v2 (the old `takeout` block
+  forever. The registry governs all three merge paths the same way:
+  `_merge_tiered`/`_merge_versioned` use it (via `_core()`) to decide whether
+  a superseded *block* matches itself for dedup, and `_merge_keyed_list` uses
+  it directly, per field, to decide whether a changed field on an existing
+  entry (e.g. `people[].confirmed_at`) advances in place like `last_seen`
+  rather than relocating the old value to that entry's `history[]` — the
+  mechanism differs, but skipping either one reintroduces the same unbounded
+  growth. (`_merge_keyed_list` did not consult the registry at all until this
+  was found and fixed during Task 8 — see the "Fix round 1" note in
+  `.superpowers/sdd/task-8-report.md`.) `migrate()` upgrades a v1 sidecar to v2 (the old `takeout` block
   becomes a `provenance[]` entry of `kind:
   "imageharbor_v1_takeout_block"`), itself losslessly and idempotently.
 - **`sidecar.py`** — optional, per-image `.json` metadata file (on by default —

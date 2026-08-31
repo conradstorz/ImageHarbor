@@ -324,6 +324,51 @@ def test_last_seen_moves_without_recording_history() -> None:
     assert not any(h.get("field") == "last_seen" for h in entry.get("history", []))
 
 
+def test_last_seen_still_advances_without_history_across_repeated_merges() -> None:
+    """Same guarantee as above, but over more than one supersession -- the
+    generalized `_ANNOTATION_FIELDS` handling must not regress the field it
+    was modelled on."""
+    doc: dict = {}
+    for i in range(5):
+        doc = merge(
+            doc,
+            {"sources": [{"path": "/a.jpg", "first_seen": T0,
+                          "last_seen": f"2026-08-31T00:00:0{i}+00:00"}]},
+            observed_at=T1,
+        )
+    entry = doc["sources"][0]
+    assert entry["last_seen"] == "2026-08-31T00:00:04+00:00"
+    assert "history" not in entry
+
+
+def test_first_seen_out_of_order_still_relocates_the_later_value() -> None:
+    """`first_seen` is the one `_ANNOTATION_FIELDS` member that does NOT
+    advance-and-drop like `last_seen`/`confirmed_at`: it keeps the EARLIEST
+    value, and a genuinely earlier value arriving out of order still
+    relocates the now-superseded later one. Pinned so the generalization
+    added for `confirmed_at` cannot accidentally flatten this exception too.
+    """
+    base = merge({}, {"sources": [{"path": "/a.jpg", "first_seen": T1, "last_seen": T1}]},
+                 observed_at=T1)
+    after = merge(base, {"sources": [{"path": "/a.jpg", "first_seen": T0, "last_seen": T1}]},
+                  observed_at=T1)
+    entry = after["sources"][0]
+    assert entry["first_seen"] == T0
+    assert any(h.get("field") == "first_seen" and h.get("value") == T1 for h in entry["history"])
+
+
+def test_a_non_annotation_keyed_list_field_still_relocates_to_history() -> None:
+    """Guard against the `_ANNOTATION_FIELDS` generalization over-reaching:
+    an ordinary field -- not in `_ANNOTATION_FIELDS` -- must still relocate
+    its superseded value to the entry's own `history`, exactly as before.
+    """
+    base = merge({}, {"provenance": [{"digest": "D1", "raw": {"title": "a.jpg"}}]}, observed_at=T0)
+    after = merge(base, {"provenance": [{"digest": "D1", "raw": {"title": "b.jpg"}}]}, observed_at=T1)
+    entry = after["provenance"][0]
+    assert entry["raw"] == {"title": "b.jpg"}
+    assert any(h.get("field") == "raw" and h.get("value") == {"title": "a.jpg"} for h in entry["history"])
+
+
 def test_provenance_keys_on_digest() -> None:
     doc = {"provenance": [{"kind": "takeout_media_json", "digest": "D1", "raw": {"a": 1}}]}
     base = merge({}, doc, observed_at=T0)
