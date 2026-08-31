@@ -166,3 +166,16 @@ def test_external_date_none_leaves_the_ladder_unchanged(tmp_path) -> None:
     exif = {"DateTimeDigitized": "2019:07:04 12:33:11"}
     resolved = resolve_date(_p(tmp_path, "IMG_1234.jpg"), exif, external_date=None)
     assert resolved.tier == tiers.DATE_EXIF_OTHER
+
+
+def test_unknown_external_date_tier_degrades_instead_of_raising(tmp_path) -> None:
+    """`external_date_tier` is caller-supplied; every current caller passes
+    DATE_RELATED_SIDECAR (25) or DATE_EXTERNAL_SIDECAR (30), but an unknown
+    tier must degrade to a synthesized source name rather than raise
+    `KeyError` out of `DATE_SOURCE_NAMES` mid-resolution."""
+    resolved = resolve_date(
+        _p(tmp_path, "photo.jpg"), {},
+        external_date=datetime(2015, 3, 9), external_date_tier=999,
+    )
+    assert resolved.tier == 999
+    assert resolved.source == "external_tier_999"

@@ -866,22 +866,40 @@ def test_related_pairing_keeps_the_date_and_drops_title_and_people(
 
 
 def test_own_pairing_keeps_title_and_people(dirs, catalog: Catalog) -> None:
+    """Fix pass 1, CRITICAL 2 row 4: the given fixture (`IMG_1.jpg`, a
+    recognized camera pattern -- see `descriptor.py`) cannot actually prove
+    the title survives, because `resolve_descriptor` discards a camera-
+    generated verdict from EITHER the media's own stem OR the sidecar's
+    title, so the descriptor comes out DESC_NONE whether `original_name` is
+    threaded through or dropped entirely -- the `original_name=None` mutation
+    is invisible against that fixture. The media filename here is changed to
+    a non-camera-generated stem ("photo1"), and the sidecar's title to a
+    different, also non-camera-generated human title ("Emma Birthday.jpg"),
+    so the two are only equal if the title actually reaches the descriptor
+    ladder -- the added assertion below fails if `original_name` is dropped,
+    because the descriptor would then fall back to the media's own stem
+    ("photo1") instead of the title's ("emma-birthday")."""
     archives, dest = dirs
     _zip(archives / "takeout-001.zip", {
-        f"{D}/IMG_1.jpg": _jpeg(1),
-        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792,
-                                        people=("Alice",)),
+        f"{D}/photo1.jpg": _jpeg(1),
+        f"{D}/photo1.jpg.json": _sidecar("Emma Birthday.jpg", 1425905792,
+                                          people=("Alice",)),
     })
     ingest_archives(archives, dest, catalog, write_sidecars=True)
 
-    # "IMG_1" is a recognized camera pattern (see `descriptor.py`) and is
-    # discarded rather than kept as a descriptor, so the organized filename
-    # is bare `<date>_<digest>.jpg` -- there is no substring of "IMG_1" to
-    # match on. This archive organizes exactly one photo, so the empty
-    # needle (matches everything) still finds exactly one sidecar.
+    # This archive organizes exactly one photo, so the empty needle (matches
+    # everything) still finds exactly one sidecar.
     own = _read_sidecar(dest, "")
     assert own["provenance"][0]["confidence"] == "own"
     assert own["people"] == [{"name": "Alice", "source": "google_photos_people"}]
+
+    # The added assertion: the organized filename's descriptor came from the
+    # sidecar's title ("Emma Birthday" -> "emma-birthday"), not from the
+    # media's own filename ("photo1") -- proving `original_name` really
+    # reached the descriptor ladder for an `own` pairing.
+    organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
+    assert "emma-birthday" in organized.name
+    assert "photo1" not in organized.name
 
 
 def test_an_uncovered_archive_falls_back_and_is_counted(
@@ -901,4 +919,175 @@ def test_an_uncovered_archive_falls_back_and_is_counted(
     assert stats.index_archives_covered == 0
     assert stats.index_archives_fell_back == 1
     assert stats.ingested == 1        # identical to a no-index run
+    assert stats.missing_metadata == 0
+
+
+# --- Fix pass 1: CRITICAL 1 and CRITICAL 2 regression tests ----------------
+
+
+def test_related_pairing_records_date_tier_25(dirs, catalog: Catalog) -> None:
+    """Fix pass 1, CRITICAL 2 row 1: a `related` pairing's capture date must
+    be resolved at DATE_RELATED_SIDECAR (25) / "related_sidecar", never at
+    DATE_EXTERNAL_SIDECAR (30) -- the tier an `own` pairing gets. Kills the
+    mutation that hardcodes `date_tier=tiers.DATE_EXTERNAL_SIDECAR` always."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1-edited.jpg": _jpeg(2),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792,
+                                        people=("Alice",)),
+    })
+    ingest_archives(archives, dest, catalog)
+
+    from imageharbor.hashing import compute_sha256_b64url_bytes
+    sha = compute_sha256_b64url_bytes(_jpeg(2))
+    row = catalog.get_by_sha256(sha)
+    assert row is not None
+    assert row["date_tier"] == 25
+    assert row["date_source"] == "related_sidecar"
+
+
+def _index_covering_weird1(tmp_path: Path, archives: Path) -> Path:
+    """A Takeout_Inventory index that pairs `weird1.jpg` with a same-archive
+    sidecar whose name is unrelated to it -- something the built-in ladder's
+    naming rungs (exact, case-insensitive, truncation-prefix) cannot ever
+    associate -- stamped with a distinctive rule name so `pair_rule`
+    provenance can be checked for its actual value, not merely truthiness."""
+    from tests.test_takeout_index_reader import make_index
+
+    st = (archives / "takeout-001.zip").stat()
+    return make_index(
+        tmp_path / "index.sqlite",
+        archives=(("takeout-001.zip", st.st_size, int(st.st_mtime), 0, None),),
+        sidecars=[(1, "takeout-001.zip", f"{D}/totally-unrelated-name.json",
+                   "totally-unrelated-name.json")],
+        media=[("takeout-001.zip", f"{D}/weird1.jpg", "area", "folder",
+                "weird1.jpg", 1, "index-only-rule", "own")],
+    )
+
+
+def test_index_supplied_pairing_differs_from_builtin_result(
+    dirs, catalog: Catalog, tmp_path: Path
+) -> None:
+    """Fix pass 1, CRITICAL 2 row 2: a member the built-in ladder cannot pair
+    (an unrelated sidecar name) is still paired when a Takeout_Inventory
+    index supplies the answer -- proving the index is genuinely consulted,
+    not merely present. Kills the mutation `if False and self.index...`."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/weird1.jpg": _jpeg(3),
+        f"{D}/totally-unrelated-name.json": _sidecar("weird1.jpg", 1425905792),
+    })
+
+    # Baseline: the built-in ladder cannot associate these two unrelated names.
+    baseline = ingest_archives(archives, dest, catalog, write_sidecars=True)
+    assert baseline.missing_metadata == 1
+
+    idx_path = _index_covering_weird1(tmp_path, archives)
+    dest2 = tmp_path / "organized2"
+    dest2.mkdir()
+    cat2 = Catalog(tmp_path / "catalog2.db")
+    try:
+        stats = ingest_archives(archives, dest2, cat2, write_sidecars=True,
+                                index_path=idx_path)
+    finally:
+        cat2.close()
+
+    assert stats.index_archives_covered == 1
+    # The observable difference from the built-in-only baseline: the index
+    # supplied a pairing where the built-in ladder found none.
+    assert stats.missing_metadata == 0
+
+
+def test_index_pair_rule_is_recorded_verbatim(
+    dirs, catalog: Catalog, tmp_path: Path
+) -> None:
+    """Fix pass 1, CRITICAL 2 row 3: the provenance entry's `pair_rule` must
+    equal the index's own rule string, not merely be truthy. Kills the
+    mutation that hardcodes `"pair_rule": "builtin"`."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/weird1.jpg": _jpeg(3),
+        f"{D}/totally-unrelated-name.json": _sidecar("weird1.jpg", 1425905792),
+    })
+    idx_path = _index_covering_weird1(tmp_path, archives)
+    stats = ingest_archives(archives, dest, catalog, write_sidecars=True,
+                            index_path=idx_path)
+    assert stats.index_archives_covered == 1
+
+    from imageharbor.sidecar import read_sidecar
+    organized = next((dest / "2015" / "2015-03").glob("*.jpg"))
+    prov = read_sidecar(organized)["provenance"][0]
+    assert prov["pair_rule"] == "index-only-rule"
+
+
+def test_index_null_sidecar_falls_back_to_builtin_pairing(
+    dirs, catalog: Catalog, tmp_path: Path
+) -> None:
+    """Fix pass 1, CRITICAL 1: an index that covers the archive and knows the
+    member, but reports NO sidecar for it (`sidecar_id` NULL), must fall
+    through to the built-in ladder rather than silently overriding a pairing
+    the built-in ladder CAN make. The built-in pairing is always a correct
+    answer; every index problem falls back, counts, and reports."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792),
+    })
+    st = (archives / "takeout-001.zip").stat()
+    from tests.test_takeout_index_reader import make_index
+    idx_path = make_index(
+        tmp_path / "index.sqlite",
+        archives=(("takeout-001.zip", st.st_size, int(st.st_mtime), 0, None),),
+        media=[("takeout-001.zip", f"{D}/IMG_1.jpg", "area", "folder",
+                "IMG_1.jpg", None, "orphan", "none")],
+    )
+    stats = ingest_archives(archives, dest, catalog, index_path=idx_path)
+
+    assert stats.index_archives_covered == 1
+    assert stats.index_no_sidecar_fell_back == 1
+    # The built-in ladder still found IMG_1.jpg.json -- missing_metadata must
+    # NOT be incremented, and the photo must be dated and correctly foldered,
+    # not dumped into Undated/.
+    assert stats.missing_metadata == 0
+    organized = list((dest / "2015" / "2015-03").glob("*.jpg"))
+    assert len(organized) == 1
+    assert not list(dest.glob("Undated/*.jpg"))
+
+    from imageharbor.hashing import compute_sha256_b64url_bytes
+    sha = compute_sha256_b64url_bytes(_jpeg(1))
+    row = catalog.get_by_sha256(sha)
+    assert row is not None
+    assert row["date_tier"] == 30
+    assert row["date_source"] == "external_sidecar"
+
+
+def test_index_unrecognized_confidence_falls_back_and_is_counted(
+    dirs, catalog: Catalog, tmp_path: Path
+) -> None:
+    """Fix pass 1, MINOR: an index row with a `confidence` value `pairing.py`
+    does not recognize (e.g. "high") must not be trusted -- it would
+    otherwise silently drop the title/people (neither "own" nor "related")
+    and file the date at tier 30 regardless of what it actually was. It must
+    fall back to the built-in ladder instead, and the fallback must be
+    counted so a producer-side schema drift is visible, not invisible-safe."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792),
+    })
+    st = (archives / "takeout-001.zip").stat()
+    from tests.test_takeout_index_reader import make_index
+    idx_path = make_index(
+        tmp_path / "index.sqlite",
+        archives=(("takeout-001.zip", st.st_size, int(st.st_mtime), 0, None),),
+        sidecars=[(1, "takeout-001.zip", f"{D}/IMG_1.jpg.json", "IMG_1.jpg.json")],
+        media=[("takeout-001.zip", f"{D}/IMG_1.jpg", "area", "folder",
+                "IMG_1.jpg", 1, "some-rule", "high")],
+    )
+    stats = ingest_archives(archives, dest, catalog, index_path=idx_path)
+
+    assert stats.index_archives_covered == 1
+    assert stats.index_bad_confidence_fell_back == 1
+    # The built-in ladder still found IMG_1.jpg.json on its own.
     assert stats.missing_metadata == 0
