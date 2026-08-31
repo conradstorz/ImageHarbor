@@ -845,7 +845,7 @@ def takeout_ingest(
             f"{stats.index_archives_fell_back} fell back"
         )
         click.echo(
-            f"  pairings     : {stats.ingested - stats.pairings_related} own · "
+            f"  pairings     : {stats.pairings_own} own · "
             f"{stats.pairings_related} related · "
             f"{stats.missing_metadata} unpaired"
         )

@@ -8,6 +8,7 @@ throughout so no network access is required.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import zipfile
 from pathlib import Path
@@ -1090,6 +1091,85 @@ def test_takeout_ingest_falls_back_when_the_auto_detected_index_is_unusable(tmp_
     assert result.exit_code == 0, result.output
     assert "ingested 1" in result.output
     assert "no index" in result.output.lower()
+
+
+def test_takeout_ingest_pairings_summary_never_goes_negative(tmp_path) -> None:
+    """Reviewer repro: one archive holding a fresh image, a duplicate of it,
+    and a deferred video, all paired via a real index (own/related/related).
+
+    The "own" figure used to be derived as `ingested - pairings_related`.
+    That subtraction is not a partition: `pairings_related` is incremented in
+    `_pairing_for` for EVERY member routed through it -- fresh images,
+    duplicates, and deferred videos alike -- while `ingested` counts only
+    freshly-copied, non-duplicate images. A real export always mixes all
+    three categories, so on this fixture the old formula printed
+    `-1 own \xb7 2 related \xb7 0 unpaired`. Kills that regression by pinning
+    both that no figure is negative AND that the three figures are a true
+    partition of every member `_pairing_for` actually routed.
+    """
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    fresh_bytes = b"\xff\xd8\xff\xe0" + b"\x0a" * 16 + b"\xff\xd9"
+    archive_path = _takeout_zip(
+        archives / "t.zip",
+        {
+            "Takeout/A/fresh.jpg": fresh_bytes,
+            "Takeout/A/dup.jpg": fresh_bytes,          # byte-identical -> duplicate
+            "Takeout/A/clip.mp4": b"not really an mp4",  # -> deferred
+            "Takeout/A/fresh.jpg.json": json.dumps(
+                {"title": "fresh.jpg",
+                 "photoTakenTime": {"timestampSeconds": "1425905792"}}
+            ).encode(),
+        },
+    )
+    stat = archive_path.stat()
+    con = sqlite3.connect(archives / "takeout-index.sqlite")
+    con.executescript(_INDEX_SCHEMA)
+    con.execute(
+        "INSERT INTO archive VALUES (?,?,?,?,?)",
+        ("t.zip", stat.st_size, int(stat.st_mtime), 4, None),
+    )
+    con.execute(
+        "INSERT INTO sidecar (id, archive, path, name) VALUES (?,?,?,?)",
+        (1, "t.zip", "Takeout/A/fresh.jpg.json", "fresh.jpg.json"),
+    )
+    con.executemany(
+        "INSERT INTO media (archive, path, area, folder, name, sidecar_id, rule, confidence)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        [
+            ("t.zip", "Takeout/A/fresh.jpg", "GP", "GP", "fresh.jpg", 1, "exact", "own"),
+            ("t.zip", "Takeout/A/dup.jpg", "GP", "GP", "dup.jpg", 1, "exact", "related"),
+            ("t.zip", "Takeout/A/clip.mp4", "GP", "GP", "clip.mp4", 1, "exact", "related"),
+        ],
+    )
+    con.execute("INSERT INTO index_meta VALUES ('schema_version', '1')")
+    con.commit()
+    con.close()
+
+    result = CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    # No --takeout-index flag -- auto-detected, exactly as in the reviewer's run.
+    assert "takeout-index.sqlite" in result.output
+    assert "ingested 1 / duplicates 1 / deferred 1" in result.output
+
+    pairings_line = next(
+        line for line in result.output.splitlines() if "pairings" in line
+    )
+    assert "-1" not in pairings_line, pairings_line
+    numbers = [int(n) for n in re.findall(r"-?\d+", pairings_line)]
+    assert len(numbers) == 3
+    own, related, unpaired = numbers
+    assert own >= 0 and related >= 0 and unpaired >= 0
+    # `_pairing_for` was called exactly three times in this run (fresh.jpg and
+    # dup.jpg via `_ingest_image`, clip.mp4 via `_defer_video`); own/related/
+    # unpaired must be a true partition of that routed total.
+    assert own + related + unpaired == 3
+    assert own == 1
+    assert related == 2
+    assert unpaired == 0
 
 
 def test_takeout_status(tmp_path) -> None:

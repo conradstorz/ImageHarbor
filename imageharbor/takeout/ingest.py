@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -141,7 +142,14 @@ class IngestStats:
     # silently drop title/people and misfile the date tier), but a producer-
     # side schema drift must still be visible, not merely invisible-safe.
     index_bad_confidence_fell_back: int = 0
+    # `pairings_own`/`pairings_related` are each incremented in `_pairing_for`
+    # for EVERY member routed through it that came back with that confidence
+    # -- fresh images, duplicates, and deferred videos alike. They are not a
+    # partition of `ingested` (which counts only freshly-copied, non-
+    # duplicate images), so the summary must never derive one from the other
+    # by subtracting from `ingested` -- see the CLI's "pairings" line.
     pairings_related: int = 0
+    pairings_own: int = 0
 
 
 def _initial_status(member: archive.MemberInfo, include_trash: bool) -> str:
@@ -312,9 +320,17 @@ class _Ingestor:
                 if explicit:
                     if isinstance(exc, index_reader.IndexUnusable):
                         raise
-                    raise index_reader.IndexUnusable(
-                        f"cannot use {candidate}: {exc}"
-                    ) from exc
+                    if isinstance(exc, (OSError, sqlite3.Error)):
+                        # These are the shapes a genuinely-unusable FILE takes
+                        # (missing, permission-denied, not a database, I/O
+                        # error). Anything else is a bug in this code, not a
+                        # problem with the caller's index, and must surface as
+                        # a real traceback -- wrapping it into IndexUnusable
+                        # would send troubleshooting at the wrong file.
+                        raise index_reader.IndexUnusable(
+                            f"cannot use {candidate}: {exc}"
+                        ) from exc
+                    raise
                 logger.warning(
                     "Takeout index %s is unusable (%s); falling back to built-in "
                     "pairing for the whole run", candidate, exc,
@@ -607,10 +623,14 @@ class _Ingestor:
                 result = pairing.Pairing(found.sidecar, found.confidence)
                 if result.confidence == pairing.RELATED:
                     self.stats.pairings_related += 1
+                elif result.confidence == pairing.OWN:
+                    self.stats.pairings_own += 1
                 return result, found.rule
         result = pairing.sidecar_for(member_path, self.pairing_index)
         if result.confidence == pairing.RELATED:
             self.stats.pairings_related += 1
+        elif result.confidence == pairing.OWN:
+            self.stats.pairings_own += 1
         return result, "builtin"
 
     def _zip_for(self, path: Path) -> zipfile.ZipFile:

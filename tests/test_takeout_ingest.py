@@ -1091,3 +1091,57 @@ def test_index_unrecognized_confidence_falls_back_and_is_counted(
     assert stats.index_bad_confidence_fell_back == 1
     # The built-in ladder still found IMG_1.jpg.json on its own.
     assert stats.missing_metadata == 0
+
+
+# --- Fix pass 1: narrow the explicit-index exception catch -----------------
+
+
+def test_an_unexpected_exception_from_an_explicit_index_open_is_not_hidden(
+    dirs, catalog: Catalog, tmp_path: Path, monkeypatch
+) -> None:
+    """A bug in this code (or in `index_reader.py`) must surface as a real
+    traceback when the index was named EXPLICITLY via `--takeout-index` --
+    wrapping it into `IndexUnusable` tells the operator their FILE is bad
+    when the fault is ImageHarbor's own. Only file-shaped failures
+    (`OSError`, `sqlite3.Error`), plus a genuine `IndexUnusable`, may become
+    `IndexUnusable`; anything else -- an `AttributeError` here, standing in
+    for a real internal bug -- must propagate unwrapped."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {f"{D}/IMG_1.jpg": _jpeg(1)})
+    idx_path = tmp_path / "index.sqlite"
+    idx_path.write_bytes(b"")   # never actually read -- open() is replaced below
+
+    def _boom(cls, path, archive_stats):
+        raise AttributeError("'NoneType' object has no attribute 'sidecar_for_bug'")
+
+    monkeypatch.setattr(ingest_mod.index_reader.IndexPairings, "open", classmethod(_boom))
+
+    with pytest.raises(AttributeError, match="sidecar_for_bug"):
+        ingest_archives(archives, dest, catalog, index_path=idx_path)
+
+
+def test_an_unexpected_exception_from_an_auto_detected_index_still_falls_back(
+    dirs, catalog: Catalog, monkeypatch
+) -> None:
+    """The same bug, hit via AUTO-DETECTION (no explicit `--takeout-index`),
+    must NOT fail the run. Narrowing the explicit path's catch must not
+    change the auto-detect path's long-standing contract: any failure while
+    opening an auto-detected index -- of any exception type -- only warns and
+    falls back to the built-in pairing rungs for the whole run."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792),
+    })
+    (archives / "takeout-index.sqlite").write_bytes(b"")
+
+    def _boom(cls, path, archive_stats):
+        raise AttributeError("'NoneType' object has no attribute 'sidecar_for_bug'")
+
+    monkeypatch.setattr(ingest_mod.index_reader.IndexPairings, "open", classmethod(_boom))
+
+    stats = ingest_archives(archives, dest, catalog)
+
+    assert stats.ingested == 1               # the run completed, unfailed
+    assert stats.index_path is None           # the index was never actually loaded
+    assert stats.missing_metadata == 0        # built-in ladder still found the sidecar
