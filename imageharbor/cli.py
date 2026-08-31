@@ -13,6 +13,7 @@ from .catalog import Catalog
 from .enrich import enrich_library
 from .hashing import extract_digest_from_stem, verify_pcs_file
 from .pipeline import Pipeline
+from .takeout import index_reader
 from .takeout.ingest import ingest_archives
 
 
@@ -750,6 +751,17 @@ def takeout_survey(archives_dir: Path, json_path: Path | None, distrust_threshol
     default=False,
     help="Survey the archives and report, without extracting or writing anything.",
 )
+@click.option(
+    "--takeout-index",
+    "index_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help=(
+        "A takeout-index.sqlite published by Takeout_Inventory. Supplies the "
+        "confidence of each sidecar pairing. Auto-detected beside --archives "
+        "when present; pass this to require a specific one."
+    ),
+)
 def takeout_ingest(
     archives_dir: Path,
     dest: Path,
@@ -757,6 +769,7 @@ def takeout_ingest(
     sidecar: bool,
     include_trash: bool,
     dry_run: bool,
+    index_path: Path | None,
 ) -> None:
     """Ingest Google Takeout archives from ARCHIVES into DEST.
 
@@ -778,14 +791,23 @@ def takeout_ingest(
         catalog_target = catalog_path
 
     with Catalog(catalog_target) as catalog:
-        stats = ingest_archives(
-            archives_dir,
-            dest,
-            catalog,
-            include_trash=include_trash,
-            write_sidecars=sidecar,
-            dry_run=dry_run,
-        )
+        try:
+            stats = ingest_archives(
+                archives_dir,
+                dest,
+                catalog,
+                include_trash=include_trash,
+                write_sidecars=sidecar,
+                dry_run=dry_run,
+                index_path=index_path,
+            )
+        except index_reader.IndexUnusable as exc:
+            # Only an EXPLICITLY named --takeout-index raises this far: the
+            # caller asked for something specific and did not get it, which
+            # is an error, not a fallback. An auto-detected index that turns
+            # out unusable never raises here -- ingest_archives already
+            # warned and fell back to the built-in pairing rungs.
+            raise click.ClickException(f"--takeout-index: {exc}") from exc
 
     if dry_run:
         click.echo("[DRY-RUN] No files were extracted and nothing was recorded.")
@@ -807,6 +829,32 @@ def takeout_ingest(
         # operator badly over-attribute the metadata gap to freshly-copied
         # files.
         click.echo(f"{stats.missing_metadata} organized without Google metadata")
+
+    # The index report. "Did it use the index?" must never be a question
+    # answered by reading logs -- this says so on one line, every run.
+    if stats.index_path is None:
+        click.echo("takeout index  : no index found; pairings from built-in rules")
+    else:
+        click.echo(
+            f"takeout index  : {stats.index_path.name} "
+            f"(schema {index_reader.SCHEMA_VERSION}, "
+            f"{stats.index_archives_covered + stats.index_archives_fell_back} archives)"
+        )
+        click.echo(
+            f"  archives     : {stats.index_archives_covered} indexed, "
+            f"{stats.index_archives_fell_back} fell back"
+        )
+        click.echo(
+            f"  pairings     : {stats.ingested - stats.pairings_related} own · "
+            f"{stats.pairings_related} related · "
+            f"{stats.missing_metadata} unpaired"
+        )
+        click.echo(
+            f"  fallbacks    : {stats.index_members_fell_back} members, "
+            f"{stats.index_no_sidecar_fell_back} no-sidecar, "
+            f"{stats.index_bad_confidence_fell_back} bad-confidence, "
+            f"{stats.index_sidecars_missing} missing sidecars"
+        )
 
     if stats.failed or stats.archives_corrupt:
         sys.exit(1)

@@ -166,11 +166,20 @@ def ingest_archives(
 ) -> IngestStats:
     """Ingest every ``*.zip`` under *archives_dir* into *organized_dir*.
 
-    *index_path* is an optional Takeout_Inventory pairing index. It is
-    verified against the archives actually on disk and used only for those
-    it covers; every other archive -- and the whole run, if the index is
-    absent, stale, or unreadable -- falls back to the built-in pairing rungs,
-    which are always a correct answer.
+    *index_path* is an optional, explicitly-named Takeout_Inventory pairing
+    index. When omitted, ``archives_dir / "takeout-index.sqlite"`` is tried
+    instead -- an auto-detected one. Either way the index is verified against
+    the archives actually on disk and used only for those it covers; every
+    other archive falls back to the built-in pairing rungs, which are always
+    a correct answer.
+
+    The two cases fail differently. An index named explicitly is a request
+    for something specific: if it is missing, stale, or unreadable, this
+    raises `index_reader.IndexUnusable` rather than silently ingesting with
+    weaker pairing. An auto-detected index is a convenience: the same
+    failures there only log a warning, and the whole run falls back to the
+    built-in rungs -- a broken or absent auto-detected index must never fail
+    an ingest.
     """
     return _Ingestor(
         archives_dir=archives_dir,
@@ -274,22 +283,46 @@ class _Ingestor:
         archive_paths = sorted(p for p in self.archives_dir.glob("*.zip") if p.is_file())
 
         # Load the optional Takeout_Inventory index once, against every
-        # archive actually on disk. Any failure here -- missing file, wrong
-        # schema, an unreadable database, even a race where a listed archive
-        # vanishes before it can be stat()'d -- falls back to `self.index =
-        # None`, which makes `_pairing_for` behave exactly as if no index had
-        # been given. A broken index must never fail an ingest.
-        if self.index_path is not None:
-            self.stats.index_path = self.index_path
+        # archive actually on disk.
+        #
+        # An index the caller NAMED explicitly (`self.index_path` set on
+        # entry, from `--takeout-index`) is something they asked for
+        # specifically -- missing or unusable there is an error, not a
+        # fallback: `IndexUnusable` propagates out of `run()` uncaught, and
+        # the CLI turns it into a clean exit. An index found by
+        # AUTO-DETECTION (no explicit path; a `takeout-index.sqlite` sitting
+        # beside the archives) is a convenience, not a request: any failure
+        # there -- missing file, wrong schema, an unreadable database, even a
+        # race where a listed archive vanishes before it can be stat()'d --
+        # falls back to `self.index = None`, exactly as if no index had ever
+        # been given, and only logs a warning. A broken auto-detected index
+        # must never fail an ingest.
+        #
+        # `self.index_path` is left at its original value (None, for
+        # auto-detection) unless an index is actually loaded successfully --
+        # the per-archive coverage counting just below, and the run summary,
+        # both key off it to decide whether an index was used at all.
+        explicit = self.index_path is not None
+        candidate = self.index_path if explicit else self.archives_dir / "takeout-index.sqlite"
+        if explicit or candidate.is_file():
             try:
                 archive_stats = {p.name: p.stat() for p in archive_paths}
-                self.index = index_reader.IndexPairings.open(self.index_path, archive_stats)
+                self.index = index_reader.IndexPairings.open(candidate, archive_stats)
             except Exception as exc:
+                if explicit:
+                    if isinstance(exc, index_reader.IndexUnusable):
+                        raise
+                    raise index_reader.IndexUnusable(
+                        f"cannot use {candidate}: {exc}"
+                    ) from exc
                 logger.warning(
                     "Takeout index %s is unusable (%s); falling back to built-in "
-                    "pairing for the whole run", self.index_path, exc,
+                    "pairing for the whole run", candidate, exc,
                 )
                 self.index = None
+            else:
+                self.index_path = candidate
+                self.stats.index_path = candidate
 
         for path in archive_paths:
             self.stats.archives_seen += 1
