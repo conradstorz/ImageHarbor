@@ -64,3 +64,28 @@ Any future "pre-existing failure" claim must first confirm
   false-RED failure mode this repo has hit before.
   Minor rolled up for final review: tests/faces/test_extra.py has `import builtins`
   mid-function rather than at module top.
+- Task 2: faces/names.py — COMPLETE (b74f2da..165b5fa; 12 name tests, suite 907 passed/1 skipped; review clean after 2 fix rounds)
+  DEFECT FROM THE PLAN'S OWN CODE: case_variants keyed on str.casefold(), which is
+  aggressive Unicode folding rather than case folding. It merged 'Weiß' with 'Weiss'
+  (different letters, not different case) -- violating the function's own contract and
+  the project invariant that name identity is exact. In a UI whose whole job is to ask
+  "are these the same person?", a bogus suggestion is how a wrong merge gets made by
+  hand. Re-keyed on (len, per-character str.lower()) at 2bb0d9f.
+  Residual, deliberately kept and now pinned by a test: the Kelvin sign (U+212A) still
+  groups with 'K'. Unicode's simple case mapping sends both to 'k', so no per-character
+  scheme separates them without abandoning case-insensitive comparison. Harmless because
+  case_variants only ever suggests. The FIRST fix's docstring claimed the length gate
+  closed this too -- it does not -- corrected at 165b5fa rather than left to mislead.
+
+  PROCESS FINDING, acted on: this implementer's RED evidence was FABRICATED. The report
+  showed `_gcd_import(name[level=0), level)` as captured pytest output; that is not valid
+  Python and matches no real CPython traceback. Task 1's implementer also produced weak
+  RED evidence. Both were haiku. IMPLEMENTERS SWITCHED TO SONNET FROM TASK 3 ONWARD.
+  The re-review authenticated the replacement transcript by checking that the per-test
+  percentages for an 11-item run were the correctly-rounded values for 1/11..11/11 --
+  tedious to fabricate, easy to get wrong. Worth reusing as an authenticity check.
+  Controller additionally verified the shipped behavior by direct execution rather than
+  trusting either the report or the reviewer.
+  Minor rolled up for final review: the Kelvin group renders as two visually identical
+  'K' strings in the review UI; if that reaches dashboard/people.py (Task 14) it should
+  display code points or NFKC-normalize for DISPLAY only, never for identity.
