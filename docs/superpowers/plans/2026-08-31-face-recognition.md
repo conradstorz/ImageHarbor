@@ -59,6 +59,8 @@ Each is working, testable software on its own.
 # tests/faces/test_extra.py
 """The faces package must import with or without onnxruntime installed."""
 
+import sys
+
 import imageharbor.faces as faces
 
 
@@ -68,7 +70,48 @@ def test_package_imports_without_onnxruntime():
     # imported lazily by the runner.
     assert hasattr(faces, "HAS_ONNX")
     assert isinstance(faces.HAS_ONNX, bool)
+
+
+def test_package_imports_when_onnxruntime_raises_non_import_error(monkeypatch):
+    # A broken install (ABI-mismatch, partial installation, etc.) may raise
+    # non-ImportError exceptions during import. The probe must catch all
+    # exceptions, not just ImportError, and set HAS_ONNX to False so the
+    # package still imports successfully.
+
+    # Clear the imageharbor.faces module from sys.modules to force re-execution
+    # of its import probe. Use monkeypatch.delitem (not sys.modules.pop) so the
+    # original module object is restored at teardown regardless of whether the
+    # test passes or fails — a bare pop() here would leak the reloaded,
+    # ONNX-less module into every later test in the session.
+    monkeypatch.delitem(sys.modules, "imageharbor.faces", raising=False)
+    to_remove = [k for k in list(sys.modules.keys()) if k.startswith("imageharbor.faces.")]
+    for k in to_remove:
+        monkeypatch.delitem(sys.modules, k, raising=False)
+
+    # Patch builtins.__import__ to raise RuntimeError for onnxruntime,
+    # simulating a broken C extension or ABI mismatch. The original __import__
+    # is called for all other modules.
+    import builtins
+    original_import = builtins.__import__
+
+    def mock_import_with_broken_onnx(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise RuntimeError("ONNX Runtime initialization failed: ABI version mismatch")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import_with_broken_onnx)
+
+    # Import the package with the patched import. It should succeed
+    # because the probe catches all exceptions.
+    import imageharbor.faces as faces_reloaded
+
+    assert hasattr(faces_reloaded, "HAS_ONNX")
+    # If the exception handler only caught ImportError, this would fail
+    # because RuntimeError would propagate. With the proper fix, it is False.
+    assert faces_reloaded.HAS_ONNX is False
 ```
+
+Use `monkeypatch`, not `sys.modules.pop()` and `unittest.mock.patch("builtins.__import__", ...)`, for the `sys.modules` surgery and the import patch above — `monkeypatch` restores both automatically at teardown, on both the passing and failing path. A bare `pop()` leaves the reloaded, ONNX-less module permanently installed in `sys.modules["imageharbor.faces"]` for the rest of the pytest session, silently poisoning `HAS_ONNX` for every later test that imports the package.
 
 - [ ] **Step 2: Run test to verify it fails**
 
