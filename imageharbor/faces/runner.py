@@ -11,17 +11,27 @@ counted in `ScanResult.errors`.
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
+import click
 import numpy as np
 from PIL import Image
 
+from ..sidecar import merge_sidecar
+from . import attribute, calibrate, cluster
 from .align import DegenerateLandmarks, align_crop
 
 logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
 
 # On a 12 MP JPEG, Image.draft(...) before Image.load() downscales in the DCT
 # domain and skips most of the decode -- decode, not inference, dominates this
@@ -165,3 +175,139 @@ def scan(
         result.rejected += rejected
 
     return result
+
+
+def build_clusters(
+    store,
+    photo_names: Mapping[str, Sequence[str]],
+    *,
+    embed_model: str,
+    threshold: float,
+    min_score: float,
+    min_support: int,
+) -> int:
+    """Re-cluster every face for *embed_model*, seeded from Google anchors,
+    and record fresh name proposals.
+
+    Never writes `clusters.person_id` -- that happens only when a human
+    confirms a cluster on the dashboard (`FaceStore.confirm`/`merge`). This
+    function only calls `replace_clusters` (a machine reclustering, which on
+    its own reattaches an already-confirmed cluster's *existing* person but
+    never assigns a new one) and `record_proposals` (which the store's own
+    docstring guarantees never touches `person_id`).
+    """
+    # Sorted explicitly rather than trusted from the store: `cluster_faces`
+    # is order-dependent by design (see cluster.py's module docstring), so a
+    # re-cluster of the same faces must always visit them in the same order
+    # regardless of what order the caller's iterator happens to yield.
+    vectors = sorted(store.iter_face_vectors(embed_model), key=lambda f: f.face_id)
+
+    anchor_ids = store.anchor_face_ids(embed_model, photo_names)
+    seeds = [
+        cluster.Seed(name=name, face_ids=tuple(anchor_ids[name]))
+        for name in sorted(anchor_ids)
+    ]
+
+    clusters = cluster.cluster_faces(vectors, threshold=threshold, seeds=seeds)
+    store.replace_clusters(embed_model, clusters)
+
+    cluster_photos = store.digests_by_cluster(embed_model)
+    proposals = attribute.propose(
+        cluster_photos, photo_names, min_score=min_score, min_support=min_support
+    )
+    store.record_proposals(proposals)
+    return len(clusters)
+
+
+def measure_threshold(
+    store,
+    photo_names: Mapping[str, Sequence[str]],
+    *,
+    embed_model: str,
+    target_precision: float,
+) -> calibrate.Calibration:
+    """Calibrate the clustering threshold from the library's own anchors."""
+    anchors = store.anchors(embed_model, photo_names)
+    distinct_names = {name for name, _ in anchors}
+    if len(distinct_names) < 2:
+        # calibrate.calibrate raises ValueError for the same condition, but
+        # only after trying to np.stack an anchor list that may have zero or
+        # one rows -- a much less legible failure for a CLI user than a
+        # message that names the actual shortfall.
+        raise click.ClickException(
+            "calibration needs anchor photos (exactly one detected face, "
+            "exactly one Google-tagged name) for at least two distinct "
+            f"people; found {len(distinct_names)}. Tag more photos in "
+            "Google Photos and re-run `faces scan` first."
+        )
+    return calibrate.calibrate(anchors, target_precision=target_precision)
+
+
+def propagate_sidecars(store, dest: Path, detect_model: str) -> int:
+    """Write every confirmed cluster's name into its photos' sidecars.
+
+    Idempotent: `iter_pending_sidecars` only yields a digest whose
+    confirmation (`clusters.assigned_at`) is newer than its last sidecar
+    write (`face_scan.sidecar_at`), and even a forced re-write merges to a
+    byte-identical document -- `confirmed_at` is a registered annotation
+    field (`sidecar_schema._ANNOTATION_FIELDS`), so it advances in place on
+    a `(name, source)` match instead of growing a `history` list.
+    """
+    written = 0
+    for digest, names in store.iter_pending_sidecars():
+        organized_path = store.organized_path_for(digest)
+        if organized_path is None:
+            # No known path to write to -- nothing this pass can do about it,
+            # and it must not be counted as written or it will never be
+            # retried once a path becomes known.
+            continue
+        updates = {
+            "people": [
+                {
+                    "name": name,
+                    "source": "imageharbor_faces",
+                    "confirmed_at": _now_iso(),
+                }
+                for name in names
+            ]
+        }
+        merge_sidecar(Path(organized_path), updates)
+        store.mark_sidecar_written(digest, detect_model)
+        written += 1
+    return written
+
+
+def google_names(dest: Path) -> dict[str, list[str]]:
+    """`{digest: [name, ...]}` from every sidecar's Google-tagged people.
+
+    Walks *dest* for sidecars directly rather than going through a `Catalog`
+    handle -- this is shared by the `cluster` and `calibrate` CLI
+    subcommands (Task 13), which only take `--dest`. Each sidecar carries its
+    own digest in `identity.sha256_b64url` (written by the facts pass and by
+    `backfill.py`); a sidecar missing that field, unreadable, or carrying no
+    `google_photos_people` entry contributes nothing rather than raising --
+    a name lookup for clustering must not abort a whole run over one bad
+    file.
+    """
+    out: dict[str, list[str]] = {}
+    for sidecar_path in sorted(Path(dest).rglob("*.json")):
+        try:
+            doc = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        identity = doc.get("identity")
+        digest = identity.get("sha256_b64url") if isinstance(identity, dict) else None
+        if not digest:
+            continue
+        names = [
+            person.get("name")
+            for person in doc.get("people", ())
+            if isinstance(person, dict)
+            and person.get("source") == "google_photos_people"
+            and person.get("name")
+        ]
+        if names:
+            out[digest] = names
+    return out

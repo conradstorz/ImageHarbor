@@ -90,14 +90,15 @@ CREATE TABLE IF NOT EXISTS people (
 );
 
 CREATE TABLE IF NOT EXISTS proposals (
-  cluster_id   INTEGER NOT NULL,
-  name         TEXT    NOT NULL,
-  support      INTEGER NOT NULL,        -- photos in cluster tagged this name
-  total_tagged INTEGER NOT NULL,        -- photos in cluster tagged anything
-  score        REAL    NOT NULL,
-  proposed_at  TEXT    NOT NULL,
-  decided      TEXT,                    -- NULL | confirmed | rejected
-  decided_at   TEXT,
+  cluster_id       INTEGER NOT NULL,
+  name             TEXT    NOT NULL,
+  support          INTEGER NOT NULL,    -- photos in cluster tagged this name
+  total_tagged     INTEGER NOT NULL,    -- photos in cluster tagged anything
+  score            REAL    NOT NULL,
+  untagged_photos  INTEGER NOT NULL DEFAULT 0,  -- what confirming would newly name
+  proposed_at      TEXT    NOT NULL,
+  decided          TEXT,                -- NULL | confirmed | rejected
+  decided_at       TEXT,
   PRIMARY KEY (cluster_id, name)
 );
 
@@ -288,6 +289,65 @@ class FaceStore:
                 if row["embed_model"] != embed_model or row["embedding"] is None:
                     continue
                 out.append((next(iter(names)), self._decode_embedding(row)))
+        return out
+
+    def anchor_face_ids(
+        self, embed_model: str, photo_names: Mapping[str, Sequence[str]]
+    ) -> dict[str, list[int]]:
+        """`{name: [face_id, ...]}` for the same anchor photos `anchors()` selects.
+
+        `anchors()` returns `(name, embedding)` pairs because that is all
+        `calibrate.calibrate` ever needs. `cluster.Seed` needs face ids
+        instead, to place into `cluster_faces`'s own `by_id` lookup -- Task
+        12's brief said to build seeds "from `store.anchors(...)`", but that
+        method's return tuple has no id in it, only a name and a decoded
+        embedding. Rather than widen `anchors()`'s tuple (which would break
+        every existing two-value unpacking of its result, including
+        `test_anchors_are_single_face_single_name_photos`), this is a second
+        method with the identical selection criteria: one unrejected face,
+        one distinct normalized name, that face embedded by *embed_model*.
+        """
+        out: dict[str, list[int]] = {}
+        with self.lock:
+            for digest in sorted(photo_names):
+                names = {normalize(n) for n in photo_names[digest] if normalize(n)}
+                if len(names) != 1:
+                    continue
+                rows = self._conn.execute(
+                    """
+                    SELECT id, embed_model, embedding FROM faces
+                    WHERE sha256_b64url=? AND rejected IS NULL
+                    """,
+                    (digest,),
+                ).fetchall()
+                if len(rows) != 1:
+                    continue
+                row = rows[0]
+                if row["embed_model"] != embed_model or row["embedding"] is None:
+                    continue
+                out.setdefault(next(iter(names)), []).append(row["id"])
+        return out
+
+    def digests_by_cluster(self, embed_model: str) -> dict[int, list[str]]:
+        """`{cluster_id: [digest, ...]}` for every clustered face under *embed_model*.
+
+        Feeds `attribute.propose`'s `cluster_photos` argument. Task 12's
+        brief said to build this "from the store" without naming a method --
+        nothing needed a photo-level view of a cluster before proposal-
+        building did, so there was no existing accessor for it.
+        """
+        with self.lock:
+            rows = self._conn.execute(
+                """
+                SELECT cluster_id, sha256_b64url FROM faces
+                WHERE embed_model=? AND cluster_id IS NOT NULL
+                ORDER BY cluster_id, id
+                """,
+                (embed_model,),
+            ).fetchall()
+        out: dict[int, list[str]] = {}
+        for row in rows:
+            out.setdefault(row["cluster_id"], []).append(row["sha256_b64url"])
         return out
 
     # ------------------------------------------------------------------
@@ -489,15 +549,17 @@ class FaceStore:
             for p in proposals:
                 self._conn.execute(
                     """
-                    INSERT INTO proposals (cluster_id, name, support, total_tagged, score, proposed_at, decided, decided_at)
-                    VALUES (?,?,?,?,?,?,NULL,NULL)
+                    INSERT INTO proposals (cluster_id, name, support, total_tagged, score, untagged_photos, proposed_at, decided, decided_at)
+                    VALUES (?,?,?,?,?,?,?,NULL,NULL)
                     ON CONFLICT(cluster_id, name) DO UPDATE SET
-                        support      = excluded.support,
-                        total_tagged = excluded.total_tagged,
-                        score        = excluded.score,
-                        proposed_at  = excluded.proposed_at
+                        support         = excluded.support,
+                        total_tagged    = excluded.total_tagged,
+                        score           = excluded.score,
+                        untagged_photos = excluded.untagged_photos,
+                        proposed_at     = excluded.proposed_at
                     """,
-                    (p.cluster_id, normalize(p.name), p.support, p.total_tagged, p.score, now),
+                    (p.cluster_id, normalize(p.name), p.support, p.total_tagged, p.score,
+                     p.untagged_photos, now),
                 )
             self._conn.commit()
 
