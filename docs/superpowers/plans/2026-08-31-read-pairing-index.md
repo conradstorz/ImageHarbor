@@ -884,6 +884,22 @@ def test_an_uncovered_archive_falls_back_and_is_counted(
 `tests/test_takeout_index_reader.py`; import it from there rather than
 duplicating the SQL.
 
+**Three corrections found while implementing, recorded so a re-run does not
+repeat them:**
+
+- The ingest calls above must pass `write_sidecars=True`. Without it no JSON
+  sidecar is written at all and every assertion on its contents is vacuous.
+- `_read_sidecar` must EXCLUDE the provenance room, `.takeout-provenance/`.
+  That directory preserves raw Google sidecars verbatim under their original
+  mixed-case names, so a naive `rglob("*.json")` matches two files and the
+  helper's uniqueness assertion fires on the wrong one.
+- Match filenames case-INSENSITIVELY. `normalize_descriptor` lowercases every
+  organized filename, so a substring test for `"IMG_1-edited"` finds nothing.
+
+Also note `_pairing_for` cannot return a bare `pairing.Pairing`: the policy
+requires recording `pair_rule` in the provenance entry, and `Pairing` has no
+field for it. Return `tuple[pairing.Pairing, str]`.
+
 Read two neighbouring ingest tests before writing, and confirm `_read_sidecar`
 matches where sidecars are actually written — if `--no-sidecar` semantics or
 the sidecar's location differ from the assumption above, follow the code.
