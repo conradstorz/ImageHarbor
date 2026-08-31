@@ -324,24 +324,25 @@ class _Ingestor:
         self.pairing_index = pairing.build_index(all_members)
 
         # Every sidecar path claimed by some media member, across the whole
-        # batch. `pairing.sidecar_for` already returns None for a path that
-        # is itself sidecar-shaped, so this can run over every member path
-        # unfiltered -- no need to separate media from sidecars here. A
+        # batch. `pairing.sidecar_for` already returns a `Pairing` with
+        # `sidecar=None` for a path that is itself sidecar-shaped, so this can
+        # run over every member path unfiltered -- no need to separate media
+        # from sidecars here. A
         # failure for one member's path must not cost every OTHER member its
         # orphan/claimed determination, so each call is isolated -- mirrors
         # every other per-member try/except in this module.
         claimed: set[str] = set()
         for member_path in all_members:
             try:
-                sidecar = pairing.sidecar_for(member_path, self.pairing_index)
+                pairing_result = pairing.sidecar_for(member_path, self.pairing_index)
             except Exception as exc:
                 logger.warning(
                     "sidecar_for failed for %s during provenance indexing: %s",
                     member_path, exc, exc_info=True,
                 )
                 continue
-            if sidecar is not None:
-                claimed.add(sidecar)
+            if pairing_result.sidecar is not None:
+                claimed.add(pairing_result.sidecar)
         self._claimed_sidecars = frozenset(claimed)
 
         # SECOND PASS -- the late-sidecar case, and the reason the survey has
@@ -377,7 +378,7 @@ class _Ingestor:
                 # reason: none of them means "organized, but missing metadata".
                 and row["status"] in (_INGESTED, _DUPLICATE, _DEFERRED)
                 and not row["sidecar_path"]
-                and pairing.sidecar_for(row["member_path"], self.pairing_index) is not None
+                and pairing.sidecar_for(row["member_path"], self.pairing_index).sidecar is not None
             ]
             if stale:
                 self.stats.archives_reopened += 1
@@ -595,7 +596,8 @@ class _Ingestor:
         member = archive.MemberInfo(
             path=member_path, size=row["size"], crc32=row["crc32"], kind=row["kind"]
         )
-        sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
+        pairing_result = pairing.sidecar_for(member_path, self.pairing_index)
+        sidecar_member = pairing_result.sidecar
         sidecar_raw = self._read_sidecar_bytes(sidecar_member) if sidecar_member else None
         meta = (
             metadata.parse_photo_metadata(sidecar_raw)
@@ -757,7 +759,8 @@ class _Ingestor:
         """
         member_path = row["member_path"]
         try:
-            sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
+            pairing_result = pairing.sidecar_for(member_path, self.pairing_index)
+            sidecar_member = pairing_result.sidecar
             meta = self._read_sidecar(sidecar_member) if sidecar_member else metadata.EMPTY
             if sidecar_member is None:
                 self.stats.missing_metadata += 1

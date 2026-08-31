@@ -259,7 +259,7 @@ def _record_member(
     # sidecar (a .screen file's .json) unclaimed and reports it orphaned even
     # though its media is right there in the batch.
     if kind not in _NON_MEDIA_KINDS:
-        sidecar = pairing.sidecar_for(member.path, index)
+        sidecar = pairing.sidecar_for(member.path, index).sidecar
         if sidecar is not None:
             paired_sidecars.add(sidecar)
         # The descriptor tiers and media_without_sidecar stay scoped to media
