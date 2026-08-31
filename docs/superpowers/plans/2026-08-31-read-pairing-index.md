@@ -211,11 +211,15 @@ def test_case_insensitive_retry_keeps_the_underlying_confidence():
 
 
 def test_truncation_recovery_is_own():
-    # Rung 6 resolves a truncated spelling of THIS file's own name.
+    # Rung 6 resolves a truncated spelling of THIS file's own name. Google
+    # truncates the WHOLE name, not the stem with a full extension re-appended
+    # - build the fixture the way the module's existing rung-6 tests do, or
+    # the sidecar's media part is never a prefix of the media's basename and
+    # the rung never fires.
     long_stem = "A_very_long_original_filename_that_google_truncated"
     index = tf_pairing.build_index([
         f"T/GP/2019/{long_stem}.jpg",
-        f"T/GP/2019/{long_stem[:40]}.jpg.supplemental-metadata.json"])
+        f"T/GP/2019/{(long_stem + '.jpg')[:40]}.supplemental-metadata.json"])
     p = tf_pairing.sidecar_for(f"T/GP/2019/{long_stem}.jpg", index)
     assert p.confidence == tf_pairing.OWN
 
@@ -310,9 +314,13 @@ def sidecar_for(media_path: str, index: PairingIndex) -> Pairing:
 `build_index` also calls `_candidates` when populating `claimed`; update that
 call site to unpack the tuples. Read it before editing.
 
-Then update every `sidecar_for` call site in `ingest.py` — there are three
-(around lines 336, 760, and the image path). Each currently binds a `str | None`;
-each now binds a `Pairing` and reads `.sidecar`. Do not change behaviour in
+Then update every `sidecar_for` call site. There are FOUR, not three: three
+in `ingest.py` (around lines 336, 760, and the image path) and one in
+`imageharbor/takeout/survey.py` (around line 262). Grep for `sidecar_for(`
+across the package rather than trusting this list. Each currently binds a
+`str | None`; each now binds a `Pairing` and reads `.sidecar`. Missing the
+survey.py site turns its `is not None` / `is None` checks into silently
+always-true tests against a `Pairing` object. Do not change behaviour in
 this task beyond the type: confidence is threaded in Task 5.
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -356,12 +364,24 @@ def test_related_sidecar_has_a_source_name():
 
 
 def test_an_own_sidecar_upgrades_a_related_one():
-    assert tiers.better(tiers.DATE_EXTERNAL_SIDECAR, tiers.DATE_RELATED_SIDECAR)
-    assert not tiers.better(tiers.DATE_RELATED_SIDECAR, tiers.DATE_EXTERNAL_SIDECAR)
+    # The upgrade helper is `is_upgrade()`, NOT `better()`, and it takes
+    # TUPLES of (date_tier, descriptor_tier) rather than two bare ints. Read
+    # its real signature before writing this - the form below is illustrative.
+    assert tiers.is_upgrade(
+        (tiers.DATE_RELATED_SIDECAR, tiers.DESC_NONE),
+        (tiers.DATE_EXTERNAL_SIDECAR, tiers.DESC_NONE))
+    assert not tiers.is_upgrade(
+        (tiers.DATE_EXTERNAL_SIDECAR, tiers.DESC_NONE),
+        (tiers.DATE_RELATED_SIDECAR, tiers.DESC_NONE))
 ```
 
-Check `tests/test_tiers.py`'s existing import style and `better()`'s real
-signature before writing; match them.
+Check `tests/test_tiers.py`'s existing import style and `is_upgrade()`'s real
+signature and argument ORDER before writing; match them.
+
+**Expect collateral failures.** Adding a tier constant breaks any test that
+enumerates the ladder exhaustively — `tests/test_dashboard_stats.py` is known
+to. Those tests must be EXTENDED to include the new tier, never relaxed to
+stop checking exhaustively.
 
 - [ ] **Step 2: Run test to verify it fails**
 
