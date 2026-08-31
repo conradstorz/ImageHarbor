@@ -179,6 +179,24 @@ Enforced where the sidecar is parsed, not scattered through the pipeline.
 | `title` | **no** | the *original's* filename; would rename an edit after its parent |
 | `trashed` / `archived` / `from_partner` | yes | describe the underlying photo; both copies share its status |
 
+**Amended 2026-08-31 during planning, after reading how these values actually
+travel.** `latitude`/`longitude` are parsed into `TakeoutMetadata` but never
+reach `ExternalEvidence`, which carries only `date` and `original_name`. The
+coordinates exist in ImageHarbor only inside the raw Google JSON document that
+`_write_takeout_sidecar` stores verbatim under `provenance`. So the drop-list
+above applies to the values ImageHarbor **acts on**:
+
+- `ExternalEvidence.date` → kept, at tier 25
+- `ExternalEvidence.original_name` (Google `title`) → dropped
+- the `people` block → dropped
+
+The raw document itself is **kept, and labelled**. Deleting it would violate
+the project's preserve-everything discipline and destroy the audit trail; the
+provenance entry instead gains `"confidence"` and `"pair_rule"` keys, so the
+`geoData` inside `raw` is self-describing rather than silently authoritative.
+A consumer that reads coordinates out of a `related` provenance entry is then
+making a visible choice, not an accident.
+
 The rule and confidence are written into the append-only JSON sidecar
 alongside the date. A year from now the catalog must be able to answer "why
 does this photo have a date and no location?" without re-deriving anything,
