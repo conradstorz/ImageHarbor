@@ -48,6 +48,37 @@ def test_identical_landmarks_raise():
         align.similarity_transform(same, align.ARCFACE_TEMPLATE)
 
 
+def test_near_collinear_landmarks_raise():
+    # Reviewer-reported gap: points 1e-4 off a perfect line passed the old
+    # exact-rank check (np.linalg.matrix_rank's default tolerance is
+    # essentially machine precision) and produced a similarity transform
+    # with scale ~12.6 -- physically nonsensical for a face fit. The
+    # conditioning check must catch this near-degenerate case too.
+    near_collinear = np.array(
+        [[0.0, 0.0], [1.0, 1.0001], [2.0, 2.0], [3.0, 3.0001], [4.0, 4.0]]
+    )
+    with pytest.raises(align.DegenerateLandmarks):
+        align.similarity_transform(near_collinear, align.ARCFACE_TEMPLATE)
+
+
+def test_arcface_template_onto_itself_does_not_raise():
+    # Guard against over-rejection: the template is a perfectly typical
+    # frontal face and must never be flagged degenerate.
+    t = align.similarity_transform(align.ARCFACE_TEMPLATE, align.ARCFACE_TEMPLATE)
+    assert np.allclose(t, np.eye(3), atol=1e-6)
+
+
+def test_rotated_and_scaled_template_does_not_raise():
+    # Guard against over-rejection on realistic, well-conditioned geometry.
+    theta = np.deg2rad(30.0)
+    r = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    src = align.ARCFACE_TEMPLATE @ r.T * 2.0 + np.array([30.0, 40.0])
+    t = align.similarity_transform(src, align.ARCFACE_TEMPLATE)
+    homogeneous = np.hstack([src, np.ones((5, 1))])
+    mapped = (t @ homogeneous.T).T[:, :2]
+    assert np.allclose(mapped, align.ARCFACE_TEMPLATE, atol=1e-4)
+
+
 def test_align_crop_returns_the_requested_size():
     img = Image.new("RGB", (400, 400), (128, 64, 32))
     landmarks = [(150.0, 160.0), (250.0, 160.0), (200.0, 210.0), (160.0, 270.0), (240.0, 270.0)]

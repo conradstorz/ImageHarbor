@@ -31,12 +31,15 @@ ARCFACE_TEMPLATE = np.array(
 
 
 class DegenerateLandmarks(ValueError):
-    """Landmarks that cannot define a similarity transform.
+    """Landmarks that cannot define a stable similarity transform.
 
-    Collinear or coincident points make the estimate rank-deficient. Raising
-    here means the caller rejects that face, which is correct: a face whose
-    landmarks collapse to a line is not a usable face, and warping it anyway
-    produces a crop that embeds to noise.
+    Coincident points, and points that are exactly or *nearly* collinear,
+    leave the covariance matrix rank-deficient or so ill-conditioned that
+    the estimate is numerically unstable. Raising here means the caller
+    rejects that face, which is correct: a face whose landmarks collapse
+    toward a line is not a usable face, and warping it anyway produces a
+    crop that embeds to noise. See `similarity_transform` for how "nearly"
+    is measured and why.
     """
 
 
@@ -61,12 +64,48 @@ def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     cov = dst_demean.T @ src_demean / n
     u, s, vt = np.linalg.svd(cov)
 
-    if np.linalg.matrix_rank(cov) < 2:
-        raise DegenerateLandmarks("landmarks are collinear")
+    # `np.linalg.matrix_rank(cov) < 2` (the original check) only catches
+    # *exactly* rank-deficient input -- its default tolerance is essentially
+    # machine precision, so landmarks that are merely near-collinear (a real
+    # detector on an extreme profile, motion blur, or partial occlusion)
+    # sail through and produce a wild, physically nonsensical scale instead
+    # of a rejection. Test the conditioning of `cov` directly with the
+    # singular values `svd` already computed above, rather than paying for
+    # a second, redundant SVD inside matrix_rank.
+    #
+    # Measured smallest/largest singular-value ratios (see
+    # tests/faces/test_align.py and docs/superpowers/plans/
+    # 2026-08-31-face-recognition.md Task 5 for the full sweep):
+    #   - ArcFace template onto itself (typical frontal face):        0.63
+    #   - template + 1.5px detector jitter:                           0.62
+    #   - rotated/scaled template (existing regression cases):        0.63
+    #   - three-quarter profile, eyes/nose compressed toward one side: 0.40
+    #   - extreme near-edge-on profile (80% compression):             0.29
+    #   - reviewer's landmarks 1e-4 off a perfect line:            1.15e-6
+    #   - exactly collinear:                                       7.0e-17
+    # Realistic geometry -- including a hard profile -- never drops below
+    # ~0.2; the pathological near-collinear case sits around 1e-6, five to
+    # six orders of magnitude lower. 1e-3 sits comfortably in that gap: it
+    # is ~1000x above the pathological ratio and ~200x below the most
+    # extreme realistic one measured, so it rejects unstable fits without
+    # discarding usable faces.
+    # Guard the division: s[0] == 0 only if `cov` itself is the zero matrix
+    # (e.g. `dst` is coincident, since `src` coincidence is already excluded
+    # above), which is degenerate regardless of the ratio -- `0/0` is `nan`
+    # and `nan < 1e-3` is silently False, so this must be checked first
+    # rather than folded into the ratio comparison.
+    if s[0] < 1e-12 or s[-1] / s[0] < 1e-3:
+        raise DegenerateLandmarks("landmarks are collinear or too close to it")
 
     d = np.ones(2)
     if np.linalg.det(cov) < 0:
         d[1] = -1.0
+    # `sign(det(cov))` and `sign(det(u) * det(vt))` are always equal once
+    # the conditioning guard above has passed -- both encode the same
+    # reflection via the same (now well-conditioned) `cov`, so this branch
+    # currently never flips `d` a second time. Kept anyway: reflection
+    # handling here is subtle, and a future reader who loosens or removes
+    # the guard above may need this check to still be doing real work.
     if np.linalg.det(u) * np.linalg.det(vt) < 0:
         d[1] = -1.0
 
