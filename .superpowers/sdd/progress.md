@@ -314,3 +314,31 @@ Any future "pre-existing failure" claim must first confirm
   score 0.904, box (249,192,306,404) -- before and after.
   Pre-existing lint (5 F401s in sidecar.py, test_date_resolver.py, test_watcher.py) confirmed
   present with my changes stashed; left alone, not this branch's business.
+- Task 11: faces/runner.py (scan pass) — COMPLETE (b625a49..6bd5c23; 10 tests, suite 1013 passed/10 skipped without weights, 1022/1 with; review clean, NO Critical or Important)
+  THE BRIEF NAMED TWO APIS THAT DO NOT EXIST, both caught and corrected:
+  Catalog.record_photo -> Catalog.upsert, and the fictional
+  catalog.record_failure(digest, stage=...) -> the real
+  Catalog.record_file_failure(source_path, size, mtime_ns, error).
+  CROSS-CONTAMINATION WAS THE REVIEW'S CENTRAL QUESTION and it checks out clean for TWO
+  INDEPENDENT STRUCTURAL REASONS, traced through the real consumers rather than assumed:
+    - iter_unenriched's exclusion join requires failed_files.quarantined = 1, and the face
+      runner never calls quarantine_file, so its rows can never reach that state; and
+    - it requires a (source_path, size, mtime_ns) match against the `sources` table, which
+      holds ORIGINAL ingest paths, while face failures are keyed on the ORGANIZED copy --
+      a physically distinct tree.
+  Either alone would prevent a face failure from perturbing enrichment, _reconcile_poison,
+  or the breaker. circuit_breaker is not imported or called anywhere in runner.py.
+  THE IMPLEMENTER ADDED A GUARD THE BRIEF LACKED: nothing would have caught removal of
+  img.draft('RGB', (640,640)) before load(). That call does the downscale in the DCT domain
+  and skips most of the decode; decode, not inference, dominates this loop, and losing it
+  silently is a ~10x slowdown on a 77,000-photo pass with no test going red. Now spied on.
+  Reviewer independently reproduced 3 of the 4 mutations on the live checkout and matched
+  the report's exact assertion text and failure counts -- so the transcripts are genuine.
+  It skipped the fourth (silent exception swallow) as corroborated by pattern rather than
+  re-running it; noted here as the one claim taken on inference rather than reproduction.
+  Minor rolled up for final review: the "[faces] " marker in the error string is DECORATIVE
+  -- nothing filters on it -- and should say so in the module docstring so a later task does
+  not assume it is machine-read; record_file_failure's size/mtime staleness reset is inert
+  bookkeeping for content-addressed organized copies (fail_count accrues with no consumer);
+  _work_queue materializes catalog.iter_all() per scan() call, an accepted one-time O(n) at
+  ~77k photos.
