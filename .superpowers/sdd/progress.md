@@ -111,3 +111,34 @@ Any future "pre-existing failure" claim must first confirm
   two literals are valid each (Literal[...] would make a bad value a type error); get()
   hardcodes two registries, so a third model KIND would need it touched; test_models.py
   lacks `from __future__ import annotations` (plan-mandated, inert -- no PEP 604 syntax).
+- Task 4: faces/decode.py — COMPLETE (0176418..6f671f1; 9 tests, suite 921 passed/2 skipped; review clean after 1 fix round)
+  TWO REAL DEFECTS, both in the PLAN's hand-written draft, both found by the CONTROLLER
+  downloading the real 232 KB YuNet model and reading its signature instead of waiting
+  for Task 9 to do it. This is the single highest-value thing done in this run so far.
+    (1) OUTPUT ORDER. The real model is TYPE-MAJOR:
+        cls_8,cls_16,cls_32, obj_8,obj_16,obj_32, bbox_8..., kps_8...
+        The draft sliced outputs[si*4 : si*4+4], i.e. stride-major, so for stride 8 it
+        read (cls_8, cls_16, cls_32, obj_8) and treated cls_16 as objectness.
+    (2) BATCH AXIS. Real outputs are (1, N, C), not (N, C); `cls[:, 0]` on a
+        (1,6400,1) array yields shape (1,1), not (6400,).
+  THE TESTS PASSED ANYWAY, because the synthetic-tensor helper was built from the same
+  wrong assumption. Decoder and fixture agreed with each other and both were wrong --
+  precisely the trap flagged in the dispatch, and the reason the plan isolates this
+  module as pure. Fixed at 6f671f1: indexing derived from n_strides rather than magic
+  offsets, and _drop_batch squeezes a leading 1 while RAISING on batch>1 rather than
+  silently taking [0].
+  Reviewer went beyond the brief and earned it: re-derived the indexing by hand for
+  si=0,1,2; REPRODUCED THE ORIGINAL BUG against the real model (it crashes with
+  "operands could not be broadcast together with shapes (1,4) (1,10)" at stride 32, so
+  the old code failed loudly rather than silently); and ran the fixed decoder at
+  score_threshold=0.0 to confirm it emits 2233 low-confidence boxes (max ~0.0102) rather
+  than trivially returning [] -- which is what makes the blank-image test a real guard.
+  Plan corrected at source, including Task 9 Step 5, which had told a future implementer
+  to EXPECT the stride-major order. That would have re-taught the bug.
+  STILL UNPROVEN and deferred to Task 9 by design: box and landmark GEOMETRY is verified
+  only against synthetic arithmetic. Zero detections on a blank image is a weak signal --
+  a broken decoder would also return zero. Task 9's real-photograph test is the gate.
+  Minor rolled up for final review: _drop_batch's docstring still justifies accepting
+  bare 2-D input "so tests don't have to carry a batch axis", but the helper now always
+  builds 3-D, so nothing exercises that path and the stated why is no longer true;
+  the batch>1 ValueError path is untested.
