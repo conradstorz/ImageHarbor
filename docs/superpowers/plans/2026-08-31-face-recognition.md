@@ -1221,6 +1221,23 @@ def test_one_seed_name_may_produce_several_clusters():
     assert {c.seed_name for c in out} == {"Emma"}
 
 
+def test_seed_isolation_prevents_merging_different_people():
+    # The invariant this module exists for: two different people must never
+    # merge just because their embeddings are close. Phase A restricts each
+    # seed's comparisons to that seed's own clusters (`accumulators[start:]`);
+    # mutating that to search all accumulators would merge Judy into Emma's
+    # cluster here, since their embeddings are identical.
+    faces = [_fv(1, [1, 0, 0]), _fv(2, [1, 0, 0])]
+    seeds = [
+        cluster.Seed(name="Emma", face_ids=(1,)),
+        cluster.Seed(name="Judy", face_ids=(2,)),
+    ]
+    out = cluster.cluster_faces(faces, threshold=0.5, seeds=seeds)
+    assert len(out) == 2
+    by_name = {c.seed_name: c.face_ids for c in out}
+    assert by_name == {"Emma": (1,), "Judy": (2,)}
+
+
 def test_is_deterministic_for_the_same_input_order():
     faces = [_fv(i, [np.cos(i), np.sin(i), 0]) for i in range(20)]
     a = cluster.cluster_faces(faces, threshold=0.8)
@@ -1338,6 +1355,23 @@ def test_a_repeated_name_on_one_photo_counts_once():
     assert props[0].support == 2
 
 
+def test_duplicate_photo_digest_in_cluster_is_counted_once():
+    # cluster_photos carrying the same digest twice (e.g. a face detected
+    # twice on one photo) must not double-count that photo's evidence --
+    # dict.fromkeys() de-duplication is what makes support/total_tagged
+    # reflect distinct photos rather than raw entries.
+    props = attribute.propose(
+        {1: ["a", "a", "b"]},
+        {"a": ["Emma"], "b": ["Judy"]},
+        min_score=0.3,
+        min_support=1,
+    )
+    by_name = {p.name: p for p in props}
+    assert by_name["Emma"].support == 1
+    assert by_name["Emma"].total_tagged == 2
+    assert by_name["Judy"].total_tagged == 2
+
+
 def test_output_is_sorted_by_score_then_name():
     props = attribute.propose(
         {1: ["a", "b", "c", "d"]},
@@ -1404,6 +1438,46 @@ def test_is_deterministic_under_subsampling():
     a = calibrate.calibrate(anchors, max_anchors=50)
     b = calibrate.calibrate(anchors, max_anchors=50)
     assert a.threshold == b.threshold
+
+
+def _two_pair_anchors():
+    # Two same-name pairs (A at sim 0.9, B at sim 0.7) with zero similarity
+    # across names -- built in 4D so the A-pair and B-pair occupy disjoint
+    # subspaces and every cross pair is exactly 0.
+    return [
+        ("A", np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)),
+        ("A", np.array([0.9, np.sqrt(1 - 0.9**2), 0.0, 0.0], dtype=np.float32)),
+        ("B", np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)),
+        ("B", np.array([0.0, 0.0, 0.7, np.sqrt(1 - 0.7**2)], dtype=np.float32)),
+    ]
+
+
+def test_unreachable_target_precision_falls_back_to_best_recall():
+    # With this anchor set, precision is 1.0 across the whole threshold range
+    # up to 0.9 -- low thresholds keep both pairs (recall 1.0), high
+    # thresholds keep only the A-pair (recall 0.5). An unreachable
+    # target_precision forces the fallback; among tied-precision points it
+    # must pick the lowest threshold, matching the primary scan's own bias
+    # toward recall -- not the highest threshold, which is the worst point on
+    # the plateau.
+    result = calibrate.calibrate(_two_pair_anchors(), target_precision=1.5)
+    assert result.precision == pytest.approx(1.0)
+    assert result.recall == pytest.approx(1.0)
+
+
+def test_self_pairs_are_excluded_from_the_curve():
+    # A face compared to itself has similarity 1.0 and is trivially
+    # "same-name" -- including it (np.triu_indices with k=0 instead of k=1)
+    # inflates both precision and recall. Just above the B-pair's similarity
+    # (0.7), only the A-pair (0.9) remains a genuine same-name match: 1 of 2
+    # same-name pairs, so recall is 0.5. If self-pairs leaked in, the 4
+    # self-pairs (always selected, always "same") would push recall to
+    # 5/6 instead.
+    result = calibrate.calibrate(_two_pair_anchors(), target_precision=0.99)
+    point = next(c for c in result.curve if c[0] > 0.7)
+    _, precision, recall = point
+    assert precision == pytest.approx(1.0)
+    assert recall == pytest.approx(0.5)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1515,15 +1589,16 @@ def cluster_faces(
     by_id = {f.face_id: f for f in faces}
     accumulators: list[_Accumulator] = []
 
-    def _place(face: FaceVector, seed_name: str | None) -> None:
-        if accumulators:
-            centroids = np.stack([a.centroid for a in accumulators])
-            sims = centroids @ face.embedding
-            best = int(np.argmax(sims))
-            if float(sims[best]) >= threshold:
-                accumulators[best].add(face.face_id, face.embedding)
-                return
-        accumulators.append(_Accumulator(face.face_id, face.embedding, seed_name))
+    def _best_match(
+        candidates: list[_Accumulator], embedding: np.ndarray
+    ) -> _Accumulator | None:
+        """The candidate closest to `embedding`, if it clears `threshold`."""
+        if not candidates:
+            return None
+        centroids = np.stack([a.centroid for a in candidates])
+        sims = centroids @ embedding
+        best = int(np.argmax(sims))
+        return candidates[best] if float(sims[best]) >= threshold else None
 
     # Phase A: seeds, grouped by name so one name may yield several clusters.
     seeded: set[int] = set()
@@ -1536,20 +1611,21 @@ def cluster_faces(
             seeded.add(face_id)
             # Only compare against this seed's own clusters: two different
             # people must never be merged just because they look alike.
-            window = accumulators[start:]
-            if window:
-                sims = np.stack([a.centroid for a in window]) @ face.embedding
-                best = int(np.argmax(sims))
-                if float(sims[best]) >= threshold:
-                    window[best].add(face_id, face.embedding)
-                    continue
+            match = _best_match(accumulators[start:], face.embedding)
+            if match is not None:
+                match.add(face_id, face.embedding)
+                continue
             accumulators.append(_Accumulator(face_id, face.embedding, seed.name))
 
     # Phase B: everything else, in the caller's order.
     for face in faces:
         if face.face_id in seeded:
             continue
-        _place(face, None)
+        match = _best_match(accumulators, face.embedding)
+        if match is not None:
+            match.add(face.face_id, face.embedding)
+        else:
+            accumulators.append(_Accumulator(face.face_id, face.embedding, None))
 
     return [a.freeze() for a in accumulators]
 ```
@@ -1709,7 +1785,11 @@ def calibrate(
     if chosen is None:
         # Nothing reaches the target; return the most precise point measured so
         # the operator sees the real ceiling instead of a fabricated threshold.
-        best = max(curve, key=lambda c: (c[1], c[0]))
+        # Tie-break toward the *lowest* threshold, same as the primary scan
+        # above: among equally-precise points a lower threshold means strictly
+        # more recall, and the reverse tie-break would silently hand back the
+        # worst-recall point on a precision plateau.
+        best = max(curve, key=lambda c: (c[1], -c[0]))
         chosen = best
 
     return Calibration(

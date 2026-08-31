@@ -99,15 +99,16 @@ def cluster_faces(
     by_id = {f.face_id: f for f in faces}
     accumulators: list[_Accumulator] = []
 
-    def _place(face: FaceVector, seed_name: str | None) -> None:
-        if accumulators:
-            centroids = np.stack([a.centroid for a in accumulators])
-            sims = centroids @ face.embedding
-            best = int(np.argmax(sims))
-            if float(sims[best]) >= threshold:
-                accumulators[best].add(face.face_id, face.embedding)
-                return
-        accumulators.append(_Accumulator(face.face_id, face.embedding, seed_name))
+    def _best_match(
+        candidates: list[_Accumulator], embedding: np.ndarray
+    ) -> _Accumulator | None:
+        """The candidate closest to `embedding`, if it clears `threshold`."""
+        if not candidates:
+            return None
+        centroids = np.stack([a.centroid for a in candidates])
+        sims = centroids @ embedding
+        best = int(np.argmax(sims))
+        return candidates[best] if float(sims[best]) >= threshold else None
 
     # Phase A: seeds, grouped by name so one name may yield several clusters.
     seeded: set[int] = set()
@@ -120,19 +121,20 @@ def cluster_faces(
             seeded.add(face_id)
             # Only compare against this seed's own clusters: two different
             # people must never be merged just because they look alike.
-            window = accumulators[start:]
-            if window:
-                sims = np.stack([a.centroid for a in window]) @ face.embedding
-                best = int(np.argmax(sims))
-                if float(sims[best]) >= threshold:
-                    window[best].add(face_id, face.embedding)
-                    continue
+            match = _best_match(accumulators[start:], face.embedding)
+            if match is not None:
+                match.add(face_id, face.embedding)
+                continue
             accumulators.append(_Accumulator(face_id, face.embedding, seed.name))
 
     # Phase B: everything else, in the caller's order.
     for face in faces:
         if face.face_id in seeded:
             continue
-        _place(face, None)
+        match = _best_match(accumulators, face.embedding)
+        if match is not None:
+            match.add(face.face_id, face.embedding)
+        else:
+            accumulators.append(_Accumulator(face.face_id, face.embedding, None))
 
     return [a.freeze() for a in accumulators]

@@ -56,3 +56,43 @@ def test_is_deterministic_under_subsampling():
     a = calibrate.calibrate(anchors, max_anchors=50)
     b = calibrate.calibrate(anchors, max_anchors=50)
     assert a.threshold == b.threshold
+
+
+def _two_pair_anchors():
+    # Two same-name pairs (A at sim 0.9, B at sim 0.7) with zero similarity
+    # across names -- built in 4D so the A-pair and B-pair occupy disjoint
+    # subspaces and every cross pair is exactly 0.
+    return [
+        ("A", np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)),
+        ("A", np.array([0.9, np.sqrt(1 - 0.9**2), 0.0, 0.0], dtype=np.float32)),
+        ("B", np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)),
+        ("B", np.array([0.0, 0.0, 0.7, np.sqrt(1 - 0.7**2)], dtype=np.float32)),
+    ]
+
+
+def test_unreachable_target_precision_falls_back_to_best_recall():
+    # With this anchor set, precision is 1.0 across the whole threshold range
+    # up to 0.9 -- low thresholds keep both pairs (recall 1.0), high
+    # thresholds keep only the A-pair (recall 0.5). An unreachable
+    # target_precision forces the fallback; among tied-precision points it
+    # must pick the lowest threshold, matching the primary scan's own bias
+    # toward recall -- not the highest threshold, which is the worst point on
+    # the plateau.
+    result = calibrate.calibrate(_two_pair_anchors(), target_precision=1.5)
+    assert result.precision == pytest.approx(1.0)
+    assert result.recall == pytest.approx(1.0)
+
+
+def test_self_pairs_are_excluded_from_the_curve():
+    # A face compared to itself has similarity 1.0 and is trivially
+    # "same-name" -- including it (np.triu_indices with k=0 instead of k=1)
+    # inflates both precision and recall. Just above the B-pair's similarity
+    # (0.7), only the A-pair (0.9) remains a genuine same-name match: 1 of 2
+    # same-name pairs, so recall is 0.5. If self-pairs leaked in, the 4
+    # self-pairs (always selected, always "same") would push recall to
+    # 5/6 instead.
+    result = calibrate.calibrate(_two_pair_anchors(), target_precision=0.99)
+    point = next(c for c in result.curve if c[0] > 0.7)
+    _, precision, recall = point
+    assert precision == pytest.approx(1.0)
+    assert recall == pytest.approx(0.5)

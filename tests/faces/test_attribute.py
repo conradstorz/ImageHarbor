@@ -97,6 +97,23 @@ def test_a_repeated_name_on_one_photo_counts_once():
     assert props[0].support == 2
 
 
+def test_duplicate_photo_digest_in_cluster_is_counted_once():
+    # cluster_photos carrying the same digest twice (e.g. a face detected
+    # twice on one photo) must not double-count that photo's evidence --
+    # dict.fromkeys() de-duplication is what makes support/total_tagged
+    # reflect distinct photos rather than raw entries.
+    props = attribute.propose(
+        {1: ["a", "a", "b"]},
+        {"a": ["Emma"], "b": ["Judy"]},
+        min_score=0.3,
+        min_support=1,
+    )
+    by_name = {p.name: p for p in props}
+    assert by_name["Emma"].support == 1
+    assert by_name["Emma"].total_tagged == 2
+    assert by_name["Judy"].total_tagged == 2
+
+
 def test_output_is_sorted_by_score_then_name():
     props = attribute.propose(
         {1: ["a", "b", "c", "d"]},

@@ -76,7 +76,11 @@ def calibrate(
     if chosen is None:
         # Nothing reaches the target; return the most precise point measured so
         # the operator sees the real ceiling instead of a fabricated threshold.
-        best = max(curve, key=lambda c: (c[1], c[0]))
+        # Tie-break toward the *lowest* threshold, same as the primary scan
+        # above: among equally-precise points a lower threshold means strictly
+        # more recall, and the reverse tie-break would silently hand back the
+        # worst-recall point on a precision plateau.
+        best = max(curve, key=lambda c: (c[1], -c[0]))
         chosen = best
 
     return Calibration(

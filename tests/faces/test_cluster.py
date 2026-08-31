@@ -59,6 +59,23 @@ def test_one_seed_name_may_produce_several_clusters():
     assert {c.seed_name for c in out} == {"Emma"}
 
 
+def test_seed_isolation_prevents_merging_different_people():
+    # The invariant this module exists for: two different people must never
+    # merge just because their embeddings are close. Phase A restricts each
+    # seed's comparisons to that seed's own clusters (`accumulators[start:]`);
+    # mutating that to search all accumulators would merge Judy into Emma's
+    # cluster here, since their embeddings are identical.
+    faces = [_fv(1, [1, 0, 0]), _fv(2, [1, 0, 0])]
+    seeds = [
+        cluster.Seed(name="Emma", face_ids=(1,)),
+        cluster.Seed(name="Judy", face_ids=(2,)),
+    ]
+    out = cluster.cluster_faces(faces, threshold=0.5, seeds=seeds)
+    assert len(out) == 2
+    by_name = {c.seed_name: c.face_ids for c in out}
+    assert by_name == {"Emma": (1,), "Judy": (2,)}
+
+
 def test_is_deterministic_for_the_same_input_order():
     faces = [_fv(i, [np.cos(i), np.sin(i), 0]) for i in range(20)]
     a = cluster.cluster_faces(faces, threshold=0.8)
