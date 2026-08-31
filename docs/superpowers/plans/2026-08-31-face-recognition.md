@@ -19,6 +19,7 @@
 - **Name identity is exact.** No fuzzy, similarity, or case-insensitive name merging, ever. `Conrad Storz` and `Conrad Storz III` are different people.
 - **Embeddings are L2-normalized where they are produced.**
 - **Every bug fix ships with a regression test.**
+- **Preprocessing is contract-tested, not inferred.** `imageharbor/faces/preprocess.py` holds `build_blob(images, info)`, the single pure preprocessing path shared by `detect` and `embed`. `tests/faces/test_preprocess.py` asserts channel order, mean, std, NCHW layout *and its axis semantics*, and per-row batching element-wise against what `models.py` declares, reading expectations from the registry at run time. It needs no weights and runs in the default suite. A wrong channel order does not raise — it returns plausible embeddings that are quietly worse — so never replace this with a threshold on measured embedding similarity: those numbers drift, and the first flaky failure gets the bound loosened rather than the bug found.
 - Runtime deps go in `pyproject.toml` under a new `faces` extra. Adding one needs a strong reason. **Do not add OpenCV** — see the Task 9 risk note for the sanctioned fallback.
 - ImageHarbor is **AGPL-3.0-or-later**. Only `imageharbor/__init__.py` carries a per-file licence notice; new modules follow the existing convention and do not. Any code adapted from another AGPL project (PhotoPrism, Immich) MUST carry a header naming the upstream project, file, and licence.
 - Python floor is `>=3.10`. Use `from __future__ import annotations` in every new module.
