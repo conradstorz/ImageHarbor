@@ -238,3 +238,30 @@ Any future "pre-existing failure" claim must first confirm
   Minor rolled up: split()'s local _centroid duplicates cluster._Accumulator.centroid math
   (left deliberately -- _Accumulator is private and reaching into it would be worse);
   split() has no test coverage in this task.
+- Task 8: sidecar contract — COMPLETE (66c1898..83c0b19; suite 987 passed/2 skipped; review by controller inspection + mutation)
+  KEYED_LISTS["people"] widened to ("name","source") so Google's tag and a confirmed face
+  cluster coexist instead of the second superseding the first's `source` into history as
+  though they conflicted. No migration needed: every entry ever written already carries a
+  source, so the wider key resolves existing entries unchanged (tested).
+  THEN THE REAL DEFECT, flagged by the implementer and confirmed by the controller with a
+  direct reproduction: _ANNOTATION_FIELDS DID NOT GOVERN KEYED LISTS AT ALL.
+  _merge_keyed_list -- the path people/sources/albums/provenance all use -- never consulted
+  _ANNOTATION_FIELDS or _core(); that machinery only gated _merge_tiered/_merge_versioned.
+  So registering `confirmed_at` there, which CLAUDE.md demands in its bluntest language,
+  WAS A NO-OP for this list. Measured: merging one people entry 5 times with only
+  confirmed_at differing produced 4 history entries -- one per merge, forever. And
+  propagate_sidecars (Task 12) stamps a fresh confirmed_at every run, so it is a live path.
+  This is the exact Critical bug CLAUDE.md says already shipped once here, reachable by a
+  different route than the one the warning describes.
+  Fixed: _merge_keyed_list now treats every _ANNOTATION_FIELDS member the way it already
+  treated last_seen -- advance the value, do not relocate the old one -- so the registry
+  means the same thing in all three merge paths, which is what a reader of CLAUDE.md would
+  reasonably assume it already did.
+  NOT A PRE-EXISTING BUG IN SHIPPED CODE. I suspected it might be; it is not. Every current
+  keyed-list writer (pipeline._source_entry, takeout/ingest.py) emits only first_seen and
+  last_seen as annotation-shaped fields, and both were already special-cased. confirmed_at
+  is written nowhere yet. The defect was dormant and introduced by this branch.
+  Controller verified both directions: annotation field -> 0 history entries after 5 merges;
+  non-annotation field (cluster_ids) still relocates its old value, so the fix did not
+  over-reach. The property test test_never_loses_a_value_over_a_random_merge_sequence
+  passes untouched -- it was the safety net and was never edited.
