@@ -291,3 +291,26 @@ Any future "pre-existing failure" claim must first confirm
   Both checksum guards (mismatch, and missing pin) mutated individually; each caused its
   test to fail. detect.py imports onnxruntime lazily inside __init__, so importing the
   module never requires the optional extra.
+- Task 10: faces/embed.py (+ preprocess.py) — COMPLETE (0dfa054..8608f9e; suite 1012 passed/1 skipped with weights, 1003/10 without)
+  NOTE: the review subagent for this task DIED mid-run on an account spend limit, leaving
+  the tree clean and nothing committed. The fix below was done by the controller inline.
+  THE HOLE models.py EXISTS TO PREVENT WAS ITSELF UNGUARDED. Task 10's own mutation testing
+  found that feeding BGR to the RGB-declared AuraFace model PASSES EVERY TEST. Degradation
+  was real but sub-threshold: blank-similarity nearly tripled (0.038 -> 0.090) and the
+  correct-vs-misaligned gap shrank ~30%, and no assertion moved. models.py's docstring names
+  this exact failure -- loads, runs, quietly worse, surfacing later as bad clusters.
+  Deliberately NOT fixed with a similarity threshold: those numbers depend on fixture and
+  model, they drift, and the first contributor to hit a flaky bound loosens it.
+  Instead build_blob was extracted to a pure module (also removing the preprocessing
+  DUPLICATED between detect.py and embed.py) and the contract is asserted element-wise
+  against what models.py declares -- channel order, mean, std, NCHW layout AND its axis
+  semantics (a (1,3,H,W) array can have the right shape and the wrong axis meaning), and
+  per-row batching. Expectations are read from the registry at run time, so changing the
+  registry and forgetting the implementation is what fails; a correct registry change does
+  not require editing tests. 12 tests, NO WEIGHTS NEEDED, so they run in the default suite.
+  All four mutations confirmed caught: drop the BGR swap (2 failed), wrong std (5 failed),
+  NHWC instead of NCHW (8 failed), reversed batch rows (3 failed).
+  Refactor verified behaviour-preserving: detection on the fixture is BIT-IDENTICAL --
+  score 0.904, box (249,192,306,404) -- before and after.
+  Pre-existing lint (5 F401s in sidecar.py, test_date_resolver.py, test_watcher.py) confirmed
+  present with my changes stashed; left alone, not this branch's business.
