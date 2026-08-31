@@ -171,3 +171,33 @@ Any future "pre-existing failure" claim must first confirm
   unreachable-as-distinct (given the rank guard, sign(det(cov)) always agrees with it);
   kept deliberately with a comment rather than deleted, since reflection handling is
   subtle and the guard could change.
+- Task 6: cluster.py + attribute.py + calibrate.py — COMPLETE (7de5c56..729e193; 28 tests, suite 960 passed/2 skipped; review clean after 1 fix round)
+  *** MILESTONE A COMPLETE: the entire pure core, tested with zero model weights and no DB.
+  EVERY DEFECT IN THIS TASK WAS FOUND BY MUTATION TESTING, not by reading. 24 tests passed
+  against code with two real holes in it. This is the technique that worked; keep using it.
+    (1) SEED ISOLATION HAD NO TEST AT ALL. cluster.py Phase A restricts each seed's
+        comparisons to its own clusters via `accumulators[start:]`. Mutating that to
+        `accumulators` left all 9 cluster tests GREEN while silently merging two different
+        people whose embeddings are close -- the exact thing domain rule 2 forbids. The
+        shipped suite only ever used ONE seed, so isolation BETWEEN seeds was unexercised.
+        Implementation was correct; the guard was missing. Controller independently
+        re-verified: mutation now fails test_seed_isolation_prevents_merging_different_people,
+        restore passes, two look-alike people stay in separate clusters.
+    (2) CALIBRATE FALLBACK TIE-BREAK WAS BACKWARDS (real bug in the plan's code).
+        The primary scan takes the LOWEST threshold reaching target precision, favouring
+        recall. The fallback did `max(curve, key=(precision, threshold))` -- among ties it
+        took the HIGHEST threshold, i.e. the WORST recall, contradicting the module's own
+        docstring. Demonstrated on a precision-1.0 plateau spanning ~0.0003..0.8999 where
+        the code returned recall 0.5 instead of 1.0. Fixed to (precision, -threshold).
+        The fallback branch was DEAD CODE as far as the suite was concerned -- the shipped
+        anchors are separable enough that the primary path always succeeded.
+    (3) and (4) Two more correct-but-unguarded lines: calibrate's triu k=1 self-pair
+        exclusion (self-pairs are sim 1.0 and always same-name, so counting them inflates
+        precision and biases the threshold), and attribute's dict.fromkeys photo dedup.
+        Both now have tests confirmed failing against their mutation.
+  _best_match(candidates, embedding) helper extracted; the seed-isolation slice stays the
+  single visible line at the call site rather than buried in a duplicated argmax block.
+  Implementer also fixed a genuine bug in the PLAN's own test fixture: _anchors() hardcoded
+  an 8-dim basis while a test passed 10 names.
+  Minor rolled up: MixedModelError is (ValueError) where the brief's table said (Exception)
+  -- ValueError is the better choice and pytest.raises matches either; left as shipped.
