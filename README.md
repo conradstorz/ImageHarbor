@@ -102,3 +102,20 @@ Run `imageharbor --help` (or `<command> --help`) for the full flag list.
   the design behind the facts/enrichment split and the tier system.
 - [`docs/deploy-docker.md`](docs/deploy-docker.md) — running ImageHarbor as a
   continuous Docker watcher against a NAS and a self-hosted AI server.
+
+## Licence
+
+Copyright (C) 2026 Conrad Storz. Released under the
+[GNU Affero General Public License v3.0 or later](LICENSE).
+
+Free to use, study, modify and share. Two conditions come with that:
+
+- **Credit stays with the work.** Copyright and licence notices must be
+  preserved in any copy or derivative.
+- **Derivatives stay free.** Anyone who distributes a modified version — or
+  runs one as a network service that other people use, which the operational
+  dashboard makes easy to do — must publish its source under the same
+  licence. Nobody can take this closed and sell it as their own product.
+
+Using it on your own photo library, personally or at work, needs no
+permission.
