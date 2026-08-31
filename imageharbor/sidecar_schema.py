@@ -36,7 +36,14 @@ VERSIONED_BLOCKS: tuple[str, ...] = ("classification",)
 KEYED_LISTS: dict[str, tuple[str, ...]] = {
     "sources": ("path",),
     "albums": ("archive_id", "folder"),
-    "people": ("name",),
+    # Keyed on (name, source), not name alone. Google tagging "Suzanne Storz"
+    # and a confirmed face cluster identifying her are two true facts about the
+    # same photo, from different evidence. Under a name-only key the second
+    # would supersede the first's `source` and relocate it to history --
+    # recording them as if they conflicted. No migration is needed: every entry
+    # ever written already carries a `source`, so the wider key resolves them
+    # unchanged.
+    "people": ("name", "source"),
     "provenance": ("digest",),
 }
 
@@ -56,6 +63,7 @@ FLAT_MAP_HISTORY_KEYS: dict[str, str] = {"exif": "exif_history", "identity": "id
 # new annotation safe; forgetting to is how unbounded growth gets reintroduced.
 _ANNOTATION_FIELDS = frozenset({
     "observed_at", "superseded_at", "first_seen", "last_seen", "rejected", "history",
+    "confirmed_at",
 })
 
 
