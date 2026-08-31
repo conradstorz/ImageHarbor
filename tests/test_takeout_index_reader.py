@@ -11,6 +11,13 @@ import pytest
 
 from imageharbor.takeout import index_reader
 
+# Fixed archive tuple used by the "covered archive" fixtures below: a name,
+# a size and mtime matching stats_for()'s defaults, a member count, and no
+# error.
+_ARCHIVE_1_COVERED = ("part-1.zip", 100, 5, 2, None)
+_ARCHIVE_2_COVERED = ("part-2.zip", 100, 5, 1, None)
+_ARCHIVE_2_UNCOVERED = ("part-2.zip", 999, 5, 1, None)
+
 
 SCHEMA = """
 CREATE TABLE sidecar (
@@ -131,3 +138,66 @@ def test_a_non_database_file_is_unusable(tmp_path):
     bad.write_bytes(b"this is not a database")
     with pytest.raises(index_reader.IndexUnusable):
         index_reader.IndexPairings.open(bad, {})
+
+
+def test_open_percent_encodes_a_hash_in_the_path(tmp_path):
+    # '#' starts a URI fragment; a bare f-string interpolation truncates the
+    # connect URI there and SQLite opens a different (nonexistent) path --
+    # surfacing as a misleading "no index_meta table" IndexUnusable for a
+    # perfectly good file. A directory name containing '#' is legal on both
+    # Windows and POSIX.
+    special_dir = tmp_path / "has#hash"
+    special_dir.mkdir()
+    db = make_index(
+        special_dir / "i.sqlite",
+        sidecars=[(1, "part-1.zip", "T/GP/a.jpg.json", "a.jpg.json")],
+        media=[("part-1.zip", "T/GP/a.jpg", "GP", "GP", "a.jpg", 1, "exact", "own")])
+    idx = index_reader.IndexPairings.open(db, {"part-1.zip": stats_for()})
+    p = idx.sidecar_for("T/GP/a.jpg")
+    assert p.sidecar == "T/GP/a.jpg.json"
+    assert p.confidence == "own"
+    assert p.rule == "exact"
+
+
+def test_uncovered_archive_does_not_leak_its_pairings(tmp_path):
+    # `_read_pairings` filters on `m_archive not in covered` -- the guard
+    # stopping a stale index from supplying pairings for an archive that
+    # failed verification. This exercises both sides of that guard directly.
+    db = make_index(
+        tmp_path / "i.sqlite",
+        archives=(_ARCHIVE_1_COVERED, _ARCHIVE_2_UNCOVERED),
+        sidecars=[(1, "part-1.zip", "T/GP/a.jpg.json", "a.jpg.json")],
+        media=[
+            ("part-1.zip", "T/GP/a.jpg", "GP", "GP", "a.jpg", 1, "exact", "own"),
+            ("part-2.zip", "T/GP/b.jpg", "GP", "GP", "b.jpg", None, "orphan", "none"),
+        ])
+    idx = index_reader.IndexPairings.open(
+        db, {"part-1.zip": stats_for(), "part-2.zip": stats_for()})
+    assert idx.covers("part-1.zip")
+    assert not idx.covers("part-2.zip")
+    assert idx.sidecar_for("T/GP/a.jpg") is not None
+    assert idx.sidecar_for("T/GP/b.jpg") is None
+
+
+def test_member_path_shared_by_two_covered_archives_is_excluded(tmp_path):
+    # Mirrors `pairing.py`'s `PairingIndex.ambiguous_media`: a member path
+    # keyed with no archive dimension can't tell two archives sharing that
+    # path apart, so pairing either one risks dating one archive's bytes
+    # with another archive's sidecar. The index reader must refuse this too,
+    # not just the module it stands in for.
+    db = make_index(
+        tmp_path / "i.sqlite",
+        archives=(_ARCHIVE_1_COVERED, _ARCHIVE_2_COVERED),
+        sidecars=[
+            (1, "part-1.zip", "T/GP/a.jpg.json", "a.jpg.json"),
+            (2, "part-2.zip", "T/GP/a2.jpg.json", "a2.jpg.json"),
+        ],
+        media=[
+            ("part-1.zip", "T/GP/a.jpg", "GP", "GP", "a.jpg", 1, "exact", "own"),
+            ("part-2.zip", "T/GP/a.jpg", "GP", "GP", "a.jpg", 2, "exact", "own"),
+        ])
+    idx = index_reader.IndexPairings.open(
+        db, {"part-1.zip": stats_for(), "part-2.zip": stats_for()})
+    assert idx.covers("part-1.zip")
+    assert idx.covers("part-2.zip")
+    assert idx.sidecar_for("T/GP/a.jpg") is None

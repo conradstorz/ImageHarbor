@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -66,8 +67,17 @@ class IndexPairings:
         path = Path(path)
         if not path.is_file():
             raise IndexUnusable(f"no index at {path}")
+        # SQLite URI filenames treat '%', '?' and '#' specially (percent-
+        # escape, query start, fragment start). A bare f-string interpolation
+        # truncates the path at the first '?' or '#' -- legal in a directory
+        # name on both Windows and POSIX -- and SQLite then opens a
+        # different (nonexistent) path, surfacing as a misleading "no
+        # index_meta table" error for a perfectly good file. `/`, `\\` and
+        # `:` are kept unescaped so a Windows drive letter and both path
+        # separator styles still resolve.
+        encoded = urllib.parse.quote(str(path), safe="/\\:")
         try:
-            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            con = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
         except sqlite3.Error as exc:
             raise IndexUnusable(f"cannot open {path}: {exc}") from exc
         try:
@@ -138,12 +148,27 @@ class IndexPairings:
     def _read_pairings(
         con: sqlite3.Connection, covered: set[str],
     ) -> dict[str, IndexedPairing]:
-        out: dict[str, IndexedPairing] = {}
+        rows: list[tuple[str, str | None, str, str]] = []
+        counts: dict[str, int] = {}
         for m_path, m_archive, s_path, rule, confidence in con.execute(
             "SELECT m.path, m.archive, s.path, m.rule, m.confidence"
             " FROM media m LEFT JOIN sidecar s ON s.id = m.sidecar_id"
         ):
             if m_archive not in covered:
+                continue
+            rows.append((m_path, s_path, rule, confidence))
+            counts[m_path] = counts.get(m_path, 0) + 1
+        # A member path present in more than one COVERED archive is
+        # indistinguishable here, for the same reason `pairing.py`'s
+        # `ambiguous_media` refuses to pair one: this index is keyed on bare
+        # member paths with no archive dimension, so two archives sharing a
+        # path cannot be told apart, and guessing risks dating one archive's
+        # bytes with another archive's sidecar. Excluded entirely, so
+        # `sidecar_for` returns None and the caller falls back to
+        # `pairing.py` (which applies the identical refusal there).
+        out: dict[str, IndexedPairing] = {}
+        for m_path, s_path, rule, confidence in rows:
+            if counts[m_path] > 1:
                 continue
             out[m_path] = IndexedPairing(
                 sidecar=s_path, confidence=confidence, rule=rule)
