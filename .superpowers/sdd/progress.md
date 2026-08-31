@@ -265,3 +265,29 @@ Any future "pre-existing failure" claim must first confirm
   non-annotation field (cluster_ids) still relocates its old value, so the fix did not
   over-reach. The property test test_never_loses_a_value_over_a_random_merge_sequence
   passes untouched -- it was the safety net and was never edited.
+- Task 9: download.py + detect.py — COMPLETE (83c0b19..8781830; suite 995 passed/1 skipped with weights, 991/5 without; review by controller inspection + mutation)
+  *** THE RISK TASK IS CLEARED. The decoder is now proven, not merely un-crashing.
+  Both checksums PINNED FROM REAL DOWNLOADS, never fabricated, and re-verified by the
+  controller through download.ensure itself:
+      yunet     8f2383e4...  232,589 bytes
+      auraface  a7933ea5...  260,694,151 bytes
+  POSITIVE CONTROL SOLVED WITHOUT A REAL PERSON'S PHOTO. Everything before this proved only
+  that the decoder does not crash and returns nothing on a blank image -- but a BROKEN
+  decoder returns nothing on a blank image too. The implementer was forbidden from
+  downloading any real face (committing an identifiable stranger to this repo is not ours
+  to decide) and told to try a synthetic one, escalating rather than improvising if it
+  failed. A drawn Pillow face was detected FIRST TRY at score 0.904; all 5 variants scored
+  0.71-0.90, so no threshold tuning was needed -- tuning until something appears is exactly
+  how a wrong decoder ships looking right.
+  Controller independently re-ran the detector on the committed fixture and checked the
+  geometry is anatomically coherent rather than merely present:
+      box (249,192,306,404), area 0.194 of an 800x800 image
+      eyes (337,349) and (473,350)  -- level, 136 px apart
+      nose (407,432)                -- centred between the eyes (midpoint 405), below them
+      mouth (344,490) and (457,490) -- level, below the nose, narrower than the eyes
+  Also viewed the image to confirm it is a drawn illustration, not a photograph.
+  This fixture is licence-free, privacy-free, and deterministic, so the test reproduces for
+  anyone who clones the repo. Better than a real photo would have been.
+  Both checksum guards (mismatch, and missing pin) mutated individually; each caused its
+  test to fail. detect.py imports onnxruntime lazily inside __init__, so importing the
+  module never requires the optional extra.
