@@ -584,27 +584,35 @@ def test_nms_on_empty_input():
 def _synthetic_outputs(size=(640, 640), hot=None):
     """Build YuNet-shaped outputs with at most one confident cell.
 
-    YuNet emits, per stride in (8, 16, 32): cls (N,1), obj (N,1), bbox (N,4)
-    and kps (N,10), where N = (size/stride)**2 in row-major order.
+    Mirrors the real exported graph exactly (confirmed by inspecting the real
+    ONNX artifact with onnxruntime, Task 4 fix round 1): twelve tensors,
+    type-major then stride-major -- all three `cls_{8,16,32}`, then all three
+    `obj`, then all three `bbox`, then all three `kps` -- each shaped
+    `(1, N, C)` with a leading batch axis of 1, where N = (size/stride)**2 in
+    row-major order.
     """
-    out = []
-    for stride in (8, 16, 32):
+    strides = (8, 16, 32)
+    cls_out, obj_out, bbox_out, kps_out = [], [], [], []
+    for stride in strides:
         gw, gh = size[0] // stride, size[1] // stride
         n = gw * gh
-        cls = np.zeros((n, 1), dtype=np.float32)
-        obj = np.zeros((n, 1), dtype=np.float32)
-        bbox = np.zeros((n, 4), dtype=np.float32)
-        kps = np.zeros((n, 10), dtype=np.float32)
+        cls = np.zeros((1, n, 1), dtype=np.float32)
+        obj = np.zeros((1, n, 1), dtype=np.float32)
+        bbox = np.zeros((1, n, 4), dtype=np.float32)
+        kps = np.zeros((1, n, 10), dtype=np.float32)
         if hot is not None and hot[0] == stride:
             idx = hot[1]
-            cls[idx, 0] = 1.0
-            obj[idx, 0] = 1.0
+            cls[0, idx, 0] = 1.0
+            obj[0, idx, 0] = 1.0
             # bbox is (dx, dy, log-w, log-h) relative to the cell, in strides.
-            bbox[idx] = [0.0, 0.0, np.log(4.0), np.log(4.0)]
+            bbox[0, idx] = [0.0, 0.0, np.log(4.0), np.log(4.0)]
             # Five landmarks, all offset one stride right and down of the cell.
-            kps[idx] = [1.0, 1.0] * 5
-        out.extend([cls, obj, bbox, kps])
-    return out
+            kps[0, idx] = [1.0, 1.0] * 5
+        cls_out.append(cls)
+        obj_out.append(obj)
+        bbox_out.append(bbox)
+        kps_out.append(kps)
+    return cls_out + obj_out + bbox_out + kps_out
 
 
 def test_decode_returns_nothing_when_every_score_is_zero():
@@ -631,7 +639,7 @@ def test_decode_places_a_detection_at_the_hot_cell():
 
 def test_decode_respects_the_score_threshold():
     outs = _synthetic_outputs(hot=(8, 81))
-    outs[0][81, 0] = 0.1  # cls for stride 8 -> score becomes sqrt(0.1 * 1.0)
+    outs[0][0, 81, 0] = 0.1  # cls for stride 8 -> score becomes sqrt(0.1 * 1.0)
     assert decode.decode_yunet(outs, (640, 640), 0.9, 0.3) == []
     assert len(decode.decode_yunet(outs, (640, 640), 0.2, 0.3)) == 1
 
@@ -645,12 +653,27 @@ def test_decode_is_deterministic():
     ]
 ```
 
+A ninth test, `test_decode_yunet_against_the_real_model_on_a_blank_image`, runs the
+real ONNX artifact through `decode_yunet` when `IMAGEHARBOR_FACE_MODEL_DIR` is
+set, and `pytest.skip`s otherwise -- this is what actually proves the layout
+above matches the exported graph rather than a second hand-written guess at it.
+See `tests/faces/test_decode.py` for the current version.
+
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/faces/test_decode.py -v`
 Expected: FAIL with `ImportError: cannot import name 'decode'`
 
 - [ ] **Step 3: Write minimal implementation**
+
+**Update (Task 4 fix round 1, verified against the real artifact):** the draft
+below originally assumed the twelve outputs were grouped stride-major -- one
+`(cls, obj, bbox, kps)` per stride. Inspecting the real exported graph with
+onnxruntime showed the opposite: outputs are grouped **type-major**, all three
+`cls` tensors first, then all three `obj`, then all three `bbox`, then all
+three `kps`, each block ordered by stride. Each tensor also carries a leading
+batch axis -- `(1, N, C)`, not `(N, C)`. The code below is already corrected;
+do not reintroduce `outputs[si * 4 : si * 4 + 4]` or assume 2-D outputs.
 
 ```python
 """Decode YuNet's raw ONNX outputs into detections. Pure: no I/O, no session.
@@ -659,16 +682,21 @@ This is the fiddliest logic in the face pipeline, so it lives here, separated
 from the ONNX session in `detect.py`, and is tested against synthetic tensors
 with no model present.
 
-YuNet emits four tensors per stride in (8, 16, 32), each with one row per grid
-cell in row-major order:
+YuNet emits twelve output tensors, grouped by *type* first and *stride* second
+-- all three `cls`, then all three `obj`, then all three `bbox`, then all three
+`kps`, each group ordered by stride (8, 16, 32) -- not grouped by stride with
+one of each type per group. Verified against the real exported graph with
+onnxruntime; a stride-major reading silently treats `cls_16` as objectness and
+`cls_32` as a bbox regressor. Each tensor carries a leading batch axis:
 
-    cls  (N, 1)   classification logit, already sigmoid-ed by the graph
-    obj  (N, 1)   objectness, already sigmoid-ed
-    bbox (N, 4)   (dx, dy, log w, log h), offsets in stride units
-    kps  (N, 10)  five (dx, dy) landmark offsets, in stride units
+    cls  (1, N, 1)   classification logit, already sigmoid-ed by the graph
+    obj  (1, N, 1)   objectness, already sigmoid-ed
+    bbox (1, N, 4)   (dx, dy, log w, log h), offsets in stride units
+    kps  (1, N, 10)  five (dx, dy) landmark offsets, in stride units
 
-The confidence of a cell is ``sqrt(cls * obj)`` -- the geometric mean, which is
-what the reference implementation uses.
+where N is one row per grid cell in row-major order. The confidence of a cell
+is ``sqrt(cls * obj)`` -- the geometric mean, which is what the reference
+implementation uses.
 """
 
 from __future__ import annotations
@@ -725,6 +753,20 @@ def nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> list[int]:
     return keep
 
 
+def _drop_batch(arr: np.ndarray) -> np.ndarray:
+    """Squeeze YuNet's leading batch axis, if present.
+
+    The real graph always emits `(1, N, C)`. `(N, C)` is also accepted, on
+    purpose, so hand-built synthetic tensors in tests don't have to carry a
+    batch axis they get nothing from -- both shapes mean "one image."
+    """
+    if arr.ndim == 3:
+        if arr.shape[0] != 1:
+            raise ValueError(f"decode_yunet only supports batch size 1, got {arr.shape[0]}")
+        return arr[0]
+    return arr
+
+
 def decode_yunet(
     outputs: Sequence[np.ndarray],
     input_size: tuple[int, int],
@@ -737,8 +779,14 @@ def decode_yunet(
     scores: list[np.ndarray] = []
     kps: list[np.ndarray] = []
 
+    n_strides = len(STRIDES)
     for si, stride in enumerate(STRIDES):
-        cls, obj, bbox, kp = outputs[si * 4 : si * 4 + 4]
+        # Type-major layout: all `cls`, then all `obj`, then all `bbox`, then
+        # all `kps`, each block ordered by stride -- see module docstring.
+        cls = _drop_batch(outputs[0 * n_strides + si])
+        obj = _drop_batch(outputs[1 * n_strides + si])
+        bbox = _drop_batch(outputs[2 * n_strides + si])
+        kp = _drop_batch(outputs[3 * n_strides + si])
         gw, gh = width // stride, height // stride
 
         # Cell centres in row-major order, matching the graph's flattening.
@@ -790,7 +838,9 @@ def decode_yunet(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/faces/test_decode.py -v`
-Expected: PASS, 8 tests
+Expected: PASS, 9 tests (8 synthetic-tensor tests, plus one real-model
+integration test that runs when `IMAGEHARBOR_FACE_MODEL_DIR` is set and the
+weights are present, and `pytest.skip`s otherwise).
 
 - [ ] **Step 5: Commit**
 
@@ -2176,7 +2226,28 @@ print('outputs:', [(o.name, o.shape) for o in s.get_outputs()])
 "
 ```
 
-Expected: one input of shape `[1, 3, H, W]`, and twelve outputs — `cls_8, obj_8, bbox_8, kps_8, cls_16, ...`. **If the order or grouping differs, reorder the slice in `decode.decode_yunet` to match, and add a test asserting the order you observed.** The decoder indexes outputs positionally; a different export order silently decodes garbage.
+**Verified fact (Task 4 fix round 1, run against the real artifact):** one
+input `input [1, 3, 640, 640]`, and twelve outputs in **type-major** order --
+all three `cls` tensors, then all three `obj`, then all three `bbox`, then all
+three `kps`, each block ordered by stride (8, 16, 32) --
+
+```
+cls_8 [1, 6400, 1]   cls_16 [1, 1600, 1]   cls_32 [1, 400, 1]
+obj_8 [1, 6400, 1]   obj_16 [1, 1600, 1]   obj_32 [1, 400, 1]
+bbox_8 [1, 6400, 4]  bbox_16 [1, 1600, 4]  bbox_32 [1, 400, 4]
+kps_8 [1, 6400, 10]  kps_16 [1, 1600, 10]  kps_32 [1, 400, 10]
+```
+
+**not** the stride-major `cls_8, obj_8, bbox_8, kps_8, cls_16, ...` this step
+originally told the implementer to expect. Every tensor also carries a leading
+batch axis of 1 -- `(1, N, C)`, not `(N, C)`. `decode.decode_yunet` (Task 4)
+and `_synthetic_outputs` in `tests/faces/test_decode.py` are already written
+against this real layout, and `tests/faces/test_decode.py` carries a real-model
+integration test (skipped unless `IMAGEHARBOR_FACE_MODEL_DIR` points at the
+weights) that guards against this regressing. If a future export ever changes
+the order or grouping again, reorder `decode.decode_yunet` to match and update
+that integration test's expectations -- the decoder indexes outputs
+positionally, so a different export order silently decodes garbage.
 
 - [ ] **Step 6: Write `detect.py` and add the fixture**
 

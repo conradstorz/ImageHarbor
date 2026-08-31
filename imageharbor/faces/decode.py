@@ -4,16 +4,21 @@ This is the fiddliest logic in the face pipeline, so it lives here, separated
 from the ONNX session in `detect.py`, and is tested against synthetic tensors
 with no model present.
 
-YuNet emits four tensors per stride in (8, 16, 32), each with one row per grid
-cell in row-major order:
+YuNet emits twelve output tensors, grouped by *type* first and *stride* second
+-- all three `cls`, then all three `obj`, then all three `bbox`, then all three
+`kps`, each group ordered by stride (8, 16, 32) -- not grouped by stride with
+one of each type per group. Verified against the real exported graph with
+onnxruntime; a stride-major reading silently treats `cls_16` as objectness and
+`cls_32` as a bbox regressor. Each tensor carries a leading batch axis:
 
-    cls  (N, 1)   classification logit, already sigmoid-ed by the graph
-    obj  (N, 1)   objectness, already sigmoid-ed
-    bbox (N, 4)   (dx, dy, log w, log h), offsets in stride units
-    kps  (N, 10)  five (dx, dy) landmark offsets, in stride units
+    cls  (1, N, 1)   classification logit, already sigmoid-ed by the graph
+    obj  (1, N, 1)   objectness, already sigmoid-ed
+    bbox (1, N, 4)   (dx, dy, log w, log h), offsets in stride units
+    kps  (1, N, 10)  five (dx, dy) landmark offsets, in stride units
 
-The confidence of a cell is ``sqrt(cls * obj)`` -- the geometric mean, which is
-what the reference implementation uses.
+where N is one row per grid cell in row-major order. The confidence of a cell
+is ``sqrt(cls * obj)`` -- the geometric mean, which is what the reference
+implementation uses.
 """
 
 from __future__ import annotations
@@ -70,6 +75,20 @@ def nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> list[int]:
     return keep
 
 
+def _drop_batch(arr: np.ndarray) -> np.ndarray:
+    """Squeeze YuNet's leading batch axis, if present.
+
+    The real graph always emits `(1, N, C)`. `(N, C)` is also accepted, on
+    purpose, so hand-built synthetic tensors in tests don't have to carry a
+    batch axis they get nothing from -- both shapes mean "one image."
+    """
+    if arr.ndim == 3:
+        if arr.shape[0] != 1:
+            raise ValueError(f"decode_yunet only supports batch size 1, got {arr.shape[0]}")
+        return arr[0]
+    return arr
+
+
 def decode_yunet(
     outputs: Sequence[np.ndarray],
     input_size: tuple[int, int],
@@ -82,8 +101,14 @@ def decode_yunet(
     scores: list[np.ndarray] = []
     kps: list[np.ndarray] = []
 
+    n_strides = len(STRIDES)
     for si, stride in enumerate(STRIDES):
-        cls, obj, bbox, kp = outputs[si * 4 : si * 4 + 4]
+        # Type-major layout: all `cls`, then all `obj`, then all `bbox`, then
+        # all `kps`, each block ordered by stride -- see module docstring.
+        cls = _drop_batch(outputs[0 * n_strides + si])
+        obj = _drop_batch(outputs[1 * n_strides + si])
+        bbox = _drop_batch(outputs[2 * n_strides + si])
+        kp = _drop_batch(outputs[3 * n_strides + si])
         gw, gh = width // stride, height // stride
 
         # Cell centres in row-major order, matching the graph's flattening.
