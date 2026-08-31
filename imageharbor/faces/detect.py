@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import numpy as np
 from PIL import Image
 
 from . import models
 from .decode import Detection, decode_yunet
 from .download import ensure
+from .preprocess import build_blob
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +37,11 @@ class Detector:
     ) -> list[Detection]:
         """Detect faces, returning boxes in `image`'s own pixel coordinates."""
         width, height = self._info.input_size
-        rgb = image if image.mode == "RGB" else image.convert("RGB")
-        scale_x = rgb.width / width
-        scale_y = rgb.height / height
-
-        resized = rgb.resize((width, height), Image.BILINEAR)
-        array = np.asarray(resized, dtype=np.float32)
-        if self._info.channel_order == "BGR":
-            array = array[:, :, ::-1]
-        array = (array - self._info.mean) / self._info.std
-        blob = np.ascontiguousarray(array.transpose(2, 0, 1)[None])
+        # Scale from the SOURCE image: build_blob resizes internally, so the
+        # ratio must be taken before that, not after.
+        scale_x = image.width / width
+        scale_y = image.height / height
+        blob = build_blob([image], self._info)
 
         outputs = self._session.run(None, {self._input: blob})
         detections = decode_yunet(

@@ -11,6 +11,7 @@ from PIL import Image
 from . import models
 from .align import align_crop
 from .download import ensure
+from .preprocess import build_blob
 
 
 class Embedder:
@@ -28,22 +29,11 @@ class Embedder:
         )
         self._input = self._session.get_inputs()[0].name
 
-    def _blob(self, crops: Sequence[Image.Image]) -> np.ndarray:
-        arrays = []
-        for crop in crops:
-            a = np.asarray(crop, dtype=np.float32)
-            if self._info.channel_order == "BGR":  # pragma: no cover - RGB today
-                a = a[:, :, ::-1]
-            arrays.append((a - self._info.mean) / self._info.std)
-        # Crops stack to (N, H, W, C); the model wants NCHW.
-        stacked = np.stack(arrays).transpose(0, 3, 1, 2)
-        return np.ascontiguousarray(stacked, dtype=np.float32)
-
     def embed_batch(self, crops: Sequence[Image.Image]) -> np.ndarray:
         """Embed pre-aligned 112x112 crops. Returns (N, dim), L2-normalized."""
         if not crops:
             return np.zeros((0, self.dim), dtype=np.float32)
-        raw = self._session.run(None, {self._input: self._blob(crops)})[0]
+        raw = self._session.run(None, {self._input: build_blob(crops, self._info)})[0]
         vectors = np.asarray(raw, dtype=np.float32)
         # Normalized here, at the point of production, so cosine and Euclidean
         # stay equivalent for every consumer downstream (cluster.py's centroid
