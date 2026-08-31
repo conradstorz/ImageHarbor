@@ -19,7 +19,8 @@
 - **Name identity is exact.** No fuzzy, similarity, or case-insensitive name merging, ever. `Conrad Storz` and `Conrad Storz III` are different people.
 - **Embeddings are L2-normalized where they are produced.**
 - **Every bug fix ships with a regression test.**
-- Runtime deps go in `pyproject.toml` under a new `faces` extra. Adding one needs a strong reason.
+- Runtime deps go in `pyproject.toml` under a new `faces` extra. Adding one needs a strong reason. **Do not add OpenCV** — see the Task 9 risk note for the sanctioned fallback.
+- ImageHarbor is **AGPL-3.0-or-later**. Only `imageharbor/__init__.py` carries a per-file licence notice; new modules follow the existing convention and do not. Any code adapted from another AGPL project (PhotoPrism, Immich) MUST carry a header naming the upstream project, file, and licence.
 - Python floor is `>=3.10`. Use `from __future__ import annotations` in every new module.
 - Run tests with `uv run pytest`. Never `pip install`.
 - **Do not bump `catalog.SCHEMA_VERSION`.** Face tables are new `CREATE TABLE IF NOT EXISTS` tables that cannot corrupt an existing catalog; that constant is reserved for changes that would.
@@ -35,7 +36,9 @@ Each is working, testable software on its own.
 | C — the pass | 9–13 | `faces scan`, `calibrate`, `cluster` running end to end |
 | D — review + integration | 14–17 | Dashboard People section, `watch`, docs |
 
-**Risk note for Task 9.** The spec rules out OpenCV, so YuNet's raw ONNX outputs must be decoded by hand. That is the single riskiest task here. It is isolated into a pure module (Task 4) so it can be tested against recorded fixtures. **If the decode cannot be validated against a real detection in Task 9, the documented fallback is to add `opencv-python-headless` to the `faces` extra and use `cv2.FaceDetectorYN`** — take that fallback rather than shipping a decoder that "works" but silently detects worse.
+**Risk note for Task 9.** The spec rules out OpenCV, so YuNet's raw ONNX outputs must be decoded by hand. That is the single riskiest task here. It is isolated into a pure module (Task 4) so it can be tested against recorded fixtures.
+
+**If the decode cannot be validated against a real detection in Task 9, the fallback is to port PhotoPrism's YuNet decoder** (`internal/ai/face/engine_onnx_yunet.go`), not to add OpenCV. ImageHarbor is AGPL-3.0-or-later and so is PhotoPrism, so adapting their implementation is licence-compatible — it requires an attribution and provenance note in the file header naming the upstream project, file, and licence. Take that fallback rather than shipping a decoder that "works" but silently detects worse, and rather than adding a ~60 MB dependency to a project whose entire runtime list is Pillow and Click.
 
 ---
 
@@ -1879,7 +1882,7 @@ git commit -m "feat(faces): key people on (name, source) so evidence coexists"
 - Consumes: `models.ModelInfo`, `decode.decode_yunet`, `decode.Detection`
 - Produces: `download.ChecksumMismatch(Exception)`, `download.ensure(info, model_dir) -> Path`; `detect.Detector(model_dir, name=models.DEFAULT_DETECTOR)` with `.detect(image, score_threshold=0.6, nms_threshold=0.3) -> list[Detection]` and `.model_name: str`
 
-**This is the risk task.** If Step 6 cannot produce a correct detection on a real photograph, take the documented fallback: add `opencv-python-headless` to the `faces` extra and reimplement `Detector.detect` on `cv2.FaceDetectorYN`, keeping the same signature. Do not ship an unvalidated decoder.
+**This is the risk task.** If Step 6 cannot produce a correct detection on a real photograph, take the documented fallback: port PhotoPrism's `internal/ai/face/engine_onnx_yunet.go` into `decode.py`, keeping every signature in this plan unchanged. Both projects are AGPL-3.0-or-later, so this is licence-compatible; add a header note naming the upstream project, file, and licence. Do not ship an unvalidated decoder, and do not reach for OpenCV.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2173,7 +2176,7 @@ Commit a single-face photograph as `tests/fixtures/one_face.jpg`. Use a photo yo
 IMAGEHARBOR_FACE_MODEL_DIR=~/.cache/imageharbor/models uv run pytest tests/faces/test_download.py tests/faces/test_detect.py -v
 ```
 
-Expected: PASS. If `test_a_real_photograph_yields_a_plausible_face` fails, the decoder is wrong — take the OpenCV fallback named at the top of this task rather than tuning thresholds until something appears.
+Expected: PASS. If `test_a_real_photograph_yields_a_plausible_face` fails, the decoder is wrong — take the porting fallback named at the top of this task rather than tuning thresholds until something appears. Tuning until a detection appears is how an incorrect decoder ships looking correct.
 
 - [ ] **Step 8: Commit**
 
