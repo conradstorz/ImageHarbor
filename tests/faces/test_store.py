@@ -1,5 +1,7 @@
 """Face persistence: work queue, clusters, and the confirmation gate."""
 
+import logging
+
 import numpy as np
 import pytest
 
@@ -124,6 +126,61 @@ def test_replacing_clusters_preserves_confirmed_people(store):
     assert store.person_for_cluster(new_cid) == person_id
 
 
+def test_recluster_merging_two_confirmed_people_leaves_the_cluster_unconfirmed(store, caplog):
+    # Emma's confirmed cluster and Judy's confirmed cluster get reclustered
+    # into a single new cluster containing both their faces. Picking either
+    # person would manufacture a confirmation nobody made -- see Finding 1.
+    ids = store.record_scan("d", "yunet", [
+        (_det(x=0), _vec([1, 0, 0]), "auraface"),
+        (_det(x=200), _vec([0, 1, 0]), "auraface"),
+    ])
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0])),
+        cluster.Cluster(face_ids=(ids[1],), centroid=_vec([0, 1, 0])),
+    ])
+    a, b = store.cluster_ids()
+    store.confirm(a, "Emma")
+    store.confirm(b, "Judy")
+
+    with caplog.at_level(logging.WARNING):
+        store.replace_clusters("auraface", [
+            cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 1, 0])),
+        ])
+
+    new_cid = store.cluster_ids()[0]
+    assert store.person_for_cluster(new_cid) is None
+    assert any(
+        "Emma" in record.getMessage() and "Judy" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_recluster_splitting_one_confirmed_cluster_both_fragments_inherit_person(store):
+    # The opposite case: one confirmed cluster fragments into two new
+    # clusters. This only ever duplicates a real confirmation, so both
+    # fragments must keep it -- this must keep working, not just Finding 1's
+    # merge case.
+    ids = store.record_scan("d", "yunet", [
+        (_det(x=0), _vec([1, 0, 0]), "auraface"),
+        (_det(x=200), _vec([0.99, 0.01, 0]), "auraface"),
+    ])
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0])),
+    ])
+    cid = store.cluster_ids()[0]
+    person_id = store.confirm(cid, "Emma")
+
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0])),
+        cluster.Cluster(face_ids=(ids[1],), centroid=_vec([0.99, 0.01, 0])),
+    ])
+
+    new_ids = store.cluster_ids()
+    assert len(new_ids) == 2
+    assert store.person_for_cluster(new_ids[0]) == person_id
+    assert store.person_for_cluster(new_ids[1]) == person_id
+
+
 def test_pending_sidecars_lists_a_photo_after_confirmation(store):
     ids = store.record_scan("d", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
@@ -147,3 +204,41 @@ def test_anchors_are_single_face_single_name_photos(store):
     ])
     anchors = store.anchors("auraface", {"one": ["Emma"], "two": ["Judy"]})
     assert [n for n, _ in anchors] == ["Emma"]  # "two" has two faces, so it is not an anchor
+
+
+def test_organized_path_prefers_explicit_override_over_photos_row(tmp_path):
+    db = tmp_path / "catalog.db"
+    cat = Catalog(db)
+    cat.upsert(sha256_b64url="d", original_path="/orig/d.jpg", organized_path="/from/photos.jpg")
+    cat.close()
+    store = FaceStore(db)
+    store.set_organized_path("d", "/from/override.jpg")
+    assert store.organized_path_for("d") == "/from/override.jpg"
+    store.close()
+
+
+def test_organized_path_falls_back_to_photos_row_when_no_override_exists(tmp_path):
+    db = tmp_path / "catalog.db"
+    cat = Catalog(db)
+    cat.upsert(sha256_b64url="d", original_path="/orig/d.jpg", organized_path="/from/photos.jpg")
+    cat.close()
+    store = FaceStore(db)
+    assert store.organized_path_for("d") == "/from/photos.jpg"
+    store.close()
+
+
+def test_organized_path_is_none_when_neither_source_has_it(tmp_path):
+    db = tmp_path / "catalog.db"
+    Catalog(db).close()
+    store = FaceStore(db)
+    assert store.organized_path_for("missing") is None
+    store.close()
+
+
+def test_organized_path_is_none_when_photos_table_does_not_exist(tmp_path):
+    # A FaceStore opened on a database a Catalog has never touched: no
+    # `photos` table at all. Must not raise.
+    db = tmp_path / "faces_only.db"
+    store = FaceStore(db)
+    assert store.organized_path_for("d") is None
+    store.close()

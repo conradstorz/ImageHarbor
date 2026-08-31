@@ -13,6 +13,7 @@ behave identically when they later share one on-disk file.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -26,6 +27,8 @@ from .attribute import Proposal
 from .cluster import Cluster, FaceVector
 from .decode import Detection
 from .names import normalize
+
+logger = logging.getLogger(__name__)
 
 # The five tables from the design spec's "Catalog schema" section, plus one
 # addition: `face_organized_paths`. The spec is silent on where
@@ -313,6 +316,20 @@ class FaceStore:
         face set is captured, and after the new rows are inserted, any new
         cluster whose face set intersects a captured one gets that person
         back.
+
+        A new cluster's face set can intersect *more than one* distinct
+        confirmed person -- the spec's own "Aging" section treats one person
+        owning several clusters, with merge/split as first-class repairs, as
+        the expected steady state, so a recluster run merging two different
+        people's confirmed clusters into one new cluster is a plausible real
+        event, not a corner case. When that happens, picking either person
+        would manufacture a confirmation nobody made -- losing a confirmation
+        is the tolerated, safe direction, but inventing one is not. So the
+        new cluster's `person_id` is left NULL (it returns to the review
+        queue for a human) and a warning names the conflicting people. A
+        single confirmed cluster splitting into several new fragments is the
+        opposite, safe case -- every fragment intersects only that one
+        person, so each still inherits it.
         """
         with self.lock:
             confirmed = self._conn.execute(
@@ -376,13 +393,31 @@ class FaceStore:
                     )
 
                 new_face_set = frozenset(cluster.face_ids)
-                for old_face_set, person_id in confirmed_by_faces:
-                    if new_face_set & old_face_set:
-                        self._conn.execute(
-                            "UPDATE clusters SET person_id=?, assigned_at=? WHERE id=?",
-                            (person_id, now, new_id),
+                matched_people = {
+                    person_id
+                    for old_face_set, person_id in confirmed_by_faces
+                    if new_face_set & old_face_set
+                }
+                if len(matched_people) == 1:
+                    self._conn.execute(
+                        "UPDATE clusters SET person_id=?, assigned_at=? WHERE id=?",
+                        (next(iter(matched_people)), now, new_id),
+                    )
+                elif len(matched_people) > 1:
+                    placeholders = ",".join("?" * len(matched_people))
+                    names = [
+                        r["name"]
+                        for r in self._conn.execute(
+                            f"SELECT name FROM people WHERE id IN ({placeholders}) ORDER BY name",
+                            tuple(matched_people),
                         )
-                        break
+                    ]
+                    logger.warning(
+                        "recluster: new cluster %s merges faces from confirmed "
+                        "people %s -- leaving unconfirmed for human review "
+                        "rather than picking one",
+                        new_id, names,
+                    )
 
             self._conn.commit()
 
@@ -575,11 +610,42 @@ class FaceStore:
             self._conn.commit()
 
     def organized_path_for(self, digest: str) -> str | None:
+        """Resolve *digest*'s organized path from two sources, in this order:
+
+        1. `face_organized_paths` -- an explicit override written by
+           `set_organized_path`. This table exists because that method is
+           part of this module's required interface even for a digest with
+           no `photos` row at all (Task 12's fixtures exercise exactly that),
+           so it can't simply defer to `Catalog`.
+        2. A read-only fallback to `Catalog`'s own `photos.organized_path`.
+           Reading another module's table is not an ownership violation --
+           only writing is (see this class's docstring). The fallback exists
+           because Task 11's `scan()` reads `organized_path` straight from
+           the catalog and never calls `set_organized_path`, so in
+           production `face_organized_paths` stays empty forever; without
+           this, sidecar propagation would never resolve a path. Do not
+           "simplify" this to a single SELECT against `face_organized_paths`
+           -- that would silently break production while every test (which
+           seeds the table directly) kept passing.
+
+        A `FaceStore` can be opened on a database a `Catalog` has never
+        touched, in which case `photos` doesn't exist at all; that is caught
+        and treated as "no fallback value" rather than raised.
+        """
         with self.lock:
             row = self._conn.execute(
                 "SELECT organized_path FROM face_organized_paths WHERE sha256_b64url=?",
                 (digest,),
             ).fetchone()
+            if row is not None:
+                return row["organized_path"]
+            try:
+                row = self._conn.execute(
+                    "SELECT organized_path FROM photos WHERE sha256_b64url=?",
+                    (digest,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
             return row["organized_path"] if row is not None else None
 
     # ------------------------------------------------------------------
@@ -636,7 +702,7 @@ class FaceStore:
         with self.lock:
             self._conn.close()
 
-    def __enter__(self) -> "FaceStore":
+    def __enter__(self) -> FaceStore:
         return self
 
     def __exit__(self, *_: Any) -> None:
