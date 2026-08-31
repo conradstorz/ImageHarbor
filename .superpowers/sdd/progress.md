@@ -201,3 +201,40 @@ Any future "pre-existing failure" claim must first confirm
   an 8-dim basis while a test passed 10 names.
   Minor rolled up: MixedModelError is (ValueError) where the brief's table said (Exception)
   -- ValueError is the better choice and pytest.raises matches either; left as shipped.
+- Task 7: faces/store.py — COMPLETE (4a956a6..f98640c; 18 tests, suite 978 passed/2 skipped; review clean after 1 fix round)
+  THE MOST SERIOUS DEFECT OF THE RUN SO FAR, found by the REVIEWER independently (not by
+  the implementer, not by me): replace_clusters could SILENTLY RELABEL A PERSON.
+  Its restore loop took the FIRST matching old cluster by id and broke. So when a recluster
+  merged Emma's confirmed cluster and Judy's confirmed cluster into one, the new cluster was
+  silently labelled Emma -- asserting that Judy's faces are Emma, with no error, no log, and
+  no unconfirmed state. Losing a confirmation is the tolerated safe direction; MANUFACTURING
+  a wrong one is precisely what "no identity without human confirmation" exists to prevent.
+  Not hypothetical: the spec's own Aging section makes one person owning several clusters,
+  with merge/split as first-class repairs, the EXPECTED steady state for a 1968-2026 library.
+  Fixed: a new cluster intersecting more than one distinct person_id is left NULL and
+  returns to the review queue, with a warning naming the conflicting people. The split case
+  (one confirmed cluster -> two fragments, both inheriting the same person) still works --
+  it only ever duplicates a real confirmation, never invents one.
+  Controller re-verified end to end: two confirmed people merged by a recluster now yield
+  person_id None plus "merges faces from confirmed people ['Emma', 'Judy'] -- leaving
+  unconfirmed for human review rather than picking one".
+  SECOND FIX -- production-write gap I raised and the reviewer sharpened: the implementer
+  added a face_organized_paths table (correctly: FaceStore must not WRITE Catalog's photos
+  table, and Task 12's own brief calls set_organized_path for a digest with no photos row).
+  But nothing in PRODUCTION ever writes that table -- Task 11's scan reads organized_path
+  from the catalog, and propagate_sidecars takes no catalog parameter -- so sidecar
+  propagation would have found nothing in production while every test passed, because the
+  tests seed the table directly. organized_path_for now falls back to a read-only SELECT on
+  photos.organized_path (reading is not an ownership violation; only writing is), guarded
+  against the photos table being absent. Verified: fallback works, explicit override wins,
+  absent digest returns None. Task 11's plan notes updated so its implementer does not add
+  a redundant set_organized_path call.
+  RLock-over-Lock was independently validated, not taken on trust: record_scan calls
+  is_scanned from inside its own lock, so plain Lock genuinely deadlocks -- FaceStore needs
+  it on its own merits, not by analogy to Catalog (which needs it for the same reason).
+  Implementer also caught two real defects in the brief: `bbox_x, bbox_y, bbox_w, bbox_h
+  INTEGER NOT NULL` is not valid multi-column SQL, and the brief claimed 13 tests for a
+  12-test code block.
+  Minor rolled up: split()'s local _centroid duplicates cluster._Accumulator.centroid math
+  (left deliberately -- _Accumulator is private and reaching into it would be worse);
+  split() has no test coverage in this task.
