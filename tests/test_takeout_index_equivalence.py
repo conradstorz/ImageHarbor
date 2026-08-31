@@ -45,8 +45,9 @@ branch actually ran. Neither test HARD-asserts it is "sibling_writer" --
 doing so would fail this whole file on any machine without the sibling
 checkout, which is not a property either test exists to pin -- but a
 fallback to the weak path still must not be silent, so module import emits a
-`pytest.PytestWarning` when it happens; that warning surfaces in the test
-run's summary (a real one was observed and read during development, while
+plain `UserWarning` (via a bare `warnings.warn(...)`, no category argument)
+when it happens; that warning surfaces in the test run's summary (a real one
+was observed and read during development, while
 tracking down why `INDEX_SOURCE` was unexpectedly "literal_schema" on THIS
 machine, despite the sibling checkout being present and importable -- see the
 report for what that turned out to mean).
@@ -240,6 +241,15 @@ def test_the_two_pairing_paths_never_name_different_sidecars(tmp_path):
     rules ImageHarbor lacks. It must never name a DIFFERENT sidecar for the
     same member: that would be two implementations of one domain
     disagreeing, and whichever ran would decide a photo's date.
+
+    That includes the case where the built-in has NO opinion about the
+    member being compared but DOES have an opinion about the sidecar: if the
+    index hands `lonely.jpg` a sidecar the built-in already assigned to some
+    other real member, accepting that pairing would stamp the other
+    member's title/capture date onto `lonely.jpg`, which is exactly the
+    cross-repo divergence this test exists to catch -- so the "index knows
+    more" exemption below is narrowed to exclude that case rather than
+    accepting any index-only answer unconditionally.
     """
     archives_dir = tmp_path / "archives"
     archives_dir.mkdir()
@@ -250,15 +260,40 @@ def test_the_two_pairing_paths_never_name_different_sidecars(tmp_path):
     index = index_reader.IndexPairings.open(idx_path, {zip_path.name: zip_path.stat()})
     assert index.covers(zip_path.name)
 
+    # Built once, before the loop, from the same member list: which member
+    # (if any) the built-in ladder already claims each sidecar for. Used
+    # below to check that an "index knows more" pairing never reassigns a
+    # sidecar the built-in already gave to a DIFFERENT member.
+    builtin_by_member = {
+        member: pairing.sidecar_for(member, builtin_index) for member in MEDIA_MEMBERS
+    }
+    builtin_owner_of: dict[str, str] = {
+        b.sidecar: member
+        for member, b in builtin_by_member.items()
+        if b.sidecar is not None
+    }
+
     compared = 0
     skipped_index_only = 0
     for member in MEDIA_MEMBERS:
-        builtin = pairing.sidecar_for(member, builtin_index)
+        builtin = builtin_by_member[member]
         indexed = index.sidecar_for(member)
         if builtin.sidecar is None or indexed is None or indexed.sidecar is None:
             if indexed is not None and indexed.sidecar is not None:
                 # The legitimate divergence direction: the index knows
-                # something the built-in ladder cannot. Not a disagreement.
+                # something the built-in ladder cannot. Legitimate ONLY if
+                # the sidecar it names for `member` isn't already claimed by
+                # the built-in for some OTHER member -- a sidecar the
+                # built-in already assigned elsewhere is not "the index has
+                # rules ImageHarbor lacks", it's the index disagreeing with
+                # the built-in about who owns that sidecar, and the built-in
+                # side of that disagreement is a real, present pairing, not
+                # a blind spot.
+                claimant = builtin_owner_of.get(indexed.sidecar)
+                assert claimant is None, (
+                    f"{member}: index pairs it with {indexed.sidecar}, but "
+                    f"the built-in ladder already assigns that sidecar to "
+                    f"{claimant}")
                 skipped_index_only += 1
             continue
         compared += 1
@@ -365,6 +400,13 @@ def _catalog_rows(cat: Catalog, dest: Path) -> list[dict]:
         d.pop("id", None)
         d.pop("created_at", None)
         d.pop("processed_at", None)
+        # LATENT GAP, no action needed today: `Catalog.mark_duplicate`
+        # appends an "at" wall-clock timestamp to `processing_history` that
+        # this function does not normalize (unlike the `destination`
+        # substring handled below). Harmless while no fixture here contains
+        # a duplicate image -- but the day one does, this comparison will
+        # intermittently fail on that timestamp alone. Normalize it here
+        # first if a duplicate-image fixture is ever added.
         organized = d.get("organized_path")
         if organized:
             d["organized_path"] = str(Path(organized).relative_to(dest))
