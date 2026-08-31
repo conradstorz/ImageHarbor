@@ -43,3 +43,12 @@ def test_case_variants_is_deterministic():
     b = names.case_variants(["B SMITH", "B Smith", "b Smith"])
     assert a == b
     assert a["b smith"] == ["B SMITH", "B Smith", "b Smith"]
+
+
+def test_case_variants_never_groups_more_than_case():
+    # str.casefold() is Unicode-normalizing, not case-folding: 'Weiß'.casefold()
+    # == 'Weiss'.casefold() even though they are different names (an extra 's',
+    # not a case change of any character). Grouping these would surface a bogus
+    # "these may be the same person" suggestion in the review UI.
+    groups = names.case_variants(["Weiß", "Weiss"])
+    assert groups == {}

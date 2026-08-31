@@ -26,17 +26,35 @@ def normalize(name: str) -> str:
     return " ".join(name.split())
 
 
+def _case_key(name: str) -> tuple[int, str]:
+    """Key that matches two strings only when they differ *purely* by case.
+
+    ``str.casefold()`` is Unicode-normalizing, not case-folding: it merges
+    strings of different length and even different letters (``'Weiß'`` and
+    ``'Weiss'``; the Kelvin sign and ``'K'``). Per-character ``str.lower()``
+    doesn't expand or contract characters the way casefold does, so pairing
+    it with the original length is enough to catch any length mismatch --
+    which is exactly what a *non*-case difference (an extra letter, a
+    ligature) produces.
+    """
+    return (len(name), "".join(ch.lower() for ch in name))
+
+
 def case_variants(names: Iterable[str]) -> dict[str, list[str]]:
     """Group normalized names that differ only by case.
 
-    Returns ``{casefolded_key: [variant, ...]}`` for keys with more than one
+    Returns ``{lowercased_key: [variant, ...]}`` for keys with more than one
     spelling, variants sorted for determinism. These are *suggestions* for the
     review UI; nothing here merges anything.
     """
-    groups: dict[str, set[str]] = {}
+    groups: dict[tuple[int, str], set[str]] = {}
     for raw in names:
         cleaned = normalize(raw)
         if not cleaned:
             continue
-        groups.setdefault(cleaned.casefold(), set()).add(cleaned)
-    return {k: sorted(v) for k, v in sorted(groups.items()) if len(v) > 1}
+        groups.setdefault(_case_key(cleaned), set()).add(cleaned)
+    return {
+        lower: sorted(variants)
+        for (_, lower), variants in sorted(groups.items())
+        if len(variants) > 1
+    }

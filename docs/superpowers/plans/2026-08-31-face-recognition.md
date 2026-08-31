@@ -239,6 +239,17 @@ def test_case_variants_is_deterministic():
     b = names.case_variants(["B SMITH", "B Smith", "b Smith"])
     assert a == b
     assert a["b smith"] == ["B SMITH", "B Smith", "b Smith"]
+
+
+def test_case_variants_never_groups_more_than_case():
+    # str.casefold() is Unicode-normalizing, not case-folding: 'Weiß'.casefold()
+    # == 'Weiss'.casefold() even though they are different names (an extra 's',
+    # not a case change of any character). Grouping these would surface a bogus
+    # "these may be the same person" suggestion in the review UI. Use
+    # per-character str.lower() paired with length, not casefold, for the
+    # grouping key -- see Step 3.
+    groups = names.case_variants(["Weiß", "Weiss"])
+    assert groups == {}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -278,26 +289,52 @@ def normalize(name: str) -> str:
     return " ".join(name.split())
 
 
+def _case_key(name: str) -> tuple[int, str]:
+    """Key that matches two strings only when they differ *purely* by case.
+
+    ``str.casefold()`` is Unicode-normalizing, not case-folding: it merges
+    strings of different length and even different letters (``'Weiß'`` and
+    ``'Weiss'``; the Kelvin sign and ``'K'``). Per-character ``str.lower()``
+    doesn't expand or contract characters the way casefold does, so pairing
+    it with the original length is enough to catch any length mismatch --
+    which is exactly what a *non*-case difference (an extra letter, a
+    ligature) produces.
+    """
+    return (len(name), "".join(ch.lower() for ch in name))
+
+
 def case_variants(names: Iterable[str]) -> dict[str, list[str]]:
     """Group normalized names that differ only by case.
 
-    Returns ``{casefolded_key: [variant, ...]}`` for keys with more than one
+    Returns ``{lowercased_key: [variant, ...]}`` for keys with more than one
     spelling, variants sorted for determinism. These are *suggestions* for the
     review UI; nothing here merges anything.
     """
-    groups: dict[str, set[str]] = {}
+    groups: dict[tuple[int, str], set[str]] = {}
     for raw in names:
         cleaned = normalize(raw)
         if not cleaned:
             continue
-        groups.setdefault(cleaned.casefold(), set()).add(cleaned)
-    return {k: sorted(v) for k, v in sorted(groups.items()) if len(v) > 1}
+        groups.setdefault(_case_key(cleaned), set()).add(cleaned)
+    return {
+        lower: sorted(variants)
+        for (_, lower), variants in sorted(groups.items())
+        if len(variants) > 1
+    }
 ```
+
+**Do not use `cleaned.casefold()` as the grouping key.** `casefold()` is
+Unicode-normalizing, not case-folding, and merges names that differ by more
+than case (`'Weiß'.casefold() == 'Weiss'.casefold()`). `case_variants`
+promises to group names that "differ only by case" -- a wrong merge suggestion
+here is how a father and son (`Conrad Storz` / `Conrad Storz III`) get
+collapsed by hand in the review UI. Use `_case_key` (length + per-character
+`str.lower()`) as above.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/faces/test_names.py -v`
-Expected: PASS, 10 tests
+Expected: PASS, 11 tests
 
 - [ ] **Step 5: Commit**
 
@@ -3098,7 +3135,7 @@ Create `imageharbor/dashboard/people.py` implementing the functions above.
         },
     ],
     "people": [{"person_id": int, "name": str, "cluster_count": int, "photo_count": int}],
-    "case_variants": {casefolded: [variant, ...]},
+    "case_variants": {lowercased: [variant, ...]},
     "singletons_hidden": int,
     "stats": {...},
 }
