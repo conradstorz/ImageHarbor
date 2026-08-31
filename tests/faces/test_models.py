@@ -1,4 +1,3 @@
-# tests/faces/test_models.py
 """The model registry declares what an ONNX graph cannot tell us."""
 
 import pytest

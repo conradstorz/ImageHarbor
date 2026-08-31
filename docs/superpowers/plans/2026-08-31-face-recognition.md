@@ -56,7 +56,6 @@ Each is working, testable software on its own.
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_extra.py
 """The faces package must import with or without onnxruntime installed."""
 
 import sys
@@ -121,7 +120,6 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'imageharbor.faces'`
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# imageharbor/faces/__init__.py
 """Face detection, embedding, clustering, and name proposal.
 
 The pure modules in this package (`names`, `decode`, `align`, `cluster`,
@@ -193,7 +191,6 @@ This is first because the evidence demands it: `pete storz` appears 1,539 times 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_names.py
 """Name normalization: whitespace is fixed automatically, case never is."""
 
 import pytest
@@ -274,7 +271,6 @@ Expected: FAIL with `ImportError: cannot import name 'names'`
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# imageharbor/faces/names.py
 """Person-name normalization. Pure: no I/O, no imports from the package.
 
 Two defects are present in this library's real name vocabulary, and they are
@@ -375,7 +371,6 @@ git commit -m "feat(faces): normalize name whitespace, never case"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_models.py
 """The model registry declares what an ONNX graph cannot tell us."""
 
 import pytest
@@ -435,7 +430,6 @@ Expected: FAIL with `ImportError: cannot import name 'models'`
 `sha256` is deliberately `None` here. Task 9 pins the real digests after downloading and verifying the artifacts once. **Do not invent a checksum.**
 
 ```python
-# imageharbor/faces/models.py
 """Registry of face models. Pure: no I/O, no imports from the package.
 
 This module exists because **channel order and normalization are not present in
@@ -556,7 +550,6 @@ This is the riskiest logic in the build, which is exactly why it is pure and tes
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_decode.py
 """YuNet output decoding and NMS, on synthetic tensors. No model required."""
 
 import numpy as np
@@ -660,7 +653,6 @@ Expected: FAIL with `ImportError: cannot import name 'decode'`
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# imageharbor/faces/decode.py
 """Decode YuNet's raw ONNX outputs into detections. Pure: no I/O, no session.
 
 This is the fiddliest logic in the face pipeline, so it lives here, separated
@@ -822,7 +814,6 @@ git commit -m "feat(faces): decode YuNet outputs and suppress overlaps"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_align.py
 """Landmark alignment onto the ArcFace template. Pure geometry, no model."""
 
 import numpy as np
@@ -908,7 +899,6 @@ Expected: FAIL with `ImportError: cannot import name 'align'`
 The inverse in `align_crop` is not an optimization — Pillow's `AFFINE` takes the **output → input** mapping. Passing the forward transform produces a warp that looks plausible and is wrong.
 
 ```python
-# imageharbor/faces/align.py
 """Warp a detected face onto the ArcFace 5-point template. Pure geometry.
 
 The template is the standard InsightFace ArcFace destination for a 112x112
@@ -1052,7 +1042,6 @@ git commit -m "feat(faces): align faces onto the ArcFace template without OpenCV
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/faces/test_cluster.py
 """Clustering on synthetic vectors. No model, no database."""
 
 import numpy as np
@@ -1132,7 +1121,6 @@ def test_empty_input_returns_no_clusters():
 ```
 
 ```python
-# tests/faces/test_attribute.py
 """Proposal scoring. Pure, table-driven."""
 
 import pytest
@@ -1243,7 +1231,6 @@ def test_output_is_sorted_by_score_then_name():
 ```
 
 ```python
-# tests/faces/test_calibrate.py
 """Threshold calibration from labelled anchors."""
 
 import numpy as np
@@ -1309,7 +1296,6 @@ Expected: FAIL, three `ImportError`s
 - [ ] **Step 3: Write the implementations**
 
 ```python
-# imageharbor/faces/cluster.py
 """Group face embeddings into clusters. Pure: no I/O, no model, no database.
 
 Faces are compared against cluster **centroids**, not against each other.
@@ -1451,7 +1437,6 @@ def cluster_faces(
 ```
 
 ```python
-# imageharbor/faces/attribute.py
 """Propose person names for clusters from Google's tags. Pure: no I/O.
 
 This module only ever *proposes*. Nothing here writes an identity; that happens
@@ -1528,7 +1513,6 @@ def propose(
 ```
 
 ```python
-# imageharbor/faces/calibrate.py
 """Measure the clustering threshold from the library's own labelled data.
 
 A photo with exactly one detected face and exactly one Google name is an
@@ -1649,7 +1633,6 @@ git commit -m "feat(faces): cluster, propose, and calibrate against Google's own
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_store.py
 """Face persistence: work queue, clusters, and the confirmation gate."""
 
 import numpy as np
@@ -1869,7 +1852,6 @@ git commit -m "feat(faces): persist faces, clusters, and the confirmation gate"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_sidecar_people.py
 """The people list must hold Google's names and ImageHarbor's side by side."""
 
 from imageharbor import sidecar_schema
@@ -1993,7 +1975,6 @@ git commit -m "feat(faces): key people on (name, source) so evidence coexists"
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/faces/test_download.py
 """Model acquisition verifies before it trusts."""
 
 import hashlib
@@ -2045,7 +2026,6 @@ def test_both_shipped_models_have_pinned_checksums():
 ```
 
 ```python
-# tests/faces/test_detect.py
 """Detector integration. Skips without weights; fails on a broken runtime."""
 
 import os
@@ -2112,7 +2092,6 @@ Expected: `test_download` FAILs with `ImportError`; `test_detect` skips.
 - [ ] **Step 3: Write `download.py`**
 
 ```python
-# imageharbor/faces/download.py
 """Fetch and verify model artifacts.
 
 An unverified artifact is never used. Two publishers ship different models under
@@ -2202,7 +2181,6 @@ Expected: one input of shape `[1, 3, H, W]`, and twelve outputs — `cls_8, obj_
 - [ ] **Step 6: Write `detect.py` and add the fixture**
 
 ```python
-# imageharbor/faces/detect.py
 """Run YuNet over an image. I/O only: the decode lives in `decode.py`."""
 
 from __future__ import annotations
@@ -2306,7 +2284,6 @@ git commit -m "feat(faces): fetch, verify, and run the YuNet detector"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_embed.py
 """Embedder integration. Skips without weights; fails on a broken runtime."""
 
 import os
@@ -2377,7 +2354,6 @@ Expected: FAIL with `ImportError: cannot import name 'embed'`
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# imageharbor/faces/embed.py
 """Turn an aligned face crop into a vector. I/O only; the warp is in `align`."""
 
 from __future__ import annotations
@@ -2464,7 +2440,6 @@ git commit -m "feat(faces): embed aligned crops with AuraFace"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_runner.py
 """The scan pass: resumable, idempotent, and never a breaker failure."""
 
 import numpy as np
@@ -2607,7 +2582,6 @@ Adapt `Catalog.record_photo` in the fixture to the real signature if it differs 
 Write `imageharbor/faces/runner.py`:
 
 ```python
-# imageharbor/faces/runner.py
 """The per-photo detect-and-embed pass. Resumable at one-photo granularity.
 
 This pass makes no AI-backend call and touches no network. A failure here is a
@@ -2727,7 +2701,6 @@ git commit -m "feat(faces): add the resumable detect-and-embed pass"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_runner_cluster.py
 """Clustering, proposal, and sidecar propagation wired to the store."""
 
 import json
@@ -2905,7 +2878,6 @@ git commit -m "feat(faces): cluster, propose, and propagate confirmed names"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_faces_cli.py
 """The faces command group."""
 
 from click.testing import CliRunner
@@ -3021,7 +2993,6 @@ git commit -m "feat(faces): add the faces command group"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_dashboard_people.py
 """The People review API."""
 
 import numpy as np
@@ -3211,7 +3182,6 @@ git commit -m "feat(faces): serve the People review API"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_dashboard_people_page.py
 """The People section must be present in the served page."""
 
 from pathlib import Path
@@ -3294,7 +3264,6 @@ git commit -m "feat(faces): add the People review section to the dashboard"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/faces/test_watch_faces.py
 """The faces pass inside the watcher."""
 
 from imageharbor.catalog import Catalog
@@ -3436,7 +3405,6 @@ Print the head of each hit (`head -c 2000 <file>`) and record what it actually i
 Use the real format from Step 1. If it is `contacts.xml`:
 
 ```python
-# tests/faces/test_roster.py
 """The Picasa roster is vocabulary, never evidence."""
 
 import pytest
@@ -3531,7 +3499,6 @@ Expected: FAIL with `ImportError: cannot import name 'roster'`
 - [ ] **Step 4: Write the implementation**
 
 ```python
-# imageharbor/faces/roster.py
 """Read the preserved Picasa face-tag roster as autocomplete vocabulary.
 
 The roster names people across many entries and **carries no photo reference at

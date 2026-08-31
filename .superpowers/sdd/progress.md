@@ -89,3 +89,25 @@ Any future "pre-existing failure" claim must first confirm
   Minor rolled up for final review: the Kelvin group renders as two visually identical
   'K' strings in the review UI; if that reaches dashboard/people.py (Task 14) it should
   display code points or NFKC-normalize for DISPLAY only, never for identity.
+- Task 3: faces/models.py — COMPLETE (d40e722..c1e762a; 6 tests, suite 913 passed/1 skipped; review clean, NO Critical or Important)
+  The reviewer did the one check that actually matters for this module: it verified the
+  preprocessing constants against InsightFace's real arcface_onnx.py rather than reading
+  them for plausibility. AuraFace mean=127.5/std=128.0/RGB matches the genuine non-MXNet
+  ONNX path; YuNet BGR/0-255 matches cv2.dnn.blobFromImage's no-swap no-scale defaults.
+  These are the two fields that fail SILENTLY when wrong, so external confirmation is
+  worth more here than any test could be.
+  sha256=None confirmed genuinely un-fabricated for both entries (pinned in Task 9).
+  My dispatch warned of a checksum contradiction that did not exist -- the pinned-checksum
+  test lives in Task 9's test_download.py, not this brief. The implementer checked and
+  said so rather than acting on my incorrect framing.
+  Evidence authenticated: the RED traceback used the real CPython _gcd_import signature,
+  and GREEN percentages were the exact floor values for 1..6 of 6.
+  CONTROLLER FIX applied after review (not a task defect): implementers were transcribing
+  the plan's markdown code-block path labels (`# imageharbor/faces/models.py`) into the
+  real files as line 1 -- pure "what", against the project's comment rule. Stripped from
+  models.py and test_models.py, and 33 such lines removed from the PLAN so the remaining
+  14 tasks cannot inherit it. Briefs 4-6 regenerated from the corrected plan.
+  Minor rolled up for final review: `kind` and `channel_order` are bare `str` where only
+  two literals are valid each (Literal[...] would make a bad value a type error); get()
+  hardcodes two registries, so a third model KIND would need it touched; test_models.py
+  lacks `from __future__ import annotations` (plan-mandated, inert -- no PEP 604 syntax).

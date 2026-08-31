@@ -1,4 +1,3 @@
-# imageharbor/faces/models.py
 """Registry of face models. Pure: no I/O, no imports from the package.
 
 This module exists because **channel order and normalization are not present in
