@@ -250,6 +250,20 @@ def test_case_variants_never_groups_more_than_case():
     # grouping key -- see Step 3.
     groups = names.case_variants(["Weiß", "Weiss"])
     assert groups == {}
+
+
+def test_case_variants_still_groups_same_length_compatibility_characters():
+    # Known, accepted residual: the Kelvin sign (U+212A) and 'K' are the same
+    # length, and Unicode's own simple case mapping sends both to 'k' -- the
+    # same target str.lower() gives plain 'K'. The length gate in _case_key
+    # only excludes length-changing folds like Weiß/Weiss; it cannot and does
+    # not separate this pair. This is accepted because case_variants only
+    # ever suggests a merge for a human to confirm, never performs one --
+    # do not "fix" this by trying to special-case Kelvin.
+    kelvin_sign = "K"
+    assert kelvin_sign != "K"  # distinct characters going in
+    groups = names.case_variants([kelvin_sign, "K"])
+    assert groups == {"k": ["K", kelvin_sign]}  # sorted: plain K (0x4B) before Kelvin sign (0x212A)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -293,12 +307,15 @@ def _case_key(name: str) -> tuple[int, str]:
     """Key that matches two strings only when they differ *purely* by case.
 
     ``str.casefold()`` is Unicode-normalizing, not case-folding: it merges
-    strings of different length and even different letters (``'Weiß'`` and
-    ``'Weiss'``; the Kelvin sign and ``'K'``). Per-character ``str.lower()``
-    doesn't expand or contract characters the way casefold does, so pairing
-    it with the original length is enough to catch any length mismatch --
-    which is exactly what a *non*-case difference (an extra letter, a
-    ligature) produces.
+    strings of different length, e.g. ``'Weiß'`` and ``'Weiss'``.
+    Per-character ``str.lower()`` doesn't expand or contract characters the
+    way casefold does, so pairing it with the original length catches that
+    length-changing case. It does *not* catch same-length compatibility
+    collisions -- the Kelvin sign (U+212A) still keys the same as ``'K'``,
+    because Unicode's simple case mapping sends both to ``'k'``. No
+    per-character scheme can separate them without giving up case-insensitive
+    comparison. That's acceptable here: ``case_variants`` only ever suggests
+    a merge to a human, it never performs one.
     """
     return (len(name), "".join(ch.lower() for ch in name))
 
@@ -334,7 +351,7 @@ collapsed by hand in the review UI. Use `_case_key` (length + per-character
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/faces/test_names.py -v`
-Expected: PASS, 11 tests
+Expected: PASS, 12 tests
 
 - [ ] **Step 5: Commit**
 

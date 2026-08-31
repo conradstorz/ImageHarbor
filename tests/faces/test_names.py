@@ -52,3 +52,17 @@ def test_case_variants_never_groups_more_than_case():
     # "these may be the same person" suggestion in the review UI.
     groups = names.case_variants(["Weiß", "Weiss"])
     assert groups == {}
+
+
+def test_case_variants_still_groups_same_length_compatibility_characters():
+    # Known, accepted residual: the Kelvin sign (U+212A) and 'K' are the same
+    # length, and Unicode's own simple case mapping sends both to 'k' -- the
+    # same target str.lower() gives plain 'K'. The length gate in _case_key
+    # only excludes length-changing folds like Weiß/Weiss; it cannot and does
+    # not separate this pair. This is accepted because case_variants only
+    # ever suggests a merge for a human to confirm, never performs one --
+    # do not "fix" this by trying to special-case Kelvin.
+    kelvin_sign = "K"
+    assert kelvin_sign != "K"  # distinct characters going in
+    groups = names.case_variants([kelvin_sign, "K"])
+    assert groups == {"k": ["K", kelvin_sign]}  # sorted: plain K (0x4B) before Kelvin sign (0x212A)

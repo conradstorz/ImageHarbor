@@ -30,12 +30,15 @@ def _case_key(name: str) -> tuple[int, str]:
     """Key that matches two strings only when they differ *purely* by case.
 
     ``str.casefold()`` is Unicode-normalizing, not case-folding: it merges
-    strings of different length and even different letters (``'Weiß'`` and
-    ``'Weiss'``; the Kelvin sign and ``'K'``). Per-character ``str.lower()``
-    doesn't expand or contract characters the way casefold does, so pairing
-    it with the original length is enough to catch any length mismatch --
-    which is exactly what a *non*-case difference (an extra letter, a
-    ligature) produces.
+    strings of different length, e.g. ``'Weiß'`` and ``'Weiss'``.
+    Per-character ``str.lower()`` doesn't expand or contract characters the
+    way casefold does, so pairing it with the original length catches that
+    length-changing case. It does *not* catch same-length compatibility
+    collisions -- the Kelvin sign (U+212A) still keys the same as ``'K'``,
+    because Unicode's simple case mapping sends both to ``'k'``. No
+    per-character scheme can separate them without giving up case-insensitive
+    comparison. That's acceptable here: ``case_variants`` only ever suggests
+    a merge to a human, it never performs one.
     """
     return (len(name), "".join(ch.lower() for ch in name))
 
