@@ -20,7 +20,7 @@ def test_descriptor_ladder_puts_humans_above_ai():
 
 
 def test_source_names_cover_every_rank():
-    assert set(tiers.DATE_SOURCE_NAMES) == {40, 30, 20, 10, 0}
+    assert set(tiers.DATE_SOURCE_NAMES) == {40, 30, 25, 20, 10, 0}
     assert set(tiers.DESC_SOURCE_NAMES) == {30, 20, 0}
 
 
@@ -54,3 +54,27 @@ def test_ai_can_never_displace_a_human_filename():
     ai = (tiers.DATE_EXIF_ORIGINAL, tiers.DESC_AI_SUBJECT)
     assert tiers.is_upgrade(human, ai) is False
     assert tiers.is_upgrade((tiers.DATE_EXIF_ORIGINAL, tiers.DESC_NONE), ai) is True
+
+
+def test_related_sidecar_ranks_below_own_and_above_exif_other():
+    # An -edited copy's original carries the same photograph's capture
+    # instant, which beats a DateTimeDigitized recording when the file was
+    # written -- but it is weaker than this file's own sidecar.
+    assert tiers.DATE_EXTERNAL_SIDECAR > tiers.DATE_RELATED_SIDECAR
+    assert tiers.DATE_RELATED_SIDECAR > tiers.DATE_EXIF_OTHER
+
+
+def test_related_sidecar_has_a_source_name():
+    assert tiers.DATE_SOURCE_NAMES[tiers.DATE_RELATED_SIDECAR] == "related_sidecar"
+
+
+def test_an_own_sidecar_upgrades_a_related_one():
+    # An own sidecar's date tier should upgrade over a related sidecar's.
+    assert tiers.is_upgrade(
+        (tiers.DATE_RELATED_SIDECAR, tiers.DESC_NONE),
+        (tiers.DATE_EXTERNAL_SIDECAR, tiers.DESC_NONE),
+    )
+    assert not tiers.is_upgrade(
+        (tiers.DATE_EXTERNAL_SIDECAR, tiers.DESC_NONE),
+        (tiers.DATE_RELATED_SIDECAR, tiers.DESC_NONE),
+    )

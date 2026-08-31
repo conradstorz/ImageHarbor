@@ -12,6 +12,13 @@ from __future__ import annotations
 # --- Date tier: decides placement -----------------------------------------
 DATE_EXIF_ORIGINAL = 40      # EXIF DateTimeOriginal
 DATE_EXTERNAL_SIDECAR = 30   # Google Takeout photoTakenTime, via ExternalEvidence.date
+DATE_RELATED_SIDECAR = 25    # photoTakenTime from a RELATED file's sidecar -
+                             # usually this file's unedited original, so the
+                             # same photograph's capture instant. Above
+                             # EXIF_OTHER, which records when a file was
+                             # written rather than when a photo was taken.
+                             # Deliberately breaks the 10-step spacing: this sits
+                             # between two existing rungs, not at the end.
 DATE_EXIF_OTHER = 20         # DateTimeDigitized, DateTime
 DATE_FILENAME_PATTERN = 10   # date parsed out of the original filename
 DATE_NONE = 0                # no trustworthy date -> Undated/
@@ -22,6 +29,7 @@ DATE_NONE = 0                # no trustworthy date -> Undated/
 DATE_SOURCE_NAMES: dict[int, str] = {
     DATE_EXIF_ORIGINAL: "exif_original",
     DATE_EXTERNAL_SIDECAR: "external_sidecar",
+    DATE_RELATED_SIDECAR: "related_sidecar",
     DATE_EXIF_OTHER: "exif_other",
     DATE_FILENAME_PATTERN: "filename_pattern",
     DATE_NONE: "none",

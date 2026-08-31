@@ -126,6 +126,7 @@ def test_empty_catalog_returns_a_complete_document_of_zeros(
     assert doc["evidence"]["date_tiers"] == [
         {"tier": 40, "source": "exif_original", "count": 0},
         {"tier": 30, "source": "external_sidecar", "count": 0},
+        {"tier": 25, "source": "related_sidecar", "count": 0},
         {"tier": 20, "source": "exif_other", "count": 0},
         {"tier": 10, "source": "filename_pattern", "count": 0},
         {"tier": 0, "source": "none", "count": 0},
@@ -182,7 +183,7 @@ def test_tier_distributions_match_a_real_pipeline_run(
         row["tier"]: row["count"] for row in doc["evidence"]["descriptor_tiers"]
     }
 
-    assert date_counts == {40: 0, 30: 0, 20: 0, 10: 1, 0: 2}
+    assert date_counts == {40: 0, 30: 0, 25: 0, 20: 0, 10: 1, 0: 2}
     assert descriptor_counts == {30: 2, 20: 0, 0: 1}
 
     assert doc["library"]["total_photos"] == 3
