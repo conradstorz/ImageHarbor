@@ -403,3 +403,36 @@ Any future "pre-existing failure" claim must first confirm
   UNTESTED -- the reviewer mutated the resolution order and all 23 tests still passed;
   store.cluster_ids() is not scoped by embed_model, so --recluster's guard checks for ANY
   clusters store-wide (moot today, since no --embed-model flag is exposed).
+- Task 14: dashboard People API — COMPLETE (3d8c744..3474559; 50 tests, suite 1096 passed/10 skipped; review clean after 1 fix round)
+  THE IDENTITY-WRITE INVARIANT HOLDS AND WAS VERIFIED, NOT ASSUMED: people.py contains zero
+  UPDATE/INSERT touching clusters.person_id; confirm/merge delegate to the store, and split
+  creates its new cluster with person_id NULL. Reviewer traced every endpoint.
+  TWO REAL BUGS FOUND BY THE IMPLEMENTER while following the brief:
+    - review_queue's people roster needed LEFT JOIN, not JOIN, from people -> clusters. A
+      RECLUSTER CAN LEAVE A CONFIRMED PERSON WITH ZERO CLUSTERS, and an inner join silently
+      dropped them from the roster -- a confirmed person vanishing from the UI. Caught by
+      the brief's own prescribed test; reviewer reproduced it (assert 1 == 2).
+    - crop_bytes needed a store lookup: crop files are named by digest-rank, not face_id,
+      and face_id does not exist at crop-write time. Reviewer traced runner._scan_one's
+      write order end to end and confirmed the rank resolution matches.
+  IMPORTANT FOUND BY THE REVIEWER AND FIXED: people.split validated that the cluster existed
+  and face_ids was non-empty, but NOT that the faces belonged to that cluster. Reproduced
+  live: a request could detach a face from a CONFIRMED person into a new unconfirmed cluster
+  and leave clusters.face_count stale -- a number the review UI reads for ordering. It did
+  not breach "no identity without confirmation" (the stolen face lands unconfirmed) but it
+  silently corrupts a confirmed person's membership over HTTP.
+  Guarded at BOTH layers: people.split validates first (raising the 400-facing ValueError),
+  and FaceStore.split carries the same check as defence-in-depth for callers bypassing the
+  wrapper. Controller re-ran the reviewer's exact attack: refused with "face id(s) [1] do
+  not belong to cluster 2", Emma's confirmation intact.
+  The fix also caught a LATENT bug: the new cluster's face_count used the raw face_ids list
+  rather than the deduplicated moved-id set, so a request with duplicate ids inflated it.
+  reject() no longer returns 200 for a no-op -- it raised success for an unmatched
+  (cluster_id, name) pair, telling the caller something happened when nothing did.
+  crop_bytes is traversal-safe: the URL segment goes through int() before it reaches the
+  function, and the filesystem path is built from a DB-sourced digest, never client input.
+  Minor rolled up for final review: review_queue's case_variants/stats calls happen after the
+  store lock is released, so the payload is not one atomic snapshot (low impact, single
+  operator); GET routing uses startswith("/api/people") with no trailing slash, so
+  /api/peoplexyz returns the queue rather than 404 (inherited from the brief); merge()
+  calls cluster_ids() once per id, a full scan each time.
