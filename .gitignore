@@ -39,3 +39,8 @@ catalog.db
 *.tgz
 .takeout-staging/
 .takeout-provenance/
+
+# tests/test_takeout_corpus_index.py's hard-linked archive subset (cleaned
+# up automatically; ignored here only as a guard against a leftover after a
+# crashed run)
+.corpus-tmp/

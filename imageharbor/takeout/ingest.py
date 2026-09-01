@@ -22,16 +22,18 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import tiers
 from ..catalog import Catalog
 from ..hashing import compute_sha256_b64url_bytes
 from ..pipeline import ExternalEvidence, Pipeline
 from ..sidecar import merge_sidecar
-from . import archive, metadata, pairing, provenance
+from . import archive, index_reader, metadata, pairing, provenance
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,37 @@ class IngestStats:
     missing_metadata: int = 0     # organized, but no sidecar could be paired
     per_archive: list[dict] = field(default_factory=list)
 
+    # Takeout index (optional). A run without one leaves all these at zero and
+    # reports "no index"; they are never a failure signal on their own.
+    # None when no index was used at all, which the summary reports on one
+    # line so "did it use the index?" is never answered by reading logs.
+    index_path: Path | None = None
+    index_archives_covered: int = 0
+    index_archives_fell_back: int = 0
+    index_members_fell_back: int = 0    # covered archive, member absent from index
+    index_sidecars_missing: int = 0     # index named a sidecar not on disk
+    # The index covers this member and knows it, but reports NO sidecar for
+    # it (`found.sidecar is None`) -- distinct from `index_members_fell_back`
+    # (the member is absent from the index entirely). Falling through to the
+    # built-in ladder here is CRITICAL 1's fix: the index's "no sidecar"
+    # answer must never silently override a pairing the built-in ladder CAN
+    # still make.
+    index_no_sidecar_fell_back: int = 0
+    # The index knows this member and names a sidecar for it, but its
+    # `confidence` value is not one `pairing.py` recognizes ("own"/"related"/
+    # "none"). Fail-safe (falls back rather than trusting a value that would
+    # silently drop title/people and misfile the date tier), but a producer-
+    # side schema drift must still be visible, not merely invisible-safe.
+    index_bad_confidence_fell_back: int = 0
+    # `pairings_own`/`pairings_related` are each incremented in `_pairing_for`
+    # for EVERY member routed through it that came back with that confidence
+    # -- fresh images, duplicates, and deferred videos alike. They are not a
+    # partition of `ingested` (which counts only freshly-copied, non-
+    # duplicate images), so the summary must never derive one from the other
+    # by subtracting from `ingested` -- see the CLI's "pairings" line.
+    pairings_related: int = 0
+    pairings_own: int = 0
+
 
 def _initial_status(member: archive.MemberInfo, include_trash: bool) -> str:
     if archive.is_trash(member.path) and not include_trash:
@@ -137,8 +170,25 @@ def ingest_archives(
     include_trash: bool = False,
     write_sidecars: bool = False,
     dry_run: bool = False,
+    index_path: Path | None = None,
 ) -> IngestStats:
-    """Ingest every ``*.zip`` under *archives_dir* into *organized_dir*."""
+    """Ingest every ``*.zip`` under *archives_dir* into *organized_dir*.
+
+    *index_path* is an optional, explicitly-named Takeout_Inventory pairing
+    index. When omitted, ``archives_dir / "takeout-index.sqlite"`` is tried
+    instead -- an auto-detected one. Either way the index is verified against
+    the archives actually on disk and used only for those it covers; every
+    other archive falls back to the built-in pairing rungs, which are always
+    a correct answer.
+
+    The two cases fail differently. An index named explicitly is a request
+    for something specific: if it is missing, stale, or unreadable, this
+    raises `index_reader.IndexUnusable` rather than silently ingesting with
+    weaker pairing. An auto-detected index is a convenience: the same
+    failures there only log a warning, and the whole run falls back to the
+    built-in rungs -- a broken or absent auto-detected index must never fail
+    an ingest.
+    """
     return _Ingestor(
         archives_dir=archives_dir,
         organized_dir=organized_dir,
@@ -146,6 +196,7 @@ def ingest_archives(
         include_trash=include_trash,
         write_sidecars=write_sidecars,
         dry_run=dry_run,
+        index_path=index_path,
     ).run()
 
 
@@ -161,6 +212,7 @@ class _Ingestor:
         include_trash: bool,
         write_sidecars: bool,
         dry_run: bool,
+        index_path: Path | None = None,
     ) -> None:
         self.archives_dir = archives_dir
         self.organized_dir = organized_dir
@@ -168,12 +220,21 @@ class _Ingestor:
         self.include_trash = include_trash
         self.write_sidecars = write_sidecars
         self.dry_run = dry_run
+        self.index_path = index_path
         self.staging_dir = organized_dir / STAGING_DIR_NAME
         self.stats = IngestStats()
         # Which archive holds each member, so a sidecar in another part can be
         # read without re-surveying.
         self.owner: dict[str, Path] = {}
         self.pairing_index = pairing.PairingIndex()
+        # Set in `_survey`, once the batch's archives are known: the loaded
+        # Takeout_Inventory index (None if no `index_path` was given, or the
+        # file is absent/stale/unreadable -- see `_pairing_for`), and every
+        # member path in the batch, so `_pairing_for` can tell an index entry
+        # naming a real member from one naming a sidecar that never actually
+        # arrived (`index_sidecars_missing`).
+        self.index: index_reader.IndexPairings | None = None
+        self._all_members: frozenset[str] = frozenset()
         # Open zip handles, cached for the lifetime of run(). Re-opening a zip
         # re-parses its whole central directory (~91ms measured on a
         # 20,000-member archive), and every paired member triggers a
@@ -227,7 +288,69 @@ class _Ingestor:
         # "takeout-001 (1).zip" -- must be surveyed once, not once per path.
         seen_archive_ids: set[str] = set()
 
-        for path in sorted(p for p in self.archives_dir.glob("*.zip") if p.is_file()):
+        archive_paths = sorted(p for p in self.archives_dir.glob("*.zip") if p.is_file())
+
+        # Load the optional Takeout_Inventory index once, against every
+        # archive actually on disk.
+        #
+        # An index the caller NAMED explicitly (`self.index_path` set on
+        # entry, from `--takeout-index`) is something they asked for
+        # specifically -- missing or unusable there is an error, not a
+        # fallback: `IndexUnusable` propagates out of `run()` uncaught, and
+        # the CLI turns it into a clean exit. An index found by
+        # AUTO-DETECTION (no explicit path; a `takeout-index.sqlite` sitting
+        # beside the archives) is a convenience, not a request: any failure
+        # there -- missing file, wrong schema, an unreadable database, even a
+        # race where a listed archive vanishes before it can be stat()'d --
+        # falls back to `self.index = None`, exactly as if no index had ever
+        # been given, and only logs a warning. A broken auto-detected index
+        # must never fail an ingest.
+        #
+        # `self.index_path` is left at its original value (None, for
+        # auto-detection) unless an index is actually loaded successfully --
+        # the per-archive coverage counting just below, and the run summary,
+        # both key off it to decide whether an index was used at all.
+        explicit = self.index_path is not None
+        candidate = self.index_path if explicit else self.archives_dir / "takeout-index.sqlite"
+        # `candidate.is_file()` itself can raise: `Path.is_file()` only
+        # swallows ENOENT/ENOTDIR/EBADF/ELOOP, so a PermissionError (EACCES)
+        # or a stale network handle re-raises. That check must live INSIDE
+        # this try, not gate entry to it -- otherwise an unreadable
+        # auto-detected index (no --takeout-index given) fails the whole
+        # ingest with a raw PermissionError instead of warning and falling
+        # back, exactly like every other auto-detect failure below.
+        try:
+            if not explicit and not candidate.is_file():
+                self.index = None
+            else:
+                archive_stats = {p.name: p.stat() for p in archive_paths}
+                self.index = index_reader.IndexPairings.open(candidate, archive_stats)
+        except Exception as exc:
+            if explicit:
+                if isinstance(exc, index_reader.IndexUnusable):
+                    raise
+                if isinstance(exc, (OSError, sqlite3.Error)):
+                    # These are the shapes a genuinely-unusable FILE takes
+                    # (missing, permission-denied, not a database, I/O
+                    # error). Anything else is a bug in this code, not a
+                    # problem with the caller's index, and must surface as
+                    # a real traceback -- wrapping it into IndexUnusable
+                    # would send troubleshooting at the wrong file.
+                    raise index_reader.IndexUnusable(
+                        f"cannot use {candidate}: {exc}"
+                    ) from exc
+                raise
+            logger.warning(
+                "Takeout index %s is unusable (%s); falling back to built-in "
+                "pairing for the whole run", candidate, exc,
+            )
+            self.index = None
+        else:
+            if self.index is not None:
+                self.index_path = candidate
+                self.stats.index_path = candidate
+
+        for path in archive_paths:
             self.stats.archives_seen += 1
             identity = archive.identify(path, self.catalog)
 
@@ -246,6 +369,15 @@ class _Ingestor:
                 self.stats.archives_skipped += 1
                 continue
             seen_archive_ids.add(identity.archive_id)
+
+            # Counted once per archive identity actually surveyed this run --
+            # a stale or missing index must never be silent about which
+            # archives it covered.
+            if self.index_path is not None:
+                if self.index is not None and self.index.covers(identity.path.name):
+                    self.stats.index_archives_covered += 1
+                else:
+                    self.stats.index_archives_fell_back += 1
 
             row = self.catalog.takeout_archive_get(identity.archive_id)
 
@@ -322,26 +454,47 @@ class _Ingestor:
         # routinely land in different parts; a per-archive index would silently
         # lose metadata at every part boundary.
         self.pairing_index = pairing.build_index(all_members)
+        # Every member path in the batch -- built alongside `pairing_index`,
+        # from the same list, so `_pairing_for` can tell an index entry that
+        # names a real member from one naming a sidecar that never actually
+        # arrived in this batch (`index_sidecars_missing`).
+        self._all_members = frozenset(all_members)
 
         # Every sidecar path claimed by some media member, across the whole
-        # batch. `pairing.sidecar_for` already returns None for a path that
-        # is itself sidecar-shaped, so this can run over every member path
-        # unfiltered -- no need to separate media from sidecars here. A
-        # failure for one member's path must not cost every OTHER member its
-        # orphan/claimed determination, so each call is isolated -- mirrors
-        # every other per-member try/except in this module.
+        # batch -- via the index when it covers a member's archive, exactly
+        # like every other pairing site (I2: this loop used to call
+        # `pairing.sidecar_for` directly, bypassing the index entirely, so an
+        # index-only pairing's sidecar was claimed for real but never counted
+        # here, and got filed under orphaned/ regardless). Routed through
+        # `_resolve_pairing` -- the pure lookup `_pairing_for` also uses -- so
+        # this whole-batch scan does NOT touch `self.stats`; counting stays
+        # exclusively in `_pairing_for`, called once per member actually
+        # ingested or re-checked (see its docstring).
+        #
+        # `pairing.sidecar_for` (reached here whenever the index doesn't
+        # supply an answer) already returns a `Pairing` with `sidecar=None`
+        # for a path that is itself sidecar-shaped, so this can run over
+        # every member path unfiltered -- no need to separate media from
+        # sidecars here. A failure for one member's path must not cost every
+        # OTHER member its orphan/claimed determination, so each call is
+        # isolated -- mirrors every other per-member try/except in this
+        # module.
         claimed: set[str] = set()
         for member_path in all_members:
+            owner_path = self.owner.get(member_path)
+            archive_name = owner_path.name if owner_path is not None else ""
             try:
-                sidecar = pairing.sidecar_for(member_path, self.pairing_index)
+                pairing_result, _pair_rule, _fallback_stat = self._resolve_pairing(
+                    member_path, archive_name
+                )
             except Exception as exc:
                 logger.warning(
                     "sidecar_for failed for %s during provenance indexing: %s",
                     member_path, exc, exc_info=True,
                 )
                 continue
-            if sidecar is not None:
-                claimed.add(sidecar)
+            if pairing_result.sidecar is not None:
+                claimed.add(pairing_result.sidecar)
         self._claimed_sidecars = frozenset(claimed)
 
         # SECOND PASS -- the late-sidecar case, and the reason the survey has
@@ -377,7 +530,7 @@ class _Ingestor:
                 # reason: none of them means "organized, but missing metadata".
                 and row["status"] in (_INGESTED, _DUPLICATE, _DEFERRED)
                 and not row["sidecar_path"]
-                and pairing.sidecar_for(row["member_path"], self.pairing_index) is not None
+                and self._pairing_for(row["member_path"], identity.path.name)[0].sidecar is not None
             ]
             if stale:
                 self.stats.archives_reopened += 1
@@ -448,6 +601,97 @@ class _Ingestor:
         return todo
 
     # -- phase 2 ------------------------------------------------------------
+
+    # The only `confidence` values `pairing.py` (and everything downstream
+    # that branches on them -- the RELATED date-tier/title/people policy)
+    # knows how to act on. An index row carrying anything else is a
+    # producer-side schema drift, not a pairing this code may trust.
+    _VALID_CONFIDENCES = frozenset({pairing.OWN, pairing.RELATED, pairing.NO_MATCH})
+
+    def _resolve_pairing(
+        self, member_path: str, archive_name: str,
+    ) -> tuple[pairing.Pairing, str, str | None]:
+        """The pairing for one member, from the index when it covers this
+        archive and knows this member, otherwise from the built-in rungs.
+        PURE: never touches `self.stats`.
+
+        Returns `(pairing, pair_rule, fallback_stat)`. `pair_rule` is the
+        index's own rule name when the index supplied the pairing, or the
+        literal string `"builtin"` when the built-in ladder did -- it does
+        not name its rungs, and inventing names for them here would be
+        fiction. `fallback_stat` is the `IngestStats` field name to
+        increment for this fallback, or None when no fallback happened: the
+        index supplied the pairing directly, or the index simply does not
+        cover this archive at all (coverage itself is counted once per
+        archive in `_survey`, never once per member here).
+
+        `_pairing_for` wraps this and applies the counting; `_survey`'s
+        claimed-sidecar loop (I2) calls this directly instead, because it
+        scans every member in the WHOLE batch for orphan/provenance
+        accounting -- routing that scan through `_pairing_for` would
+        double-count `pairings_related`/`pairings_own`/the fallback counters
+        against the real per-ingest tallies produced where each member is
+        actually ingested or re-checked (`_ingest_image`, `_defer_video`,
+        and the late-sidecar reopen check in `_survey`'s second pass).
+
+        The built-in ladder is always a correct answer, so it is consulted --
+        not merely counted -- whenever the index cannot supply a trustworthy
+        pairing of its own: it is missing the member, reports an unrecognized
+        `confidence`, names a sidecar that never actually arrived in this
+        batch, or (CRITICAL 1) reports the member has no sidecar at all. That
+        last case is not proof the member is unpairable -- it is proof only
+        that THIS index has nothing to say about it -- so returning it
+        directly would let an incomplete index silently cost a photo its date
+        even though the built-in ladder could still have found one.
+        """
+        if self.index is not None and self.index.covers(archive_name):
+            found = self.index.sidecar_for(member_path)
+            if found is None:
+                return (pairing.sidecar_for(member_path, self.pairing_index),
+                        "builtin", "index_members_fell_back")
+            if found.confidence not in self._VALID_CONFIDENCES:
+                logger.warning(
+                    "Takeout index has an unrecognized confidence %r for %s; "
+                    "falling back to built-in pairing", found.confidence, member_path,
+                )
+                return (pairing.sidecar_for(member_path, self.pairing_index),
+                        "builtin", "index_bad_confidence_fell_back")
+            if found.sidecar is not None and found.sidecar not in self._all_members:
+                return (pairing.sidecar_for(member_path, self.pairing_index),
+                        "builtin", "index_sidecars_missing")
+            if found.sidecar is None or found.confidence == pairing.NO_MATCH:
+                # I3: `confidence='none'` is a VALID confidence value, but a
+                # NON-NULL sidecar paired with it is not top-rung evidence --
+                # `pairing.py`'s own README-documented contract is that
+                # `none` contributes nothing. Treated exactly like
+                # `sidecar is None`: fall back to the built-in ladder and
+                # count it the same way, rather than silently applying this
+                # sidecar's date at DATE_EXTERNAL_SIDECAR while dropping
+                # title/people and never touching the own/related counters.
+                return (pairing.sidecar_for(member_path, self.pairing_index),
+                        "builtin", "index_no_sidecar_fell_back")
+            return pairing.Pairing(found.sidecar, found.confidence), found.rule, None
+        return pairing.sidecar_for(member_path, self.pairing_index), "builtin", None
+
+    def _pairing_for(self, member_path: str, archive_name: str) -> tuple[pairing.Pairing, str]:
+        """The pairing for one member, counted. See `_resolve_pairing` for
+        the actual resolution logic -- this applies exactly one layer of
+        counting on top of it: the fallback counter (if any fallback
+        happened) and the own/related pairing counters, together, so a
+        caller of `_resolve_pairing` alone (the whole-batch orphan scan in
+        `_survey`) never contributes to either.
+
+        Every fallback is counted. A silent fallback would make a stale index
+        indistinguishable from a working one.
+        """
+        result, pair_rule, fallback_stat = self._resolve_pairing(member_path, archive_name)
+        if fallback_stat is not None:
+            setattr(self.stats, fallback_stat, getattr(self.stats, fallback_stat) + 1)
+        if result.confidence == pairing.RELATED:
+            self.stats.pairings_related += 1
+        elif result.confidence == pairing.OWN:
+            self.stats.pairings_own += 1
+        return result, pair_rule
 
     def _zip_for(self, path: Path) -> zipfile.ZipFile:
         """Return a cached, open handle for *path*, opening it on first use.
@@ -595,7 +839,9 @@ class _Ingestor:
         member = archive.MemberInfo(
             path=member_path, size=row["size"], crc32=row["crc32"], kind=row["kind"]
         )
-        sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
+        pairing_result, pair_rule = self._pairing_for(member_path, identity.path.name)
+        sidecar_member = pairing_result.sidecar
+        confidence = pairing_result.confidence
         sidecar_raw = self._read_sidecar_bytes(sidecar_member) if sidecar_member else None
         meta = (
             metadata.parse_photo_metadata(sidecar_raw)
@@ -609,7 +855,21 @@ class _Ingestor:
                 staged,
                 source_label=self._label(identity.path, member_path),
                 evidence=ExternalEvidence(
-                    date=meta.photo_taken_at, original_name=meta.title
+                    date=meta.photo_taken_at,
+                    # A `related` sidecar's `title` is the ORIGINAL's
+                    # filename -- feeding it to the descriptor ladder would
+                    # rename an edit after its parent.
+                    original_name=(
+                        meta.title if confidence == pairing.OWN else None
+                    ),
+                    # A `related` sidecar's capture instant is still THIS
+                    # photograph's (it is usually the unedited original), but
+                    # it is trusted one rung lower than a sidecar that names
+                    # this file directly.
+                    date_tier=(
+                        tiers.DATE_RELATED_SIDECAR if confidence == pairing.RELATED
+                        else tiers.DATE_EXTERNAL_SIDECAR
+                    ),
                 ),
             )
         except Exception as exc:  # a member failure never fails the archive
@@ -665,12 +925,13 @@ class _Ingestor:
                     organized_path = Path(photo_row["organized_path"])
             if organized_path is not None:
                 self._merge_takeout_sidecar(organized_path, identity, member_path,
-                                            sidecar_member, sidecar_raw, meta)
+                                            sidecar_member, sidecar_raw, meta,
+                                            confidence, pair_rule)
 
     def _merge_takeout_sidecar(
         self, organized_path: Path, identity, member_path: str,
         sidecar_member: str | None, sidecar_raw: bytes | None,
-        meta: metadata.TakeoutMetadata,
+        meta: metadata.TakeoutMetadata, confidence: str, pair_rule: str,
     ) -> None:
         """Record Google's metadata as provenance. None of it is load-bearing.
 
@@ -705,6 +966,13 @@ class _Ingestor:
                     "archive": identity.path.name,
                     "member": sidecar_member,
                     "digest": _digest_bytes(sidecar_raw),
+                    # How this document came to be attached to this photo. A
+                    # `related` document describes a DIFFERENT file, so the
+                    # geoData inside `raw` is not this photo's location.
+                    # Recorded rather than deleted: dropping it would destroy
+                    # the audit trail.
+                    "confidence": confidence,
+                    "pair_rule": pair_rule,
                 }
                 parsed = _safe_json_loads(sidecar_raw)
                 if parsed is not None:
@@ -733,7 +1001,9 @@ class _Ingestor:
                     ),
                 }]
 
-            if meta.people:
+            # Face tags belong to the file the sidecar names. A `related`
+            # sidecar names a different file.
+            if meta.people and confidence == pairing.OWN:
                 updates["people"] = [
                     {"name": n, "source": "google_photos_people"} for n in meta.people
                 ]
@@ -757,7 +1027,8 @@ class _Ingestor:
         """
         member_path = row["member_path"]
         try:
-            sidecar_member = pairing.sidecar_for(member_path, self.pairing_index)
+            pairing_result, _pair_rule = self._pairing_for(member_path, identity.path.name)
+            sidecar_member = pairing_result.sidecar
             meta = self._read_sidecar(sidecar_member) if sidecar_member else metadata.EMPTY
             if sidecar_member is None:
                 self.stats.missing_metadata += 1
