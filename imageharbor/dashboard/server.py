@@ -61,13 +61,13 @@ _INDEX_HTML_PATH = Path(__file__).parent / "index.html"
 # the check happens against the header, before any read of the body itself.
 MAX_BODY_BYTES = 64 * 1024
 
-# The only two keys `control.overrides()` knows about (see control.py's
+# The only three keys `control.overrides()` knows about (see control.py's
 # module docstring: 'paused' has no env counterpart and is not part of the
 # override-precedence story). Validating against this set at the HTTP
 # boundary -- rather than letting an arbitrary string reach
 # ControlPlane.set_override/revert -- is what keeps a malformed request from
 # ever being "defended against on read" instead of rejected outright.
-_SETTINGS_KEYS = ("interval", "enrich")
+_SETTINGS_KEYS = ("interval", "enrich", "faces")
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -336,6 +336,8 @@ def make_handler(
                     )
             if "enrich" in body and not isinstance(body["enrich"], bool):
                 errors["enrich"] = "enrich must be a boolean"
+            if "faces" in body and not isinstance(body["faces"], bool):
+                errors["faces"] = "faces must be a boolean"
 
             if errors:
                 self._send_json(

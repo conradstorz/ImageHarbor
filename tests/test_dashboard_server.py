@@ -309,6 +309,29 @@ def test_post_settings_enrich_applies_override(handler_cls, control: ControlPlan
     assert control.enrich_enabled is False
 
 
+def test_post_settings_faces_applies_override(handler_cls, control: ControlPlane) -> None:
+    """`faces` must be reachable through the same HTTP boundary as
+    `interval`/`enrich` -- `_SETTINGS_KEYS` omitting it made this 400 as an
+    "unknown setting" even though `ControlPlane` already fully implements
+    the storage/resolution side (`_resolve_faces`, `faces_enabled`,
+    `set_override`'s `_FACES_KEY` branch, `overrides()`'s `faces` entry).
+    """
+    assert control.faces_enabled is False
+    status, _, body = _dispatch_json(handler_cls, "POST", "/api/settings", {"faces": True})
+    assert status == 200
+    # Round-trip through the store, not just the POST's own response --
+    # a second, independent read (control.faces_enabled) and the response
+    # body's own overrides() both must reflect it.
+    assert control.faces_enabled is True
+    assert body["overrides"]["faces"]["value"] is True
+    assert body["overrides"]["faces"]["overridden"] is True
+
+    status, _, body = _dispatch_json(handler_cls, "POST", "/api/settings", {"faces": False})
+    assert status == 200
+    assert control.faces_enabled is False
+    assert body["overrides"]["faces"]["value"] is False
+
+
 def test_post_settings_rejects_negative_interval(handler_cls, control: ControlPlane) -> None:
     status, _, _ = _dispatch_json(handler_cls, "POST", "/api/settings", {"interval": -5})
     assert status == 400
