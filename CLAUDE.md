@@ -35,6 +35,7 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 |------|---------|
 | Install deps + dev tools | `uv sync --extra dev` |
 | Add OpenAI classifier support | `uv sync --extra dev --extra openai` |
+| Add face recognition | `uv sync --extra dev --extra faces` |
 | Run all tests | `uv run pytest` |
 | Run one test file | `uv run pytest tests/test_pipeline.py` |
 | Run one test | `uv run pytest tests/test_pcs.py::test_resolve_code_known` |
@@ -437,7 +438,16 @@ Module responsibilities:
   match itself on a later merge and the list grows unboundedly. This is not a
   hypothetical failure mode — a `rejected` flag left out of this set once
   shipped as a Critical bug that grew a history entry per `watch` cycle,
-  forever. `migrate()` upgrades a v1 sidecar to v2 (the old `takeout` block
+  forever. The registry governs all three merge paths the same way:
+  `_merge_tiered`/`_merge_versioned` use it (via `_core()`) to decide whether
+  a superseded *block* matches itself for dedup, and `_merge_keyed_list` uses
+  it directly, per field, to decide whether a changed field on an existing
+  entry (e.g. `people[].confirmed_at`) advances in place like `last_seen`
+  rather than relocating the old value to that entry's `history[]` — the
+  mechanism differs, but skipping either one reintroduces the same unbounded
+  growth. (`_merge_keyed_list` did not consult the registry at all until this
+  was found and fixed during Task 8 — see the "Fix round 1" note in
+  `.superpowers/sdd/task-8-report.md`.) `migrate()` upgrades a v1 sidecar to v2 (the old `takeout` block
   becomes a `provenance[]` entry of `kind:
   "imageharbor_v1_takeout_block"`), itself losslessly and idempotently.
 - **`sidecar.py`** — optional, per-image `.json` metadata file (on by default —
@@ -474,23 +484,42 @@ Module responsibilities:
   it passes `quarantine=False` to `sidecar.read_sidecar` for exactly that
   reason.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
-  `catalog list/get`, `takeout ingest/status`, `sidecar backfill`). `watch`
-  gains two dashboard flags alongside its existing `--sidecar`-style options:
+  `catalog list/get`, `takeout ingest/status`, `sidecar backfill`, `faces
+  scan/cluster/calibrate/status/models download`). `watch` gains two
+  dashboard flags alongside its existing `--sidecar`-style options:
   `--dashboard-port` (`IMAGEHARBOR_DASHBOARD_PORT`, default `8080`) and
-  `--no-dashboard` (a bare flag; the dashboard is on by default). `watch`
-  builds one `dashboard.control.ControlPlane` per run and passes the *object*
-  itself into `watcher.watch(..., control=control)` — see `dashboard/` below
-  for why that matters.
+  `--no-dashboard` (a bare flag; the dashboard is on by default), plus four
+  faces flags: `--faces/--no-faces` (`IMAGEHARBOR_FACES`, off by default —
+  a new, heavier, opt-in extra must not start running face detection just
+  because `watch` was invoked), `--face-model-dir`
+  (`IMAGEHARBOR_FACE_MODEL_DIR`), `--face-threshold`
+  (`IMAGEHARBOR_FACE_THRESHOLD` — parsed by hand, not `type=float`, because
+  `docker-compose.yml` ships it as `""` on purpose until `faces calibrate`
+  has measured a real value, and click's float type raises on an empty
+  envvar string), and `--face-recluster-threshold`
+  (`IMAGEHARBOR_FACE_RECLUSTER_THRESHOLD`, default `500`). `--faces`
+  requested but the extra not importable is not fatal — it degrades to one
+  warning, exactly like an already-bound dashboard port does, and `watch`
+  builds one `dashboard.control.ControlPlane` per run (now also carrying
+  `env_faces`) and passes the *object* itself into
+  `watcher.watch(..., control=control)` — see `dashboard/` below for why
+  that matters.
 - **`dashboard/`** — the operational dashboard and control gateway that
   `watch` serves in-process on a daemon thread: library stats, evidence
-  quality, work queues, pass history, and a projection of remaining work, plus
-  pause/resume, a poll-interval override, and an AI-enrichment toggle. See
+  quality, work queues, pass history, a projection of remaining work, and (if
+  a `FaceStore` was wired in) a People review queue, plus pause/resume, a
+  poll-interval override, and AI-enrichment/faces toggles. See
   `docs/superpowers/specs/2026-08-19-dashboard-design.md` for the full design.
-  Four modules, split the same way `sidecar_schema.py` is split from
+  Five modules, split the same way `sidecar_schema.py` is split from
   `sidecar.py`: `projections.py` (pure, no I/O — the logic most likely to be
-  wrong), `stats.py` (reads the catalog into the `/api/stats` document),
-  `control.py` (the pause flag and the `settings`-table override precedence),
-  `server.py` (`http.server`, routing, the page).
+  wrong), `stats.py` (reads the catalog — and, when given one, a `FaceStore`
+  — into the `/api/stats` document), `control.py` (the pause flag and the
+  `settings`-table override precedence, now including `faces` alongside
+  `interval`/`enrich`), `server.py` (`http.server`, routing, the page),
+  `people.py` (the People review API — `confirm`/`reject`/`merge`/`split`,
+  thin validating wrappers around the matching `FaceStore` method; see
+  `imageharbor/faces/` below for why `confirm` never writes a sidecar
+  synchronously).
   - **Never-stop-the-watcher rule.** A dashboard failure — the port already
     bound, the server thread raising, a stats query failing — logs a warning
     and lets organizing continue; it never aborts a pass or the process. This
@@ -555,6 +584,67 @@ Module responsibilities:
     and a real `0`, would turn the next such defect into a type error
     instead of a silent misread — this is a deliberate follow-up, not done
     here.
+- **`faces/`** — a third pass, independent of facts and enrichment, that
+  detects faces, embeds and clusters them, and proposes person names from
+  photos Google Photos already tagged. It makes **no AI-backend call and no
+  ongoing network call** — everything runs in-process against local ONNX
+  models (one-time weights fetched by `faces models download` /
+  `download.py`, checksum-verified before use) — so it never touches
+  `AIClassifier`, never consults or feeds the circuit breaker, and needs no
+  account or API key. Split into a **pure core**, testable with zero model
+  weights, and a thin **I/O shell** around it, the same "logic vs. plumbing"
+  split as `sidecar_schema.py`/`sidecar.py`:
+  - Pure: `decode.py` (raw YuNet ONNX output → boxes/landmarks), `align.py`
+    (landmark-based face warp), `cluster.py` (`cluster_faces` — the
+    `MixedModelError` guard lives here), `attribute.py` (name proposals from
+    cluster + Google-tag overlap), `calibrate.py` (measures the clustering
+    threshold from the library's own anchor photos), `names.py`
+    (`normalize`/`case_variants`), and `preprocess.py` (`build_blob`, the
+    single preprocessing path `detect.py` and `embed.py` both call — a wrong
+    channel order here doesn't raise, it quietly returns worse embeddings,
+    which is why `tests/faces/test_preprocess.py` pins channel order,
+    mean/std, and NCHW layout against what `models.py` declares rather than
+    trusting a similarity threshold that could just drift).
+  - I/O: `detect.py`/`embed.py` (the only two modules that import
+    `onnxruntime`, wrapping a loaded ONNX session — construct one per
+    long-lived worker, never per photo), `store.py` (`FaceStore` — owns the
+    `faces`/`face_scan`/`clusters`/`people`/`proposals` tables in the same
+    SQLite file `Catalog` uses, via its own connection; only `confirm`/`merge`
+    ever *assign a new* person to a cluster — `replace_clusters` also writes
+    `clusters.person_id`, but only to restore one a human already confirmed),
+    and `runner.py` (`scan` — per-photo, resumable; `build_clusters` —
+    whole-library; `propagate_sidecars` — writes confirmed names into
+    sidecars, guarded so a repeat run is byte-identical; `google_names` —
+    reads Google-tagged names straight from sidecars for `cluster`/
+    `calibrate`, which only take `--dest`).
+  - `imageharbor.faces.HAS_ONNX` (set at import time, catching every failure
+    — missing package, ABI mismatch, anything — as the same "can't run a
+    model" answer) is the one importability signal the whole feature gates
+    on. `cli.py`'s `_require_onnx()` turns a raw `ModuleNotFoundError` into
+    an actionable message for the `faces` subcommands; `watcher.
+    faces_available()` is the identical check for `watch`, read fresh on
+    every cycle (never cached at import time) so a test's
+    `monkeypatch.setattr(faces_pkg, "HAS_ONNX", False)` is actually visible.
+  - **`watch --faces` wiring.** `cli.py` builds one `Detector`/`Embedder`/
+    `FaceStore` per run (loading an ONNX session is too expensive to repeat
+    every poll) into a `watcher.FacesConfig`, then `watch()`'s third pass —
+    after facts and enrichment — runs `runner.scan` (per-photo, `should_stop`
+    wired to the same pause check the other two passes use) and
+    `runner.propagate_sidecars` every cycle, but calls `runner.build_clusters`
+    — a whole-library operation — only when `FaceStore.unclustered_face_
+    count` exceeds `FacesConfig.recluster_threshold` (default `500`) or no
+    cluster exists yet. **`watch` never passes `--recluster`**, for the same
+    reason it never passes `--reclassify` (see the enrichment monotonicity
+    invariant above): a continuous loop must never treat "run again" as
+    "start over". If `faces_available()` is false, or clustering is due but
+    no threshold is configured yet, `watch()` logs exactly one warning for
+    the life of the run and skips — never per cycle, so a permanently-absent
+    extra or an un-calibrated threshold doesn't flood the log for days —
+    while organizing and enrichment continue unaffected. Crop cache:
+    `<catalog_dir>/face-crops/<ab>/<cd>/<digest>-<i>.jpg`, sharded two
+    levels, on the catalog volume rather than the (possibly NAS-mounted)
+    `--dest` tree — regenerable from the stored bbox at any time, so losing
+    it costs a re-crop, never a re-detect.
 
 ## Critical invariants — do not break these
 
@@ -675,6 +765,62 @@ Module responsibilities:
   way.
 - **Runtime output directories are git-ignored, not source** (`Photos-Organized/`,
   `Review/`, `Duplicates/`, `Logs/`, `catalog.db`, etc. in `.gitignore`).
+- **Faces never rename or move a file.** No code path in `imageharbor/faces/`
+  calls `tiers.is_upgrade` or `relocate` — a detected/clustered/confirmed face
+  changes catalog rows and, once confirmed, a photo's sidecar `people` list,
+  never its path or filename. This is the same "identity lives in the
+  sidecar, not the name" posture PCS classification already has, applied to a
+  fact that is far more personal to get wrong.
+- **No identity is written without human confirmation.** `FaceStore.confirm`
+  and `FaceStore.merge` are the *only* two methods that ever *assign a new*
+  person to a cluster; `record_proposals` (what `faces cluster` calls) only
+  ever writes to the `proposals` table and is guaranteed never to touch
+  `person_id` — see `store.py`'s own mutation-tested guarantee.
+  `replace_clusters` (a recluster) also writes `clusters.person_id`, but only
+  to restore a person a human already confirmed onto its old cluster; it
+  never invents one, so no identity is ever written without a human behind
+  it. A rejected proposal is recorded as rejected, not deleted, so the same
+  wrong guess isn't re-proposed every pass. This mirrors `pairing.sidecar_for`
+  returning `None` rather than guessing a Takeout pairing, and
+  `date_resolver` refusing mtime rather than assert a date it can't support —
+  applied here to a person's name, which is both easier to get wrong
+  unnoticed and more personal than a wrong date.
+- **Embeddings are never compared across `embed_model` values.** A vector from
+  one model shares a coordinate space with another only by coincidence, so a
+  cross-model comparison is not merely wrong, it's a *plausible-looking*
+  number that means nothing — worse than an error. `cluster.cluster_faces`
+  raises `MixedModelError` rather than silently averaging or comparing across
+  models, and `FaceStore.iter_face_vectors` filters to one `embed_model`
+  before anything reaches clustering. Do not add a call path that pools
+  vectors from two `embed_model`s to "get more data" — reprocessing under the
+  new model is the only correct way to compare across a model swap.
+- **Face failures never feed the circuit breaker.** That circuit is reserved
+  for `AIClassifier.describe()` failures (AI-perception evidence about the
+  backend); a face-scan failure (a corrupt image, a decode error) is a local
+  filesystem/image fault with no bearing on the AI backend's health.
+  `faces.runner.scan` catches per-photo exceptions itself and records them
+  into `failed_files` via `catalog.record_file_failure` — the same table the
+  enrichment pass's poison-quarantine bookkeeping uses — and never calls
+  `breaker.record_failure`. `watch()`'s faces-pass block (`watcher.py`)
+  mirrors this: it wraps the whole pass in its own `try/except` so a crash
+  there can't take the loop down, and that block never references *breaker*
+  at all.
+- **Name identity is exact.** No fuzzy, similarity-based, or case-insensitive
+  name merging, ever — `names.normalize` only strips and collapses
+  whitespace; it deliberately leaves case alone. This library's own tagged
+  vocabulary is why: `Conrad Storz` (3,309 photos) and `Conrad Storz III`
+  (980 photos) are a father and son distinguished only by a suffix, and
+  `pete storz`/`claire Storz`'s lowercase drift looks identical in *shape* to
+  that real distinction. A scheme that can't tell those two cases apart must
+  not auto-merge either one — case variants are only ever *reported*
+  (`names.case_variants`) for a human to confirm.
+- **Embeddings are L2-normalized where they are produced.** `Embedder.embed_
+  batch` normalizes every vector before returning it, so cosine similarity
+  and Euclidean distance stay equivalent for every downstream consumer —
+  `cluster.py`'s centroid averaging, `calibrate.py`'s pairwise similarities —
+  without each of them re-normalizing (or worse, one of them forgetting to).
+  A stored embedding that somehow isn't unit-length is a bug upstream of
+  storage, not something a consumer should silently correct for.
 
 ## Known limitations
 

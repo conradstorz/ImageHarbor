@@ -1,10 +1,11 @@
 """Collect the catalog into the ``/api/stats`` document.
 
-``collect(catalog, control, *, breaker=None, now=None)`` is the single entry
-point: it composes one small, independent function per section (``now``,
-``library``, ``evidence``, ``queues``, ``history``, ``projection``,
-``overrides``) and returns them all as one plain-dict JSON document, per the
-design's "one document rather than several endpoints" rule (see
+``collect(catalog, control, *, breaker=None, now=None, face_store=None)`` is
+the single entry point: it composes one small, independent function per
+section (``now``, ``library``, ``evidence``, ``queues``, ``history``,
+``projection``, ``overrides``, ``faces``) and returns them all as one
+plain-dict JSON document, per the design's "one document rather than several
+endpoints" rule (see
 ``docs/superpowers/specs/2026-08-19-dashboard-design.md``, "HTTP surface").
 
 Accepted inconsistency, and the lock that is NOT a fix for it
@@ -77,13 +78,23 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from imageharbor import tiers
 from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.dashboard import projections
 from imageharbor.dashboard.control import ControlPlane
+
+# FaceStore is only ever used in type annotations here (never instantiated
+# or called), and this module has `from __future__ import annotations`
+# above, so the annotation is never evaluated at runtime. Importing it at
+# module scope would still require numpy (see imageharbor/faces/store.py's
+# module-scope `import numpy as np`) even when the dashboard is running
+# without faces enabled -- the exact bug this TYPE_CHECKING guard exists to
+# avoid. See CLAUDE.md's "a missing extra degrades to one warning" invariant.
+if TYPE_CHECKING:
+    from imageharbor.faces.store import FaceStore
 
 logger = logging.getLogger(__name__)
 
@@ -566,6 +577,38 @@ def _projection_section(
 
 
 # ---------------------------------------------------------------------------
+# faces
+# ---------------------------------------------------------------------------
+
+
+def _faces_section(face_store: FaceStore | None) -> dict:
+    """`FaceStore.stats()` under a `"wired"` flag, per the design's People panel.
+
+    Unlike every other section, ``face_store`` being absent is not a query
+    failure to hide behind ``_safe``'s ``None`` -- it is the ordinary state
+    of a deployment that never enabled `IMAGEHARBOR_FACES` (`cli.py`'s
+    `watch` only constructs a `FaceStore` when faces are enabled and the
+    `faces` extra is importable). Collapsing that into `None` would make it
+    indistinguishable from "the faces query itself raised", which
+    `_safe` already reports the same way for every other section -- so this
+    function always returns a real dict, with `"wired": False` and the count
+    fields explicitly `None` when there is no store to query, mirroring
+    `_now_section`'s `breaker is None` handling above.
+    """
+    if face_store is None:
+        return {
+            "wired": False,
+            "faces": None,
+            "scanned": None,
+            "clusters": None,
+            "people": None,
+            "unreviewed": None,
+            "singletons": None,
+        }
+    return {"wired": True, **face_store.stats()}
+
+
+# ---------------------------------------------------------------------------
 # overrides
 # ---------------------------------------------------------------------------
 
@@ -585,6 +628,7 @@ def collect(
     *,
     breaker: CircuitBreaker | None = None,
     now: datetime | None = None,
+    face_store: FaceStore | None = None,
 ) -> dict:
     """Build the whole `/api/stats` document.
 
@@ -593,6 +637,16 @@ def collect(
     detect and refuse (see e.g. `_window_summary`'s `now` check) rather than
     something silently coerced here, since a caller-supplied `now` is exactly
     what makes the projection and history windows testable.
+
+    ``face_store``, when given, is queried for the `"faces"` section
+    (`FaceStore.stats()`). It is passed in rather than opened here because a
+    `FaceStore` is only constructed by a caller that actually enabled and
+    can run the faces pass (see `cli.py`'s `watch`) -- `collect()` itself
+    must not decide whether faces are wired up, only report what it is
+    handed. Unlike every other section, `face_store=None` is a real,
+    expected state (faces never enabled), not a query failure -- see
+    `_faces_section`'s docstring for how it stays distinct from `_safe`'s
+    `None`.
 
     Every section is independently wrapped by `_safe`: a query that raises
     logs and reports that section as `None` rather than failing the whole
@@ -624,4 +678,5 @@ def collect(
             resolved_now, unenriched_count,
         ),
         "overrides": _safe("overrides", _overrides_section, control),
+        "faces": _safe("faces", _faces_section, face_store),
     }

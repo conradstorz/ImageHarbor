@@ -87,6 +87,72 @@ To disable the dashboard entirely, set `command: watch --no-dashboard` (or add
 same either way; a dashboard failure (e.g. the port already bound on the host)
 never stops it, it only logs a warning.
 
+## 6. Faces (optional)
+
+`docker-compose.yml` ships with `IMAGEHARBOR_FACES: "1"`, so face detection
+and clustering already run as a third pass alongside facts and enrichment. It
+needs no AI backend, no account, and no ongoing network call — only a
+one-time model download the first time `faces scan` (or `watch` itself) runs.
+Set `IMAGEHARBOR_FACES: "0"` (or add `--no-faces` to `command:`) to turn it
+off entirely.
+
+### Model weights live on their own volume
+
+`docker-compose.yml` mounts a dedicated `imageharbor-models` volume at
+`/data/models` (`IMAGEHARBOR_FACE_MODEL_DIR`). The default detector +
+embedder pair is **~261 MB**, downloaded and checksummed once. Without this
+volume, that download would repeat on every container recreate — an image
+update, a host reboot, a plain `docker compose up` after `down` — because a
+container's writable layer doesn't survive those; the named volume is what
+makes the download a true one-time cost. `docker compose down -v` (which
+removes volumes, not just containers) or a fresh host is what actually
+triggers a re-download — a plain restart does not.
+
+### Calibrate before you cluster
+
+`IMAGEHARBOR_FACE_THRESHOLD` ships **empty** in `docker-compose.yml` on
+purpose: a clustering threshold chosen before any embeddings exist would be a
+guess, and this project doesn't ship guesses (see `CLAUDE.md`'s invariants).
+With it empty, the faces pass still scans every photo and propagates
+already-confirmed names each cycle — it only skips whole-library
+clustering, logging one warning (not one per cycle) until a threshold is
+set. Measure it from this library's own tagged photos, in this order:
+
+```
+docker compose run --rm imageharbor faces scan --dest /data/dest
+docker compose run --rm imageharbor faces calibrate --dest /data/dest
+```
+
+`--catalog`/`--model-dir` don't need repeating here: both `faces` subcommands
+read `IMAGEHARBOR_CATALOG` and `IMAGEHARBOR_FACE_MODEL_DIR` from the
+container's own environment (the same values `watch` already uses), so they
+default to the running container's real catalog and model directory. `scan`
+detects and embeds every organized photo not yet scanned (resumable —
+re-running it is a no-op for anything already done); `calibrate` prints a
+threshold and precision/recall measured against this library's own
+Google-tagged anchor photos, plus the exact `faces cluster` command to run
+with it.
+
+Set the printed value in `docker-compose.yml`:
+
+```yaml
+IMAGEHARBOR_FACE_THRESHOLD: "0.42"   # whatever `faces calibrate` printed
+```
+
+then `docker compose up -d` to restart the container with it. From then on,
+`watch` reclusters the whole library on its own — see `CLAUDE.md`'s `faces/`
+section for the threshold that gates *when* (`IMAGEHARBOR_FACE_RECLUSTER_
+THRESHOLD`, default 500 unclustered faces, or immediately if no cluster
+exists yet) rather than reclustering on every single poll.
+
+### Reviewing and confirming names
+
+Nothing is written to a photo until a human confirms a cluster in the
+dashboard's People panel (`http://<docker-host>:8080/`) — clustering only
+ever *proposes* a name from the overlap between a cluster and Google's own
+tags. Faces never rename or move a file and never appear in a filename
+either way.
+
 ## Notes
 
 - Watching is **poll-based** (default 300s via `IMAGEHARBOR_INTERVAL`), because

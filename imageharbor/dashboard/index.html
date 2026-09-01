@@ -161,6 +161,102 @@
     font-size: 0.85rem;
   }
   .error-banner.visible { display: block; }
+
+  /* -- People review section -------------------------------------- */
+  .people-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.85rem;
+    font-size: 0.85rem;
+  }
+  .cluster-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 0.9rem;
+  }
+  .cluster-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    background: var(--bg);
+  }
+  .crop-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.3rem;
+    margin-bottom: 0.5rem;
+  }
+  .crop-grid img, .crop-grid .crop-missing {
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    border-radius: 4px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+  }
+  .crop-grid .crop-missing {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 0.7rem;
+  }
+  .crop-item { position: relative; display: block; }
+  .crop-item input.crop-select {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 1rem;
+    height: 1rem;
+  }
+  .variant-chip-name { font-weight: 600; }
+  .cluster-card .face-count { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.5rem; }
+  .proposal {
+    border-top: 1px solid var(--border);
+    padding: 0.5rem 0;
+  }
+  .proposal p.evidence { margin: 0 0 0.4rem; font-size: 0.88rem; }
+  .proposal .evidence strong { color: var(--accent); }
+  .action-row { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+  .action-row input[type=text] {
+    font: inherit;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    width: 10rem;
+  }
+  .action-row select {
+    font: inherit;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+  }
+  button.small { padding: 0.25rem 0.6rem; font-size: 0.82rem; }
+  button.danger { color: var(--bad); border-color: var(--bad); }
+  .manual-row, .split-row, .merge-row { margin-top: 0.4rem; }
+  .case-variant-list, .people-list { list-style: none; margin: 0; padding: 0; font-size: 0.85rem; }
+  .case-variant-list li, .people-list li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    padding: 0.3rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .case-variant-list li:last-child, .people-list li:last-child { border-bottom: none; }
+  .variant-chip {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05rem 0.35rem;
+  }
 </style>
 </head>
 <body>
@@ -261,6 +357,23 @@
       <label><input type="checkbox" id="enrich-toggle"> AI enrichment enabled</label>
       <span id="enrich-override" class="override-warning" style="display:none;"></span>
     </div>
+  </section>
+
+  <section class="panel wide" id="people">
+    <h2>People</h2>
+    <div class="people-toolbar">
+      <span id="people-stats" class="muted">loading…</span>
+      <label><input type="checkbox" id="people-include-singletons"> Show singleton clusters</label>
+      <span id="people-singletons-note" class="muted"></span>
+    </div>
+
+    <div id="people-case-variants"></div>
+
+    <div id="people-grid" class="cluster-grid">
+      <p class="muted">loading…</p>
+    </div>
+
+    <datalist id="known-names-list"></datalist>
   </section>
 
 </main>
@@ -536,6 +649,362 @@
 
   tick();
   setInterval(tick, POLL_MS);
+})();
+</script>
+
+<script>
+(function () {
+  "use strict";
+  // Deliberately a second, separate IIFE with its own postJSON/error
+  // handling rather than reusing the block above: a bug in the People
+  // review flow (POST failure, a malformed proposal, whatever) must never
+  // stop /api/stats polling -- "a dashboard failure never stops
+  // organizing" applies to this section as much as to anything else on
+  // the page.
+
+  const POLL_PEOPLE_MS = 10000;
+  const $ = (id) => document.getElementById(id);
+  const section = $("people");
+  if (!section) return; // defensive: keep the rest of the page working even if this markup is ever missing
+
+  let includeSingletons = false;
+  let lastDoc = null;
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[ch]));
+  }
+
+  function showPeopleError(msg) {
+    // Shares the page's one error banner -- already the page's convention
+    // for "something failed, the rest of the page keeps working."
+    const el = $("error-banner");
+    if (!el) return;
+    if (msg) {
+      el.textContent = msg;
+      el.classList.add("visible");
+    } else {
+      el.classList.remove("visible");
+    }
+  }
+
+  async function postJSON(url, body) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let data = null;
+    try { data = await resp.json(); } catch (e) { /* no JSON body */ }
+    if (!resp.ok) {
+      throw new Error("request failed (" + resp.status + ") " + ((data && data.error) || ""));
+    }
+    return data;
+  }
+
+  // A crop is a derived, deletable-at-any-time cache (see
+  // dashboard/people.py's crop_bytes docstring) -- a 404 here is routine,
+  // not an error, and must degrade to a placeholder tile rather than a
+  // broken-image icon breaking the grid. `error` doesn't bubble, so this
+  // is a capture-phase listener on the section rather than per-image
+  // `onerror` markup.
+  section.addEventListener("error", (e) => {
+    const img = e.target;
+    if (img && img.tagName === "IMG" && img.classList.contains("face-crop")) {
+      const placeholder = document.createElement("div");
+      placeholder.className = "crop-missing";
+      placeholder.textContent = "no crop";
+      img.replaceWith(placeholder);
+    }
+  }, true);
+
+  // The Kelvin sign (U+212A) renders identically to plain 'K' in most
+  // fonts -- see imageharbor/faces/names.py's case_variants docstring.
+  // Left as plain text, a suggestion pairing them reads as "K may be the
+  // same person as K", which looks like a tool bug rather than a real
+  // finding. Tagging any non-ASCII-printable character with its code
+  // point (only when one is present -- ordinary names stay unadorned)
+  // lets the operator tell the two strings apart.
+  function codepointSuffix(name) {
+    let codepoints = "";
+    for (const ch of name) {
+      const cp = ch.codePointAt(0);
+      if (cp < 0x20 || cp > 0x7e) {
+        codepoints += (codepoints ? " " : "") + "U+" + cp.toString(16).toUpperCase().padStart(4, "0");
+      }
+    }
+    return codepoints;
+  }
+
+  function labelWithCodepoints(name) {
+    const codepoints = codepointSuffix(name);
+    return escapeHtml(name) + (codepoints ? ' <span class="variant-chip">' + escapeHtml(codepoints) + "</span>" : "");
+  }
+
+  // `<option>` only ever renders plain text -- the HTML chip above doesn't
+  // apply inside a <select>, so a dropdown offering "K" and "K" (Kelvin
+  // sign) is exactly as indistinguishable as the raw strings. Append the
+  // code point as plain text instead, so the two options actually read
+  // differently in the picker itself, not just in the sentence above it.
+  function plainLabelWithCodepoints(name) {
+    const codepoints = codepointSuffix(name);
+    return name + (codepoints ? " (" + codepoints + ")" : "");
+  }
+
+  function renderCropGrid(faceIds) {
+    if (!faceIds || !faceIds.length) {
+      return '<p class="muted">no sample faces</p>';
+    }
+    return '<div class="crop-grid">' + faceIds.map((fid) =>
+      '<label class="crop-item" title="check to include this face in a split">' +
+        '<img class="face-crop" src="/api/face-crop/' + fid + '" alt="face ' + fid + '">' +
+        '<input type="checkbox" class="crop-select" data-face-id="' + fid + '">' +
+      "</label>"
+    ).join("") + "</div>";
+  }
+
+  // The evidence sentence is the entire value proposition: the operator
+  // must see the payoff (untagged_photos) before clicking, not after.
+  function renderProposal(clusterId, p) {
+    const name = escapeHtml(p.name);
+    return (
+      '<div class="proposal">' +
+        '<p class="evidence">' + name + " — <strong>" + p.support + " of " + p.total_tagged +
+          "</strong> named photos in this cluster agree. Confirming names <strong>" +
+          p.untagged_photos + "</strong> photos Google never tagged.</p>" +
+        '<div class="action-row">' +
+          '<button class="small primary" data-action="confirm" data-cluster-id="' + clusterId +
+            '" data-name="' + name + '">Confirm ' + name + "</button>" +
+          '<button class="small danger" data-action="reject" data-cluster-id="' + clusterId +
+            '" data-name="' + name + '">Reject</button>' +
+        "</div>" +
+      "</div>"
+    );
+  }
+
+  function renderClusterCard(doc, c) {
+    // A proposal the operator already rejected stays in the API response
+    // (FaceStore.reject records, never deletes -- store.py) but has no
+    // business taking up space in a review card again.
+    const proposals = (c.proposals || []).filter((p) => p.decided !== "rejected");
+    const proposalsHtml = proposals.length
+      ? proposals.map((p) => renderProposal(c.cluster_id, p)).join("")
+      : '<p class="muted">no name proposals for this cluster</p>';
+
+    const peopleOptions = (doc.people || []).map((p) =>
+      '<option value="' + p.person_id + '">' + escapeHtml(p.name) + " (" + p.cluster_count +
+      " cluster" + (p.cluster_count === 1 ? "" : "s") + ")</option>"
+    ).join("");
+
+    return (
+      '<div class="cluster-card" data-cluster-id="' + c.cluster_id + '">' +
+        renderCropGrid(c.sample_face_ids) +
+        '<div class="face-count">' + c.face_count + " face" + (c.face_count === 1 ? "" : "s") +
+          " in this cluster</div>" +
+        proposalsHtml +
+        '<div class="manual-row action-row">' +
+          '<input type="text" list="known-names-list" placeholder="Name this person…" data-role="manual-name">' +
+          '<button class="small" data-action="manual-confirm" data-cluster-id="' + c.cluster_id + '">Name manually</button>' +
+        "</div>" +
+        '<div class="merge-row action-row">' +
+          '<select data-role="merge-target">' +
+            '<option value="">Merge into…</option>' + peopleOptions +
+          "</select>" +
+          '<button class="small" data-action="merge-cluster" data-cluster-id="' + c.cluster_id + '">Merge</button>' +
+        "</div>" +
+        '<div class="split-row action-row">' +
+          '<button class="small" data-action="split" data-cluster-id="' + c.cluster_id + '">Split checked faces out</button>' +
+          '<span class="muted">check face thumbnails above first</span>' +
+        "</div>" +
+      "</div>"
+    );
+  }
+
+  // `case_variants`' dict *keys* are a per-character-lowercased string that
+  // can merge strings nobody actually typed (see
+  // imageharbor/faces/names.py); only the *values* are real names, and
+  // this renders only those. This is a suggestion list -- see the
+  // module docstring in dashboard/people.py -- never an automatic merge:
+  // the operator still supplies which variant to keep. What they no longer
+  // supply is cluster IDs -- `people[].cluster_ids` (added alongside this
+  // control) lets the click handler discover the other spellings' cluster
+  // ids itself, so there is nothing left to type.
+  function renderCaseVariants(doc) {
+    const container = $("people-case-variants");
+    if (!container) return;
+    const groups = doc.case_variants || {};
+    const keys = Object.keys(groups);
+    if (!keys.length) {
+      container.innerHTML = "";
+      return;
+    }
+    const items = keys.map((key) => {
+      const variants = groups[key];
+      const chips = variants.map((v) => '<span class="variant-chip-name">' + labelWithCodepoints(v) + "</span>").join(" vs. ");
+      const options = variants.map((v) =>
+        '<option value="' + escapeHtml(v) + '">' + escapeHtml(plainLabelWithCodepoints(v)) + "</option>"
+      ).join("");
+      return (
+        '<li data-group="' + escapeHtml(key) + '">' +
+          "<span>These may be the same person: " + chips + "</span>" +
+          '<select data-role="keep-as">' + options + "</select>" +
+          '<button class="small" data-action="merge-variants">Merge into selected</button>' +
+        "</li>"
+      );
+    }).join("");
+    container.innerHTML =
+      '<p class="muted" style="margin-top:0;">These may be the same person (spellings differ only by case) --' +
+      " pick which spelling to keep, nothing here merges on its own:</p>" +
+      '<ul class="case-variant-list">' + items + "</ul>";
+  }
+
+  function renderPeopleDoc(doc) {
+    lastDoc = doc;
+    const stats = doc.stats || {};
+    $("people-stats").textContent =
+      (stats.unreviewed ?? "?") + " cluster(s) awaiting review · " +
+      (stats.people ?? "?") + " people confirmed · " +
+      (stats.faces ?? "?") + " faces scanned";
+
+    // singletons_hidden is reported unconditionally -- hiding the noise is
+    // fine, hiding the fact that it was hidden is not.
+    $("people-singletons-note").textContent = doc.singletons_hidden
+      ? doc.singletons_hidden + " singleton cluster(s) (one face) " +
+        (includeSingletons ? "shown below" : "hidden -- toggle to review them")
+      : "no singleton clusters";
+
+    renderCaseVariants(doc);
+
+    const namesList = $("known-names-list");
+    if (namesList) {
+      const names = Array.from(new Set((doc.people || []).map((p) => p.name))).sort();
+      namesList.innerHTML = names.map((n) => '<option value="' + escapeHtml(n) + '">').join("");
+    }
+
+    const grid = $("people-grid");
+    const clusters = doc.clusters || [];
+    grid.innerHTML = clusters.length
+      ? clusters.map((c) => renderClusterCard(doc, c)).join("")
+      : '<p class="muted">nothing waiting on review.</p>';
+  }
+
+  async function fetchPeople() {
+    try {
+      const resp = await fetch("/api/people" + (includeSingletons ? "?include_singletons=1" : ""));
+      if (resp.status === 404) {
+        // store/crop_dir not wired in for this catalog -- not an error,
+        // just nothing to review here (see server.py's _handle_people).
+        $("people-stats").textContent = "face review is not enabled for this catalog.";
+        $("people-grid").innerHTML = "";
+        $("people-case-variants").innerHTML = "";
+        return;
+      }
+      if (!resp.ok) throw new Error("people fetch failed: " + resp.status);
+      const doc = await resp.json();
+      renderPeopleDoc(doc);
+      showPeopleError(null);
+    } catch (err) {
+      showPeopleError("People section could not refresh: " + err.message);
+    }
+  }
+
+  // Skip the background poll while the operator has a field in this
+  // section focused -- a full re-render on a 10s tick would otherwise
+  // wipe out an in-progress typed name or a checked split selection.
+  // An explicit action (toggle, confirm, merge, ...) still always
+  // re-fetches immediately regardless of focus.
+  function pollUnlessEditing() {
+    const active = document.activeElement;
+    if (active && section.contains(active) && (active.tagName === "INPUT" || active.tagName === "SELECT")) {
+      return;
+    }
+    fetchPeople();
+  }
+
+  section.addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+    const action = btn.dataset.action;
+    try {
+      if (action === "confirm") {
+        await postJSON("/api/people/confirm", {
+          cluster_id: Number(btn.dataset.clusterId),
+          name: btn.dataset.name,
+        });
+      } else if (action === "reject") {
+        await postJSON("/api/people/reject", {
+          cluster_id: Number(btn.dataset.clusterId),
+          name: btn.dataset.name,
+        });
+      } else if (action === "manual-confirm") {
+        const card = btn.closest(".cluster-card");
+        const input = card.querySelector('[data-role="manual-name"]');
+        const name = (input.value || "").trim();
+        if (!name) { showPeopleError("enter a name first"); return; }
+        await postJSON("/api/people/confirm", {
+          cluster_id: Number(btn.dataset.clusterId),
+          name: name,
+        });
+      } else if (action === "merge-cluster") {
+        const card = btn.closest(".cluster-card");
+        const select = card.querySelector('[data-role="merge-target"]');
+        if (!select.value) { showPeopleError("choose a person to merge into first"); return; }
+        await postJSON("/api/people/merge", {
+          person_id: Number(select.value),
+          cluster_ids: [Number(btn.dataset.clusterId)],
+        });
+      } else if (action === "split") {
+        const card = btn.closest(".cluster-card");
+        const faceIds = Array.from(card.querySelectorAll(".crop-select:checked"))
+          .map((cb) => Number(cb.dataset.faceId));
+        if (!faceIds.length) { showPeopleError("check at least one face above to split out"); return; }
+        await postJSON("/api/people/split", {
+          cluster_id: Number(btn.dataset.clusterId),
+          face_ids: faceIds,
+        });
+      } else if (action === "merge-variants") {
+        const li = btn.closest("li[data-group]");
+        const targetName = li.querySelector('[data-role="keep-as"]').value;
+        const people = (lastDoc && lastDoc.people) || [];
+        const person = people.find((p) => p.name === targetName);
+        if (!person) {
+          showPeopleError('"' + targetName + '" has no confirmed person yet -- confirm a cluster with that name first');
+          return;
+        }
+        // The other spellings in this group -- everything but the one the
+        // operator chose to keep. `data-group` round-trips through the DOM
+        // HTML-decoded, so it matches a `case_variants` key exactly (see
+        // renderCaseVariants above).
+        const variants = ((lastDoc && lastDoc.case_variants) || {})[li.dataset.group] || [];
+        const clusterIds = variants
+          .filter((name) => name !== targetName)
+          .flatMap((name) => {
+            const p = people.find((pp) => pp.name === name);
+            return p ? p.cluster_ids : [];
+          });
+        if (!clusterIds.length) {
+          showPeopleError("nothing to merge -- the other spelling(s) have no clusters left to move");
+          return;
+        }
+        await postJSON("/api/people/merge", { person_id: person.person_id, cluster_ids: clusterIds });
+      } else {
+        return;
+      }
+      showPeopleError(null);
+      await fetchPeople();
+    } catch (err) {
+      showPeopleError(err.message);
+    }
+  });
+
+  $("people-include-singletons").addEventListener("change", (e) => {
+    includeSingletons = e.target.checked;
+    fetchPeople();
+  });
+
+  fetchPeople();
+  setInterval(pollUnlessEditing, POLL_PEOPLE_MS);
 })();
 </script>
 </body>

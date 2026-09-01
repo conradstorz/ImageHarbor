@@ -36,7 +36,14 @@ VERSIONED_BLOCKS: tuple[str, ...] = ("classification",)
 KEYED_LISTS: dict[str, tuple[str, ...]] = {
     "sources": ("path",),
     "albums": ("archive_id", "folder"),
-    "people": ("name",),
+    # Keyed on (name, source), not name alone. Google tagging "Suzanne Storz"
+    # and a confirmed face cluster identifying her are two true facts about the
+    # same photo, from different evidence. Under a name-only key the second
+    # would supersede the first's `source` and relocate it to history --
+    # recording them as if they conflicted. No migration is needed: every entry
+    # ever written already carries a `source`, so the wider key resolves them
+    # unchanged.
+    "people": ("name", "source"),
     "provenance": ("digest",),
 }
 
@@ -50,12 +57,18 @@ FLAT_MAPS: tuple[str, ...] = ("identity", "exif")
 # instead of a throwaway list nobody reads, which used to silently discard it.
 FLAT_MAP_HISTORY_KEYS: dict[str, str] = {"exif": "exif_history", "identity": "identity_history"}
 
-# Fields that annotate an observation rather than identify it. `_core` strips
-# every one, because a history entry's identity is the VALUE it records --
-# never when it was seen, nor why it lost. Adding a key here is how you make a
-# new annotation safe; forgetting to is how unbounded growth gets reintroduced.
+# Fields that annotate an observation rather than identify it. Governs all
+# three merge paths, the same way everywhere: `_core` strips every one of
+# them before `_relocate` dedups a tiered/versioned block, because a history
+# entry's identity is the VALUE it records -- never when it was seen, nor why
+# it lost; and `_merge_keyed_list` advances every one of them straight to the
+# newest observation without relocating the superseded value (`first_seen` is
+# the one deliberate exception -- see its docstring). Adding a key here is
+# how you make a new annotation safe on EVERY path; forgetting to is how
+# unbounded growth gets reintroduced.
 _ANNOTATION_FIELDS = frozenset({
     "observed_at", "superseded_at", "first_seen", "last_seen", "rejected", "history",
+    "confirmed_at",
 })
 
 
@@ -194,7 +207,7 @@ def _merge_versioned(base: Any, new: Any, observed_at: str) -> dict[str, Any]:
 def _merge_keyed_list(base: Any, new: Any, keys: tuple[str, ...], observed_at: str) -> list:
     """Append-only union. An existing entry gains fields; it never loses any.
 
-    Three policies operate on an existing entry's fields:
+    Two policies operate on an existing entry's fields:
 
     * `first_seen` keeps the *earliest* value seen so far -- a later
       re-report of the already-recorded first sighting is the same fact, not
@@ -203,24 +216,33 @@ def _merge_keyed_list(base: Any, new: Any, keys: tuple[str, ...], observed_at: s
       processed before archive A, even though A's copy actually came first)
       is real information and must not vanish: the later, now-superseded
       value is relocated to history exactly like any other differing field,
-      never silently overwritten.
-    * `last_seen` always advances to the newest observation; the superseded
-      timestamp is redundant with the new one (both just say "still here"),
-      so it is not recorded either. This -- along with `observed_at` on the
-      tiered/versioned/flat-map blocks -- is the module's one deliberate
-      exception to "never lose any": both are timestamps of *observation*,
-      not facts about the photo, and recording their history would be
-      unbounded by construction, one entry per merge, forever. The rule
-      yields here to the idempotence rule that makes it usable at all.
-    * Every other field (e.g. a takeout record's `raw` payload, which really
-      can differ between observations of the "same" digest) keeps "newest
-      wins" but relocates a genuinely different old value into the entry's
-      own `history` list -- the same relocate-don't-drop rule `_merge_tiered`
-      uses, just scoped to one list entry instead of one top-level block.
-      This applies even when the recorded value is falsy (`""`, `[]`, `{}`,
-      `None`): "recorded as empty" is a real observation, not the same as
-      "never recorded", so only a field's outright *absence* from the
-      current entry counts as a gap to fill silently.
+      never silently overwritten. It is the one `_ANNOTATION_FIELDS` member
+      that does NOT follow the next rule, because "earliest" is itself the
+      fact worth keeping, not just the newest sighting.
+    * Every OTHER `_ANNOTATION_FIELDS` member (`last_seen`, `confirmed_at`,
+      `observed_at`, `superseded_at`, `rejected`, ...) always advances to the
+      newest observation; the superseded value is not recorded. This is the
+      module's one deliberate exception to "never lose any": an annotation is
+      a timestamp or note about *observing* the photo, not a fact about it,
+      and recording its history would be unbounded by construction -- one
+      entry per merge, forever, exactly the shape `propagate_sidecars`
+      re-stamping `confirmed_at` on every run would hit if this path did not
+      honor the registry. The rule yields here to the idempotence rule that
+      makes it usable at all. This governs the FIELD-level treatment inside
+      one entry; `_ANNOTATION_FIELDS` also governs entry *identity* via
+      `_core` on the tiered/versioned paths -- same registry, same reason,
+      different mechanism because a keyed-list entry's identity is `keys`,
+      not `_core`.
+
+    Every other field (e.g. a takeout record's `raw` payload, which really
+    can differ between observations of the "same" digest) keeps "newest
+    wins" but relocates a genuinely different old value into the entry's own
+    `history` list -- the same relocate-don't-drop rule `_merge_tiered` uses,
+    just scoped to one list entry instead of one top-level block. This
+    applies even when the recorded value is falsy (`""`, `[]`, `{}`, `None`):
+    "recorded as empty" is a real observation, not the same as "never
+    recorded", so only a field's outright *absence* from the current entry
+    counts as a gap to fill silently.
     """
     out = [dict(e) for e in _coerce_records(base)]
     index = {tuple(e.get(k) for k in keys): i for i, e in enumerate(out)}
@@ -249,7 +271,11 @@ def _merge_keyed_list(base: Any, new: Any, keys: tuple[str, ...], observed_at: s
                             loser = value
                         _relocate(history, {"field": field, "value": loser}, superseded_at=observed_at)
                     continue
-                if field == "last_seen":
+                if field in _ANNOTATION_FIELDS:
+                    # last_seen, confirmed_at, observed_at, superseded_at,
+                    # rejected, ... -- every registered annotation except
+                    # first_seen advances to the newest observation and the
+                    # superseded value is not relocated (see docstring).
                     current[field] = value
                     continue
                 if field not in current:

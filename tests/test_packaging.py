@@ -31,8 +31,11 @@ pyproject.toml, which makes inclusion independent of git metadata.
 
 from __future__ import annotations
 
+import ast
+import re
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -128,4 +131,106 @@ def test_the_wheels_runtime_asset_is_actually_servable(
     assert "<html" in text, f"{member} in the wheel has no <html> element"
     assert "</html>" in text, (
         f"{member} in the wheel is truncated -- no closing </html>"
+    )
+
+
+# -- the documented dev install must be able to run the suite ---------------
+#
+# `uv sync --extra dev` is what CLAUDE.md tells a contributor to run, and it
+# resolves only [project.dependencies] + the `dev` extra. When the faces work
+# landed, fifteen test modules began importing numpy at module scope while
+# numpy was declared only under the `faces` extra -- so the documented install
+# could not collect the suite at all (16 collection errors, two of them in
+# non-faces dashboard tests). Nothing caught it, because every environment
+# that ran the tests had been synced with `--all-extras`.
+#
+# Asserting "numpy is in dev" would only pin the one bug already fixed. This
+# derives the requirement instead: whatever the tests import at module scope
+# must be installable from the documented command. A test that needs a heavy
+# runtime should reach it through `pytest.importorskip`, which is a call and
+# not an import, and so is correctly invisible here.
+
+STDLIB = frozenset(sys.stdlib_module_names)
+
+# Import name -> distribution name, for the cases where they differ.
+DIST_OF_MODULE = {"PIL": "pillow"}
+
+
+def _module_scope_imports(tree: ast.Module) -> set[str]:
+    """Top-level module names imported unconditionally by `tree`.
+
+    Only statements at module scope count: an import inside a function or a
+    `try`/`except ImportError` is a deliberate soft dependency, and the point
+    here is what the interpreter must resolve at collection time.
+    """
+    found: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            found.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            # `from . import x` has no module to install.
+            if node.level == 0 and node.module:
+                found.add(node.module.split(".")[0])
+    return found
+
+
+def _canonical(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _declared_distributions() -> set[str]:
+    """Distributions `uv sync --extra dev` installs, PEP 503-normalized.
+
+    Read from pyproject.toml, which is the file a contributor edits. tomllib
+    is 3.11+ and this project supports 3.10, so on 3.10 the same declarations
+    are read back from the installed distribution's metadata instead of
+    skipping -- a guard that silently does not run is the failure mode this
+    whole module exists to prevent.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        from importlib.metadata import requires
+
+        requirements = [
+            r.split(";")[0].strip()
+            for r in (requires("imageharbor") or [])
+            if ";" not in r or 'extra == "dev"' in r
+        ]
+    else:
+        project = tomllib.loads(
+            (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]
+        requirements = list(project["dependencies"])
+        requirements += project["optional-dependencies"]["dev"]
+
+    return {
+        _canonical(re.split(r"[<>=!~\[; ]", r, maxsplit=1)[0]) for r in requirements
+    }
+
+
+def test_the_documented_dev_install_covers_every_module_scope_test_import():
+    declared = _declared_distributions()
+    local = {"imageharbor", "tests", "conftest"}
+
+    missing: dict[str, list[str]] = {}
+    for path in sorted((PROJECT_ROOT / "tests").rglob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for module in _module_scope_imports(tree):
+            if module in STDLIB or module in local:
+                continue
+            dist = DIST_OF_MODULE.get(module, module)
+            if _canonical(dist) not in declared:
+                missing.setdefault(module, []).append(
+                    str(path.relative_to(PROJECT_ROOT))
+                )
+
+    assert not missing, (
+        "these modules are imported at module scope by the test suite but are "
+        "not installed by the documented `uv sync --extra dev`, so collection "
+        "fails for anyone who follows CLAUDE.md: "
+        + "; ".join(f"{m} ({', '.join(files)})" for m, files in sorted(missing.items()))
+        + ". Either add the distribution to [project.optional-dependencies].dev "
+        "in pyproject.toml, or reach it through pytest.importorskip so the "
+        "test skips instead of erroring."
     )

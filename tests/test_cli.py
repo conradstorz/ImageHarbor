@@ -8,6 +8,7 @@ throughout so no network access is required.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import zipfile
@@ -18,6 +19,30 @@ from click.testing import CliRunner
 
 from imageharbor.cli import main
 from imageharbor.hashing import compute_sha256_b64url, verify_pcs_file
+
+# Mirrors tests/faces/test_detect.py's own skip gate: real Detector/Embedder
+# construction downloads and loads an ONNX session, so the one CLI test that
+# exercises it for real (rather than via the `HAS_ONNX=False` branch above)
+# only runs when weights are already staged locally.
+_FACE_MODEL_DIR = (
+    Path(os.environ["IMAGEHARBOR_FACE_MODEL_DIR"])
+    if os.environ.get("IMAGEHARBOR_FACE_MODEL_DIR")
+    else None
+)
+
+
+def _face_weights_present() -> bool:
+    if _FACE_MODEL_DIR is None:
+        return False
+    from imageharbor.faces import models as face_models
+
+    return (_FACE_MODEL_DIR / face_models.DETECTORS["yunet"].filename).exists()
+
+
+needs_face_weights = pytest.mark.skipif(
+    not _face_weights_present(),
+    reason="set IMAGEHARBOR_FACE_MODEL_DIR to a directory holding the weights",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +700,167 @@ def test_cli_watch_wires_args(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# faces flags and wiring (Task 16)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_watch_faces_off_by_default(monkeypatch, tmp_path):
+    """`--faces` defaults to off -- a new, heavier, opt-in extra must not
+    start running face detection just because `watch` was invoked."""
+    from imageharbor import watcher as _watcher
+    from imageharbor.watcher import WatchStats
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "beach.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9")
+    dest = tmp_path / "dest"
+
+    captured = {}
+
+    def _fake_watch(**kwargs):
+        captured.update(kwargs)
+        return WatchStats(passes=1)
+
+    monkeypatch.setattr(_watcher, "watch", _fake_watch)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["watch", "--source", str(src), "--dest", str(dest), "--no-dashboard"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["faces_enabled"] is False
+    assert captured["face_config"] is None
+
+
+def test_cli_watch_faces_requested_but_extra_unavailable_still_organizes(
+    monkeypatch, tmp_path
+):
+    """`--faces` with the extra missing must not stop `watch` from starting
+    -- it degrades to a warning and `face_config=None`, exactly like a
+    dashboard bind failure degrades instead of crashing (see
+    dashboard/server.py's module docstring) and like `watcher.watch`'s own
+    faces-pass handling of `faces_available() is False`."""
+    from imageharbor import faces as faces_pkg
+    from imageharbor import watcher as _watcher
+    from imageharbor.watcher import WatchStats
+
+    monkeypatch.setattr(faces_pkg, "HAS_ONNX", False)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "beach.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9")
+    dest = tmp_path / "dest"
+
+    captured = {}
+
+    def _fake_watch(**kwargs):
+        captured.update(kwargs)
+        return WatchStats(passes=1)
+
+    monkeypatch.setattr(_watcher, "watch", _fake_watch)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest), "--no-dashboard",
+            "--faces",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "faces' extra is not installed" in result.output
+    # faces_enabled still reflects the *request* -- watcher.watch is what
+    # decides (via faces_available()) to skip and warn once, not this layer.
+    assert captured["faces_enabled"] is True
+    assert captured["face_config"] is None
+
+
+def test_cli_watch_face_threshold_rejects_a_hostile_value(monkeypatch, tmp_path):
+    from imageharbor import watcher as _watcher
+    from imageharbor.watcher import WatchStats
+
+    src = tmp_path / "src"
+    src.mkdir()
+    dest = tmp_path / "dest"
+    monkeypatch.setattr(_watcher, "watch", lambda **kwargs: WatchStats(passes=1))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest), "--no-dashboard",
+            "--face-threshold", "not-a-number",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "must be numeric" in result.output
+
+
+def test_cli_watch_face_threshold_empty_string_is_not_a_crash(monkeypatch, tmp_path):
+    """`docker-compose.yml` ships `IMAGEHARBOR_FACE_THRESHOLD=""` on purpose
+    -- an empty env value must resolve to "not configured", never a startup
+    crash (see `_parse_face_threshold`'s docstring)."""
+    from imageharbor import watcher as _watcher
+    from imageharbor.watcher import WatchStats
+
+    src = tmp_path / "src"
+    src.mkdir()
+    dest = tmp_path / "dest"
+    monkeypatch.setattr(_watcher, "watch", lambda **kwargs: WatchStats(passes=1))
+
+    runner = CliRunner(env={"IMAGEHARBOR_FACE_THRESHOLD": ""})
+    result = runner.invoke(
+        main,
+        ["watch", "--source", str(src), "--dest", str(dest), "--no-dashboard"],
+    )
+    assert result.exit_code == 0, result.output
+
+
+@needs_face_weights
+def test_cli_watch_wires_a_real_face_config(monkeypatch, tmp_path):
+    """With the extra installed and weights staged, `--faces` must build a
+    real `FacesConfig` (a live `FaceStore`, a loaded `Detector`/`Embedder`,
+    the parsed threshold, and the library's own `--dest`) and forward it to
+    `_watcher.watch` unchanged."""
+    from imageharbor import watcher as _watcher
+    from imageharbor.faces.store import FaceStore
+    from imageharbor.watcher import WatchStats
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "beach.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9")
+    dest = tmp_path / "dest"
+
+    captured = {}
+
+    def _fake_watch(**kwargs):
+        captured.update(kwargs)
+        return WatchStats(passes=1)
+
+    monkeypatch.setattr(_watcher, "watch", _fake_watch)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest), "--no-dashboard",
+            "--faces", "--face-model-dir", str(_FACE_MODEL_DIR),
+            "--face-threshold", "0.42", "--face-recluster-threshold", "10",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["faces_enabled"] is True
+    face_config = captured["face_config"]
+    assert face_config is not None
+    assert isinstance(face_config.store, FaceStore)
+    assert face_config.dest == dest
+    assert face_config.cluster_threshold == pytest.approx(0.42)
+    assert face_config.recluster_threshold == 10
+    face_config.store.close()
+
+
+# ---------------------------------------------------------------------------
 # dashboard flags and wiring (Task 8)
 # ---------------------------------------------------------------------------
 
@@ -721,7 +907,7 @@ def test_watch_dashboard_port_is_accepted_and_forwarded(monkeypatch, tmp_path):
 
     captured = {}
 
-    def _fake_serve(catalog, control, *, port, breaker=None, stop_event):
+    def _fake_serve(catalog, control, *, port, breaker=None, store=None, crop_dir=None, stop_event):
         captured["port"] = port
         return None  # a dashboard failure must never stop the watcher
 

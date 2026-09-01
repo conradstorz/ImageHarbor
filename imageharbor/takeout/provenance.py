@@ -3,12 +3,18 @@
 The rule is deliberately uncurated: anything that is not an image or a video
 is kept. Deciding which unknown file is worth keeping is exactly where "never
 lose" degrades into "lose the thing nobody thought about" -- so Google's
-169 KB HTML viewer is preserved for the same reason its face-tag file is.
+169 KB HTML viewer is preserved for the same reason a Picasa face-tag file
+would be, if one were present.
 
-This is where data that cannot be attached to a photo lives. The Picasa face
-tags name 73 people across 1,496 entries and carry no photo reference at all;
-they are kept intact so that a future export supplying a join key can attach
-them retroactively.
+This is where data that cannot be attached to a photo lives -- a Picasa
+face-tag file is the motivating case: it would carry no photo reference at
+all, so it would be kept intact here so that a future export supplying a join
+key could attach it retroactively. (No such file was present in the export
+this module was verified against -- 175 archives scanned, none resembling
+`contacts.xml` or any Picasa face-tag document; see
+`imageharbor/faces/roster.py`. The uncurated-preservation rule above is
+unaffected by that absence -- it doesn't depend on which specific unknown
+files a given export happens to contain.)
 
 Layout, keyed by ``archive_id`` (the SHA-256 of the zip's own bytes) so a
 renamed or moved archive resolves to the same room::

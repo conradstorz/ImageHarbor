@@ -24,10 +24,14 @@ logger = logging.getLogger(__name__)
 
 # Keys stored in the `settings` table. 'paused' has no env counterpart -- it
 # is pure dashboard state, not a config override -- so it is handled
-# separately from 'interval'/'enrich' throughout this module.
+# separately from 'interval'/'enrich'/'faces' throughout this module.
 _PAUSED_KEY = "paused"
 _INTERVAL_KEY = "interval"
 _ENRICH_KEY = "enrich"
+# 'faces' mirrors 'enrich' exactly: same '0'/'1' storage, same env-vs-stored
+# precedence, same hostile-value handling -- the faces pass is a third
+# on/off dial alongside enrichment, not a different kind of setting.
+_FACES_KEY = "faces"
 
 
 def _parse_interval(raw: Any) -> float | None:
@@ -92,10 +96,22 @@ class ControlPlane:
     rather than being frozen at construction time.
     """
 
-    def __init__(self, catalog: Catalog, *, env_interval: float, env_enrich: bool) -> None:
+    def __init__(
+        self,
+        catalog: Catalog,
+        *,
+        env_interval: float,
+        env_enrich: bool,
+        env_faces: bool = False,
+    ) -> None:
         self._catalog = catalog
         self._env_interval = env_interval
         self._env_enrich = env_enrich
+        # Defaults to False (unlike env_enrich, which every existing caller
+        # passes explicitly): faces is a new, heavier, opt-in extra -- a
+        # caller that hasn't been updated to know about it yet must not
+        # silently start running face detection.
+        self._env_faces = env_faces
         # Seed the in-memory pause flag from the durable row so a restart
         # honors a pause made before the process died (see
         # test_pause_survives_a_restart). After construction this flag is the
@@ -164,6 +180,20 @@ class ControlPlane:
             return self._env_enrich, False
         return parsed, True
 
+    def _resolve_faces(self) -> tuple[bool, bool]:
+        raw = self._catalog.setting_get(_FACES_KEY)
+        if raw is None:
+            return self._env_faces, False
+        parsed = _parse_bool_flag(raw)
+        if parsed is None:
+            logger.warning(
+                "stored 'faces' setting %r is unreadable; falling back "
+                "to env value %r",
+                raw, self._env_faces,
+            )
+            return self._env_faces, False
+        return parsed, True
+
     @property
     def interval(self) -> float:
         value, _ = self._resolve_interval()
@@ -172,6 +202,11 @@ class ControlPlane:
     @property
     def enrich_enabled(self) -> bool:
         value, _ = self._resolve_enrich()
+        return value
+
+    @property
+    def faces_enabled(self) -> bool:
+        value, _ = self._resolve_faces()
         return value
 
     # ------------------------------------------------------------------
@@ -195,6 +230,8 @@ class ControlPlane:
             self._catalog.setting_set(_INTERVAL_KEY, str(interval))
         elif key == _ENRICH_KEY:
             self._catalog.setting_set(_ENRICH_KEY, "1" if value else "0")
+        elif key == _FACES_KEY:
+            self._catalog.setting_set(_FACES_KEY, "1" if value else "0")
         elif key == _PAUSED_KEY:
             self.set_paused(bool(value))
         else:
@@ -223,6 +260,7 @@ class ControlPlane:
         """
         interval_value, interval_overridden = self._resolve_interval()
         enrich_value, enrich_overridden = self._resolve_enrich()
+        faces_value, faces_overridden = self._resolve_faces()
         return {
             _INTERVAL_KEY: {
                 "value": interval_value,
@@ -233,5 +271,10 @@ class ControlPlane:
                 "value": enrich_value,
                 "env_value": self._env_enrich,
                 "overridden": enrich_overridden,
+            },
+            _FACES_KEY: {
+                "value": faces_value,
+                "env_value": self._env_faces,
+                "overridden": faces_overridden,
             },
         }

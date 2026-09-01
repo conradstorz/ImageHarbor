@@ -16,9 +16,21 @@ dependencies = [
 
 [project.optional-dependencies]
 openai = ["openai>=1.0.0"]
+faces = [
+    "onnxruntime>=1.17,<2",
+    "numpy>=1.24",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    # Not a test tool -- a test *dependency*. The faces tests, and the
+    # dashboard tests that build face fixtures, import numpy at module scope,
+    # so without it here the documented `uv sync --extra dev` install cannot
+    # even collect the suite (16 collection errors, including two non-faces
+    # dashboard files). onnxruntime deliberately stays out: tests that need a
+    # real session `importorskip` it, so the suite runs green without the
+    # 200 MB runtime. Guarded by tests/test_packaging.py.
+    "numpy>=1.24",
 ]
 
 [project.scripts]

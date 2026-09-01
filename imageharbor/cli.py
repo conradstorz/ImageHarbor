@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -485,6 +486,52 @@ def enrich(
     default=False,
     help="Disable the operational dashboard.",
 )
+@click.option(
+    "--faces/--no-faces",
+    "faces",
+    envvar="IMAGEHARBOR_FACES",
+    default=False,
+    show_default=True,
+    help="Detect and cluster faces as a third watch pass. Needs the 'faces' "
+         "extra (uv sync --extra faces / the image's onnxruntime install) --"
+         " with it missing, this only logs one warning and keeps organizing.",
+)
+@click.option(
+    "--face-model-dir",
+    "face_model_dir",
+    envvar="IMAGEHARBOR_FACE_MODEL_DIR",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory holding face model weights. Defaults to <dest>/.faces-models.",
+)
+@click.option(
+    "--face-threshold",
+    "face_threshold",
+    envvar="IMAGEHARBOR_FACE_THRESHOLD",
+    default=None,
+    # Deliberately a plain string, not type=float: docker-compose.yml ships
+    # IMAGEHARBOR_FACE_THRESHOLD="" on purpose (see its own comment and
+    # docs/deploy-docker.md) because the threshold cannot be honestly chosen
+    # before `faces calibrate` has measured it -- and click's FLOAT type
+    # calls float(value) on whatever envvar string it is handed, including
+    # "", which raises before this function ever runs. Parsed by hand below
+    # instead, where an empty/missing value can become None rather than a
+    # startup crash.
+    help="Cosine-similarity clustering threshold from `imageharbor faces "
+         "calibrate`. Faces are still scanned and their sidecars still "
+         "propagated with this unset -- only whole-library clustering is "
+         "skipped (with one warning) until it is.",
+)
+@click.option(
+    "--face-recluster-threshold",
+    "face_recluster_threshold",
+    envvar="IMAGEHARBOR_FACE_RECLUSTER_THRESHOLD",
+    default=500,
+    show_default=True,
+    type=int,
+    help="Whole-library reclustering runs when more than this many faces "
+         "are unclustered (or no clusters exist yet) -- never every cycle.",
+)
 def watch(
     source: Path,
     dest: Path,
@@ -505,8 +552,13 @@ def watch(
     quarantine_dir: Path | None,
     dashboard_port: int,
     no_dashboard: bool,
+    faces: bool,
+    face_model_dir: Path | None,
+    face_threshold: str | None,
+    face_recluster_threshold: int,
 ) -> None:
     """Continuously watch SOURCE and organize new/changed photos into DEST."""
+    import contextlib
     import signal
     import threading
 
@@ -521,6 +573,7 @@ def watch(
 
     classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
     dest.mkdir(parents=True, exist_ok=True)
+    parsed_face_threshold = _parse_face_threshold(face_threshold)
 
     stop_event = threading.Event()
 
@@ -531,7 +584,7 @@ def watch(
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
-    with Catalog(catalog_path) as catalog:
+    with Catalog(catalog_path) as catalog, contextlib.ExitStack() as face_stack:
         pipeline = Pipeline(
             source_dir=source,
             organized_dir=dest,
@@ -547,7 +600,52 @@ def watch(
         # backend), so that is the env-derived baseline for the dashboard's
         # 'enrich' override too -- a dashboard toggle can still turn it off
         # at runtime regardless of this default.
-        control = ControlPlane(catalog, env_interval=interval, env_enrich=True)
+        control = ControlPlane(
+            catalog, env_interval=interval, env_enrich=True, env_faces=faces,
+        )
+
+        # Detector/Embedder each load an ONNX session -- expensive enough
+        # that this happens once here, never per watch cycle (see
+        # `watcher.FacesConfig`'s own docstring). `--faces` requested but
+        # the extra not importable is NOT fatal here: `_watcher.watch`'s
+        # faces pass already handles `faces_available() is False` by
+        # logging one warning and skipping, so this command still starts
+        # and organizes/enriches normally -- only `face_store`/`face_config`
+        # stay `None`.
+        face_store = None
+        face_config = None
+        if faces:
+            from . import faces as faces_pkg
+
+            if not faces_pkg.HAS_ONNX:
+                click.echo(
+                    "--faces was requested but the 'faces' extra is not "
+                    "installed (uv sync --extra faces); the faces pass "
+                    "will be skipped until it is. See docs/deploy-docker.md.",
+                    err=True,
+                )
+            else:
+                from .faces.detect import Detector
+                from .faces.embed import Embedder
+                from .faces.runner import QualityGate
+                from .faces.store import FaceStore
+
+                resolved_face_model_dir = _faces_model_dir(face_model_dir, dest)
+                face_store = face_stack.enter_context(FaceStore(catalog_path))
+                face_config = _watcher.FacesConfig(
+                    store=face_store,
+                    detector=Detector(resolved_face_model_dir),
+                    embedder=Embedder(resolved_face_model_dir),
+                    # <catalog_dir>/face-crops, matching `faces scan`'s own
+                    # placement -- a derived, deletable cache that belongs on
+                    # the catalog volume, not necessarily the (possibly
+                    # NAS-mounted) --dest tree.
+                    crop_dir=catalog_path.parent / "face-crops",
+                    dest=dest,
+                    gate=QualityGate(),
+                    cluster_threshold=parsed_face_threshold,
+                    recluster_threshold=face_recluster_threshold,
+                )
 
         # A dashboard failure must NEVER stop the watcher (see
         # dashboard/server.py's module docstring): `serve()` already binds
@@ -560,6 +658,8 @@ def watch(
         else:
             dashboard_thread = dashboard_server.serve(
                 catalog, control, port=dashboard_port, breaker=breaker,
+                store=face_store,
+                crop_dir=face_config.crop_dir if face_config is not None else None,
                 stop_event=stop_event,
             )
             if dashboard_thread is None:
@@ -582,6 +682,8 @@ def watch(
             poison_max_fails=poison_max_fails,
             quarantine_dir=quarantine_dir,
             control=control,
+            faces_enabled=faces,
+            face_config=face_config,
         )
 
     click.echo(
@@ -590,6 +692,8 @@ def watch(
         f"Errors={stats.errors}] "
         f"Enrich[Enriched={stats.enriched} Renamed={stats.renamed} "
         f"Errors={stats.enrich_errors}] "
+        f"Faces[Scanned={stats.faces_scanned} Found={stats.faces_found} "
+        f"Errors={stats.faces_errors}] "
         f"Quarantined={stats.quarantined}"
     )
 
@@ -888,6 +992,441 @@ def takeout_status(catalog_path: Path) -> None:
 
 # Alias so `imageharbor takeout ingest` works
 main.add_command(takeout_cmd, name="takeout")
+
+
+# ---------------------------------------------------------------------------
+# faces
+# ---------------------------------------------------------------------------
+
+
+def _faces_catalog_path(dest: Path, catalog_path: Path | None) -> Path:
+    return catalog_path if catalog_path is not None else dest / "catalog.db"
+
+
+def _faces_model_dir(model_dir: Path | None, dest: Path | None) -> Path:
+    """Resolve a model directory: explicit flag, then env var, then <dest>/.faces-models.
+
+    Model weights are not library data -- $IMAGEHARBOR_FACE_MODEL_DIR exists
+    precisely so one download can be shared across libraries and containers
+    (see the docker-compose model volume) -- but falling back to
+    <dest>/.faces-models means a first run needs nothing beyond --dest.
+    """
+    if model_dir is not None:
+        return model_dir
+    env = os.environ.get("IMAGEHARBOR_FACE_MODEL_DIR")
+    if env:
+        return Path(env)
+    if dest is not None:
+        return dest / ".faces-models"
+    raise click.ClickException(
+        "no model directory given: pass --model-dir, set "
+        "IMAGEHARBOR_FACE_MODEL_DIR, or pass --dest"
+    )
+
+
+def _parse_face_threshold(raw: str | None) -> float | None:
+    """Parse `--face-threshold`/`IMAGEHARBOR_FACE_THRESHOLD`.
+
+    `""`/`None`/whitespace-only all mean "not set yet" -- exactly the state
+    `docker-compose.yml` ships in on purpose, since the threshold cannot be
+    honestly chosen before `faces calibrate` has measured it against this
+    library's own embeddings (see `docs/deploy-docker.md`). Anything else
+    that isn't a real number is a hand-edited mistake, not a silent 0 or
+    None -- reported clearly rather than guessed, matching this project's
+    other "hostile stored value" handling (see `dashboard/control.py`).
+    """
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise click.ClickException(
+            "--face-threshold / IMAGEHARBOR_FACE_THRESHOLD must be numeric "
+            f"(or empty), got {raw!r}"
+        ) from exc
+
+
+def _require_onnx() -> None:
+    """Gate a subcommand on the optional 'faces' extra.
+
+    Reads `faces_pkg.HAS_ONNX` at call time (not imported as a bare name at
+    module scope) so a test's `monkeypatch.setattr(faces_pkg, "HAS_ONNX",
+    False)` is actually visible here.
+
+    `scan` needs this because it constructs `Detector`/`Embedder`, which
+    import onnxruntime directly. `cluster`, `calibrate`, and `status` never
+    touch onnxruntime themselves, but they all open a `FaceStore`, and
+    `store.py` imports numpy unconditionally -- numpy ships only inside the
+    `faces` extra in pyproject.toml, not as a core dependency, so those three
+    cannot actually run without the extra either. `HAS_ONNX` is the only
+    importability signal the package exposes, and `uv sync --extra faces`
+    installs numpy and onnxruntime together, so gating on it here turns a
+    raw `ModuleNotFoundError` into the same clear, actionable message
+    instead. Only `models download` (pure hashlib/urllib) is genuinely
+    extra-free and is exempt.
+    """
+    from . import faces as faces_pkg
+
+    if not faces_pkg.HAS_ONNX:
+        raise click.ClickException(
+            "face models need the optional 'faces' extra: "
+            "uv sync --extra faces"
+        )
+
+
+@click.group()
+def faces_cmd() -> None:
+    """Detect faces, group them, and propose names.
+
+    Runs entirely in-process with no AI backend and no network beyond a
+    one-time model download. Faces never rename or move a file, and no name is
+    written to a photo until a human confirms that cluster on the dashboard.
+    """
+
+
+@faces_cmd.command(name="scan")
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db. Reads "
+         "IMAGEHARBOR_CATALOG so a deployment where `watch` uses a catalog "
+         "path other than <dest>/catalog.db (see docker-compose.yml) doesn't "
+         "have to repeat it on every `faces` subcommand.",
+)
+@click.option(
+    "--limit",
+    default=None,
+    type=int,
+    help="Stop after scanning this many photos.",
+)
+@click.option(
+    "--model-dir",
+    "model_dir",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory holding face model weights. Defaults to "
+         "$IMAGEHARBOR_FACE_MODEL_DIR or <dest>/.faces-models.",
+)
+@click.option(
+    "--min-score",
+    default=0.6,
+    show_default=True,
+    type=float,
+    help="Reject a detection below this confidence.",
+)
+@click.option(
+    "--min-box",
+    default=32,
+    show_default=True,
+    type=int,
+    help="Reject a detection smaller than this many pixels on its short side.",
+)
+def faces_scan(
+    dest: Path,
+    catalog_path: Path | None,
+    limit: int | None,
+    model_dir: Path | None,
+    min_score: float,
+    min_box: int,
+) -> None:
+    """Detect and embed faces in every organized photo not yet scanned.
+
+    Runs the default detector and embedder (see `imageharbor.faces.models`).
+    Never renames or moves a photo, and writes no name -- only face geometry
+    and embeddings. Resumable at one-photo granularity: a re-run is a no-op
+    for anything already scanned by the same detector.
+    """
+    _require_onnx()
+
+    from .faces.detect import Detector
+    from .faces.embed import Embedder
+    from .faces.runner import QualityGate, scan
+    from .faces.store import FaceStore
+
+    catalog_path = _faces_catalog_path(dest, catalog_path)
+    resolved_model_dir = _faces_model_dir(model_dir, dest)
+    # <catalog_dir>/face-crops, per the design spec's "Crop cache" section --
+    # a derived, deletable cache that belongs on the catalog volume, not
+    # necessarily the (possibly NAS-mounted) --dest tree.
+    crop_dir = catalog_path.parent / "face-crops"
+
+    detector = Detector(resolved_model_dir)
+    embedder = Embedder(resolved_model_dir)
+    gate = QualityGate(min_score=min_score, min_box=min_box)
+
+    with Catalog(catalog_path) as catalog, FaceStore(catalog_path) as store:
+        result = scan(
+            catalog, store, detector, embedder, crop_dir, gate=gate, limit=limit
+        )
+
+    click.echo(
+        f"scanned={result.scanned} faces={result.faces} "
+        f"rejected={result.rejected} errors={result.errors}"
+    )
+
+
+@faces_cmd.command(name="cluster")
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+@click.option(
+    "--threshold",
+    required=True,
+    type=float,
+    help="Cosine-similarity threshold at or above which two faces join a "
+         "cluster. Measure this first with `faces calibrate` -- never guess it.",
+)
+@click.option(
+    "--min-score",
+    default=0.6,
+    show_default=True,
+    type=float,
+    help="Minimum score for a name proposal to be recorded.",
+)
+@click.option(
+    "--min-support",
+    default=2,
+    show_default=True,
+    type=int,
+    help="Minimum supporting photos for a name proposal.",
+)
+@click.option(
+    "--recluster",
+    is_flag=True,
+    default=False,
+    help="Rebuild clustering that already exists for this library. Required "
+         "once a prior `cluster` run has produced clusters, so a re-run is "
+         "never silently destructive (any already-confirmed person is kept).",
+)
+def faces_cluster(
+    dest: Path,
+    catalog_path: Path | None,
+    threshold: float,
+    min_score: float,
+    min_support: int,
+    recluster: bool,
+) -> None:
+    """Group scanned faces into clusters and propose names from Google tags.
+
+    Never assigns a person to a cluster -- a proposal is only written to the
+    `proposals` table for a human to confirm on the dashboard.
+    """
+    _require_onnx()
+
+    from .faces import models as face_models
+    from .faces.runner import build_clusters, google_names
+    from .faces.store import FaceStore
+
+    catalog_path = _faces_catalog_path(dest, catalog_path)
+    embed_model = face_models.DEFAULT_EMBEDDER
+
+    with FaceStore(catalog_path) as store:
+        existing = store.cluster_ids(embed_model)
+        if existing and not recluster:
+            raise click.ClickException(
+                f"{len(existing)} cluster(s) already exist; pass --recluster "
+                "to rebuild them from scratch (any confirmed person is kept)."
+            )
+
+        photo_names = google_names(dest)
+        made = build_clusters(
+            store,
+            photo_names,
+            embed_model=embed_model,
+            threshold=threshold,
+            min_score=min_score,
+            min_support=min_support,
+        )
+        proposals = sum(
+            len(store.proposals_for(cid)) for cid in store.cluster_ids(embed_model)
+        )
+
+    click.echo(f"clusters={made} proposals={proposals}")
+
+
+@faces_cmd.command(name="calibrate")
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+@click.option(
+    "--target-precision",
+    default=0.99,
+    show_default=True,
+    type=float,
+    help="Lowest acceptable fraction of same-name pairs at the chosen threshold.",
+)
+def faces_calibrate(dest: Path, catalog_path: Path | None, target_precision: float) -> None:
+    """Measure the clustering threshold from the library's own Google-tagged photos.
+
+    Precision here is over anchor pairs (photos with exactly one detected
+    face and exactly one Google-tagged name). Run this after `scan` and
+    before `cluster` -- the threshold must be measured, never guessed.
+    """
+    _require_onnx()
+
+    from .faces import models as face_models
+    from .faces.runner import google_names, measure_threshold
+    from .faces.store import FaceStore
+
+    catalog_path = _faces_catalog_path(dest, catalog_path)
+    photo_names = google_names(dest)
+
+    with FaceStore(catalog_path) as store:
+        result = measure_threshold(
+            store,
+            photo_names,
+            embed_model=face_models.DEFAULT_EMBEDDER,
+            target_precision=target_precision,
+        )
+
+    click.echo(
+        f"threshold={result.threshold:.4f} precision={result.precision:.4f} "
+        f"recall={result.recall:.4f}"
+    )
+    click.echo(
+        f"Next: imageharbor faces cluster --dest {dest} "
+        f"--threshold {result.threshold:.4f}"
+    )
+
+
+@faces_cmd.command(name="status")
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+def faces_status(dest: Path, catalog_path: Path | None) -> None:
+    """Report face-scanning and review progress."""
+    _require_onnx()
+
+    from .faces.store import FaceStore
+
+    catalog_path = _faces_catalog_path(dest, catalog_path)
+    with FaceStore(catalog_path) as store:
+        stats = store.stats()
+
+    for key in ("faces", "scanned", "clusters", "people", "unreviewed", "singletons"):
+        click.echo(f"{key:<12} {stats[key]}")
+
+
+@faces_cmd.command(name="roster")
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+def faces_roster(dest: Path, catalog_path: Path | None) -> None:
+    """Import a preserved Picasa roster as autocomplete vocabulary.
+
+    These names are never attached to a photo or a cluster -- the roster
+    carries no photo reference at all. They only populate the review UI's
+    name list. Finding no preserved roster is the expected case and reports
+    0, not an error.
+    """
+    _require_onnx()
+
+    from .faces import roster
+    from .faces.store import FaceStore
+
+    catalog_path = _faces_catalog_path(dest, catalog_path)
+    with FaceStore(catalog_path) as store:
+        added = roster.import_names(store, dest)
+
+    click.echo(f"{added} new names imported")
+
+
+@faces_cmd.group(name="models")
+def faces_models_cmd() -> None:
+    """Manage local face model weights."""
+
+
+@faces_models_cmd.command(name="download")
+@click.option(
+    "--dest",
+    default=None,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of an organized library. Only used to derive a default "
+         "--model-dir (<dest>/.faces-models) when neither --model-dir nor "
+         "$IMAGEHARBOR_FACE_MODEL_DIR is set -- model weights are not "
+         "library-specific, so this is optional here (unlike the other "
+         "faces subcommands, where it is required).",
+)
+@click.option(
+    "--model-dir",
+    "model_dir",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory to store weights in. Defaults to "
+         "$IMAGEHARBOR_FACE_MODEL_DIR or <dest>/.faces-models.",
+)
+def faces_models_download(dest: Path | None, model_dir: Path | None) -> None:
+    """Download and verify the default detector and embedder weights.
+
+    Does not require the 'faces' extra: this only fetches and checksums
+    files (hashlib/urllib), it never imports onnxruntime or numpy.
+    """
+    from .faces import models as face_models
+    from .faces.download import ensure
+
+    resolved_model_dir = _faces_model_dir(model_dir, dest)
+    detector_path = ensure(face_models.DETECTORS[face_models.DEFAULT_DETECTOR], resolved_model_dir)
+    embedder_path = ensure(face_models.EMBEDDERS[face_models.DEFAULT_EMBEDDER], resolved_model_dir)
+
+    click.echo(f"detector: {detector_path}")
+    click.echo(f"embedder: {embedder_path}")
+
+
+# Alias so `imageharbor faces scan` works
+main.add_command(faces_cmd, name="faces")
 
 
 # ---------------------------------------------------------------------------
