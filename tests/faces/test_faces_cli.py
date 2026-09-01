@@ -23,7 +23,7 @@ import pytest
 from click.testing import CliRunner
 
 from imageharbor.catalog import Catalog
-from imageharbor.cli import main
+from imageharbor.cli import _faces_model_dir, main
 from imageharbor.faces.decode import Detection
 from imageharbor.faces.store import FaceStore
 
@@ -197,6 +197,22 @@ def test_models_download_falls_back_to_dest(tmp_path, monkeypatch):
     result = CliRunner().invoke(main, ["faces", "models", "download", "--dest", str(dest)])
     assert result.exit_code == 0, result.output
     assert calls == [dest / ".faces-models", dest / ".faces-models"]
+
+
+def test_faces_model_dir_precedence(tmp_path, monkeypatch):
+    """explicit arg > env var > <dest>/.faces-models -- a reordering of the
+    checks in _faces_model_dir survives every other CLI test in this file
+    because they each only exercise one tier of the fallback at a time."""
+    dest = tmp_path / "dest"
+    env_dir = tmp_path / "env-models"
+    monkeypatch.setenv("IMAGEHARBOR_FACE_MODEL_DIR", str(env_dir))
+
+    resolved = _faces_model_dir(None, dest)
+    assert resolved == env_dir
+    assert resolved != dest / ".faces-models"
+
+    explicit_dir = tmp_path / "explicit-models"
+    assert _faces_model_dir(explicit_dir, dest) == explicit_dir
 
 
 def test_cluster_builds_clusters_and_reports_proposal_counts(tmp_path):
