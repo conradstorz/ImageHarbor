@@ -140,6 +140,42 @@ def test_a_non_database_file_is_unusable(tmp_path):
         index_reader.IndexPairings.open(bad, {})
 
 
+def test_a_missing_media_column_is_unusable(tmp_path):
+    """I5: the docstring on `_verify` says a schema change in the sibling
+    repo "must surface here as a clear error, never as a wrong answer" --
+    this is the only test that actually builds a schema-drifted index and
+    checks that promise. Built by hand (not via `make_index`, which always
+    creates the full, current schema) with a `media` table missing
+    `confidence`, one of `_MEDIA_COLUMNS`. Matched on "table media is
+    missing" specifically, not merely on the word "confidence" -- a
+    downstream `sqlite3.OperationalError` from the SELECT in
+    `_read_pairings` ("no such column: m.confidence") also contains
+    "confidence" and would otherwise let this test pass even if the column
+    check itself were disabled.
+    """
+    db = tmp_path / "i.sqlite"
+    con = sqlite3.connect(db)
+    con.executescript("""
+        CREATE TABLE sidecar (
+          id INTEGER PRIMARY KEY, archive TEXT, path TEXT NOT NULL, name TEXT NOT NULL);
+        CREATE TABLE media (
+          id INTEGER PRIMARY KEY, archive TEXT, path TEXT NOT NULL, area TEXT NOT NULL,
+          folder TEXT NOT NULL, name TEXT NOT NULL, sidecar_id INTEGER,
+          rule TEXT NOT NULL);
+        CREATE TABLE archive (
+          name TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
+          members INTEGER NOT NULL, error TEXT);
+        CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT);
+    """)
+    con.execute("INSERT INTO archive VALUES (?,?,?,?,?)", ("part-1.zip", 100, 5, 0, None))
+    con.execute("INSERT INTO index_meta VALUES ('schema_version', '1')")
+    con.commit()
+    con.close()
+
+    with pytest.raises(index_reader.IndexUnusable, match=r"table media is missing"):
+        index_reader.IndexPairings.open(db, {"part-1.zip": stats_for()})
+
+
 def test_open_percent_encodes_a_hash_in_the_path(tmp_path):
     # '#' starts a URI fragment; a bare f-string interpolation truncates the
     # connect URI there and SQLite opens a different (nonexistent) path --
