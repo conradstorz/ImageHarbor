@@ -460,3 +460,15 @@ Any future "pre-existing failure" claim must first confirm
   Minor rolled up: both IIFEs write to the same #error-banner, so a People error and a stats
   error can overwrite each other; the evidence sentence says "named photos in this cluster
   agree" where the brief said "named photos agree" (clearer, kept).
+  FOLLOW-UP FIX (68ced25): the case-variant merge button was UNUSABLE AS SHIPPED. The
+  suggestion rendered, but POST /api/people/merge needs {person_id, cluster_ids} and the
+  roster exposed person_id/name/cluster_count/photo_count -- never the cluster ids -- so the
+  operator was asked to type IDs they had no way to discover. A feature that looks complete
+  and cannot be used. Roster now carries cluster_ids; the UI merges without manual entry.
+  Deliberately NOT auto-picking a canonical spelling: Conrad Storz and Conrad Storz III are
+  a father and a son in this same library, so choosing a "winner" automatically is the exact
+  class of assertion this project forbids. The operator picks the target.
+  Verified end to end in headless Chrome: seeded `pete storz` (clusters [1]) and
+  `Pete Storz` (clusters [2]), confirmed no cluster-id input exists in the rendered DOM,
+  dispatched a real click, then an INDEPENDENT fetch showed Pete Storz -> [1, 2] and
+  pete storz -> []. The write reached SQLite through the click.
