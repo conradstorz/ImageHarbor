@@ -488,6 +488,13 @@ class FaceStore:
         confirmation -- only the split-off faces start over as unreviewed,
         since they're exactly the ones a human just judged to not belong.
         Returns the new cluster's id.
+
+        Every id in *face_ids* must currently belong to *cluster_id*; this is
+        the layer that actually mutates, so it refuses even when a caller
+        bypasses `dashboard.people.split`'s own (earlier, HTTP-facing) copy
+        of this check -- a face silently stripped out of another cluster's
+        membership, with `clusters.face_count` left stale, is exactly the
+        bug this guards against. Raises before touching anything.
         """
         with self.lock:
             row = self._conn.execute(
@@ -504,6 +511,12 @@ class FaceStore:
                 (cluster_id,),
             ).fetchall()
             moving_set = set(moving)
+            owned_ids = {r["id"] for r in remaining_rows}
+            foreign = sorted(moving_set - owned_ids)
+            if foreign:
+                raise ValueError(
+                    f"face id(s) {foreign} do not belong to cluster {cluster_id}"
+                )
             remaining = [r for r in remaining_rows if r["id"] not in moving_set]
 
             def _centroid(rows: Sequence[sqlite3.Row]) -> bytes | None:
@@ -526,14 +539,19 @@ class FaceStore:
                 INSERT INTO clusters (embed_model, centroid, face_count, person_id, assigned_at, created_at)
                 VALUES (?,?,?,NULL,NULL,?)
                 """,
-                (embed_model, _centroid([r for r in remaining_rows if r["id"] in moving_set]), len(moving), now),
+                # len(moving_set), not len(moving): face_ids can repeat an id
+                # (the caller's mistake, not ours to amplify), and a
+                # duplicate can't produce a second row for `UPDATE ... WHERE
+                # id IN (...)` to move -- face_count must track rows moved,
+                # not ids requested.
+                (embed_model, _centroid([r for r in remaining_rows if r["id"] in moving_set]), len(moving_set), now),
             )
             new_id = cursor.lastrowid
-            if moving:
-                placeholders = ",".join("?" * len(moving))
+            if moving_set:
+                placeholders = ",".join("?" * len(moving_set))
                 self._conn.execute(
                     f"UPDATE faces SET cluster_id=? WHERE id IN ({placeholders})",
-                    (new_id, *moving),
+                    (new_id, *moving_set),
                 )
             self._conn.commit()
             return new_id  # type: ignore[return-value]

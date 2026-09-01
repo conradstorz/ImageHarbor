@@ -170,6 +170,13 @@ def reject(store: FaceStore, cluster_id: int, name: str) -> dict[str, Any]:
         raise ValueError("name must not be empty")
     if not _cluster_exists(store, cluster_id):
         raise ValueError(f"unknown cluster: {cluster_id!r}")
+    # `FaceStore.reject`'s UPDATE is a silent no-op for a (cluster_id, name)
+    # that never had a proposal -- checked here, not there, because
+    # `proposals_for` already exists as the read-side of this exact table
+    # and a 200 for "nothing happened" is a lie this HTTP boundary must not
+    # tell.
+    if not any(p["name"] == clean for p in store.proposals_for(cluster_id)):
+        raise ValueError(f"no proposal {clean!r} on cluster {cluster_id!r}")
     store.reject(cluster_id, clean)
     return {"cluster_id": cluster_id, "name": clean, "decided": "rejected"}
 
@@ -193,11 +200,36 @@ def merge(store: FaceStore, person_id: int, cluster_ids: list[int]) -> dict[str,
 
 def split(store: FaceStore, cluster_id: int, face_ids: list[int]) -> dict[str, Any]:
     """Move *face_ids* out of *cluster_id* into a new, unconfirmed cluster --
-    the bad-cluster repair. See `FaceStore.split`."""
+    the bad-cluster repair. See `FaceStore.split`.
+
+    Every id in *face_ids* must currently belong to *cluster_id* -- without
+    this, a caller (POST /api/people/split with a mismatched cluster_id/
+    face_ids pair) can silently strip a face out of a *different*, possibly
+    already-confirmed cluster's membership: `FaceStore.split`'s per-id
+    `UPDATE ... WHERE id IN (...)` doesn't care which cluster a face id
+    currently sits in, and the source cluster it actually came from never
+    gets its `face_count` touched, so that count goes stale. Checked here,
+    against the HTTP boundary, so a bad request comes back 400 with no
+    mutation; `FaceStore.split` carries its own copy of this same check for
+    a caller that reaches it directly, but a wrapper-mediated call is
+    rejected here first, so only one of the two ever actually raises.
+    """
     if not _cluster_exists(store, cluster_id):
         raise ValueError(f"unknown cluster: {cluster_id!r}")
     if not face_ids:
         raise ValueError("face_ids must not be empty")
+    with store.lock:
+        owned = {
+            row["id"]
+            for row in store._conn.execute(
+                "SELECT id FROM faces WHERE cluster_id=?", (cluster_id,)
+            )
+        }
+    foreign = sorted(set(face_ids) - owned)
+    if foreign:
+        raise ValueError(
+            f"face id(s) {foreign} do not belong to cluster {cluster_id!r}"
+        )
     new_cluster_id = store.split(cluster_id, face_ids)
     return {"cluster_id": cluster_id, "new_cluster_id": new_cluster_id}
 

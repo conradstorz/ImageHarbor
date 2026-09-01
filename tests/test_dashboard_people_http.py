@@ -276,6 +276,17 @@ def test_post_people_reject_marks_the_proposal(handler_cls, face_store: FaceStor
     assert face_store.proposals_for(cid)[0]["decided"] == "rejected"
 
 
+def test_post_people_reject_unmatched_name_returns_400(
+    handler_cls, face_store: FaceStore
+) -> None:
+    cid = _one_cluster(face_store)
+    status, _, body = _dispatch_json(
+        handler_cls, "POST", "/api/people/reject", {"cluster_id": cid, "name": "Nobody"}
+    )
+    assert status == 400
+    assert "error" in body
+
+
 def test_post_people_merge_points_clusters_at_one_person(
     handler_cls, face_store: FaceStore
 ) -> None:
@@ -309,6 +320,29 @@ def test_post_people_split_creates_a_new_cluster(handler_cls, face_store: FaceSt
     )
     assert status == 200
     assert body["new_cluster_id"] != cid
+
+
+def test_post_people_split_face_from_another_cluster_returns_400(
+    handler_cls, face_store: FaceStore
+) -> None:
+    ids_a = face_store.record_scan("a0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids_b = face_store.record_scan("b0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    face_store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=tuple(ids_a), centroid=_v([1, 0, 0])),
+        cluster.Cluster(face_ids=tuple(ids_b), centroid=_v([1, 0, 0])),
+    ])
+    cid_a, cid_b = face_store.cluster_ids()
+
+    status, _, body = _dispatch_json(
+        handler_cls, "POST", "/api/people/split",
+        {"cluster_id": cid_b, "face_ids": [ids_a[0]]},
+    )
+    assert status == 400
+    assert "error" in body
+    row = face_store._conn.execute(
+        "SELECT cluster_id FROM faces WHERE id=?", (ids_a[0],)
+    ).fetchone()
+    assert row["cluster_id"] == cid_a
 
 
 def test_post_people_unknown_action_returns_404(handler_cls) -> None:

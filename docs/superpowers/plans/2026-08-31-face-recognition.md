@@ -3421,6 +3421,26 @@ git add imageharbor/dashboard/people.py imageharbor/dashboard/server.py tests/fa
 git commit -m "feat(faces): serve the People review API"
 ```
 
+**Post-review fix (2026-08-31):** the `people.split` interface above shipped
+without validating that `face_ids` actually belong to `cluster_id`.
+`FaceStore.split`'s per-id `UPDATE ... WHERE id IN (...)` doesn't check which
+cluster a face id currently sits in, so a mismatched `(cluster_id, face_ids)`
+pair -- reachable straight from `POST /api/people/split` -- silently strips a
+face out of a *different* (possibly already-confirmed) cluster's membership
+and leaves that cluster's `face_count` stale. A re-run of this task must
+validate membership: every id in `face_ids` must currently belong to
+`cluster_id`, checked in `people.split` (raises `ValueError` -> 400, no
+mutation) and again, defense-in-depth, in `FaceStore.split` itself (the
+layer that actually mutates, in case a future caller bypasses the wrapper).
+Also: `people.reject` returned `{"decided": "rejected"}` with 200 even when
+no proposal row matched `(cluster_id, name)` -- `FaceStore.reject`'s UPDATE
+is a silent no-op. `people.reject` must raise `ValueError` for an unknown
+`(cluster_id, name)` pair, matching how `confirm` already handles an unknown
+cluster. See `tests/faces/test_dashboard_people.py`,
+`tests/faces/test_store.py`, and `tests/test_dashboard_people_http.py` for
+the regression tests, and `.superpowers/sdd/task-14-report.md` ("Fix round
+1") for the full writeup.
+
 ---
 
 ## Task 15: Dashboard People UI

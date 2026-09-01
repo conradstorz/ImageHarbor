@@ -110,6 +110,57 @@ def test_merge_points_several_clusters_at_one_person(store):
     assert store.person_for_cluster(b) == person_id
 
 
+def test_split_rejects_a_face_id_not_in_the_cluster(store):
+    # Defense-in-depth: FaceStore.split is the layer that actually mutates,
+    # so it must refuse even when a caller bypasses dashboard.people's
+    # wrapper-level validation.
+    ids = store.record_scan("d", "yunet", [
+        (_det(x=0), _vec([1, 0, 0]), "auraface"),
+        (_det(x=200), _vec([0, 1, 0]), "auraface"),
+    ])
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0])),
+        cluster.Cluster(face_ids=(ids[1],), centroid=_vec([0, 1, 0])),
+    ])
+    cid_a, cid_b = store.cluster_ids()
+    foreign_face = ids[0]  # belongs to cid_a, not cid_b
+
+    with pytest.raises(ValueError, match=str(foreign_face)):
+        store.split(cid_b, [foreign_face])
+
+    # Nothing mutated.
+    row = store._conn.execute(
+        "SELECT cluster_id FROM faces WHERE id=?", (foreign_face,)
+    ).fetchone()
+    assert row["cluster_id"] == cid_a
+    assert store._conn.execute(
+        "SELECT face_count FROM clusters WHERE id=?", (cid_a,)
+    ).fetchone()["face_count"] == 1
+
+
+def test_split_with_duplicate_face_ids_does_not_inflate_the_new_face_count(store):
+    ids = store.record_scan("d", "yunet", [
+        (_det(x=0), _vec([1, 0, 0]), "auraface"),
+        (_det(x=200), _vec([1, 0, 0]), "auraface"),
+    ])
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0])),
+    ])
+    cid = store.cluster_ids()[0]
+    dup_id = ids[-1]
+
+    new_id = store.split(cid, [dup_id, dup_id])
+
+    real_count = store._conn.execute(
+        "SELECT COUNT(*) AS n FROM faces WHERE cluster_id=?", (new_id,)
+    ).fetchone()["n"]
+    stored_face_count = store._conn.execute(
+        "SELECT face_count FROM clusters WHERE id=?", (new_id,)
+    ).fetchone()["face_count"]
+    assert real_count == 1
+    assert stored_face_count == real_count
+
+
 def test_replacing_clusters_preserves_confirmed_people(store):
     ids = store.record_scan("d", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [

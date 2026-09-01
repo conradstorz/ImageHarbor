@@ -179,6 +179,18 @@ def test_reject_rejects_an_unknown_cluster(store):
         people.reject(store, 9999, "Emma")
 
 
+def test_reject_rejects_a_name_with_no_matching_proposal(store):
+    # A known cluster but a name that was never proposed on it -- the
+    # store-level UPDATE is a silent no-op here, so the wrapper must be the
+    # one to notice nothing happened.
+    cid = _one_cluster(store)
+    store.record_proposals([Proposal(cid, "Emma", 14, 15, 14 / 15, 340)])
+    with pytest.raises(ValueError, match="Nobody"):
+        people.reject(store, cid, "Nobody")
+    # The real proposal is untouched by the failed call.
+    assert store.proposals_for(cid)[0]["decided"] is None
+
+
 # ---------------------------------------------------------------------------
 # merge
 # ---------------------------------------------------------------------------
@@ -248,6 +260,80 @@ def test_split_rejects_empty_face_ids(store):
     cid = _one_cluster(store)
     with pytest.raises(ValueError, match="face_ids"):
         people.split(store, cid, [])
+
+
+def _two_clusters(store):
+    """Two coexisting, unconfirmed clusters -- both from one `replace_clusters`
+    call, per the note in test_review_queue_orders_by_face_count_descending."""
+    ids_a = store.record_scan("a0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=tuple(ids_a), centroid=_v([1, 0, 0])),
+        cluster.Cluster(face_ids=tuple(ids_b), centroid=_v([1, 0, 0])),
+    ])
+    cid_a, cid_b = store.cluster_ids()
+    return cid_a, cid_b, ids_a[0]
+
+
+def test_split_rejects_a_face_from_another_cluster(store):
+    cid_a, cid_b, foreign_face = _two_clusters(store)
+
+    with pytest.raises(ValueError, match=str(foreign_face)):
+        people.split(store, cid_b, [foreign_face])
+
+    # Nothing mutated: the face is still where it started, and cluster A's
+    # face_count still matches its real membership.
+    row = store._conn.execute(
+        "SELECT cluster_id FROM faces WHERE id=?", (foreign_face,)
+    ).fetchone()
+    assert row["cluster_id"] == cid_a
+    assert store._conn.execute(
+        "SELECT face_count FROM clusters WHERE id=?", (cid_a,)
+    ).fetchone()["face_count"] == 1
+
+
+def test_split_rejects_a_face_from_a_confirmed_cluster(store):
+    # The reviewer's exact repro: confirm cluster A as "Emma", then try to
+    # split one of A's faces out of unrelated cluster B.
+    cid_a, cid_b, stolen_face = _two_clusters(store)
+    people.confirm(store, cid_a, "Emma")
+
+    with pytest.raises(ValueError, match=str(stolen_face)):
+        people.split(store, cid_b, [stolen_face])
+
+    assert store.person_for_cluster(cid_a) is not None
+    row = store._conn.execute(
+        "SELECT cluster_id FROM faces WHERE id=?", (stolen_face,)
+    ).fetchone()
+    assert row["cluster_id"] == cid_a
+    assert store._conn.execute(
+        "SELECT face_count FROM clusters WHERE id=?", (cid_a,)
+    ).fetchone()["face_count"] == 1
+
+
+def test_split_face_count_matches_real_membership_on_both_clusters(store):
+    cid = _one_cluster(store, faces=3)
+    face_ids = sorted(
+        r["id"] for r in store._conn.execute(
+            "SELECT id FROM faces WHERE cluster_id=?", (cid,)
+        )
+    )
+    result = people.split(store, cid, [face_ids[-1]])
+    new_id = result["new_cluster_id"]
+
+    def _real_count(cluster_id):
+        return store._conn.execute(
+            "SELECT COUNT(*) AS n FROM faces WHERE cluster_id=?", (cluster_id,)
+        ).fetchone()["n"]
+
+    src_face_count = store._conn.execute(
+        "SELECT face_count FROM clusters WHERE id=?", (cid,)
+    ).fetchone()["face_count"]
+    new_face_count = store._conn.execute(
+        "SELECT face_count FROM clusters WHERE id=?", (new_id,)
+    ).fetchone()["face_count"]
+    assert src_face_count == _real_count(cid) == 2
+    assert new_face_count == _real_count(new_id) == 1
 
 
 # ---------------------------------------------------------------------------
