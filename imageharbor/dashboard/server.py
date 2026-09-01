@@ -91,12 +91,13 @@ def make_handler(
     unhandled exception reaching ``http.server``'s own default (which would
     print a traceback to the client).
 
-    ``store``/``crop_dir`` are optional: the face pipeline is not wired into
-    every caller yet (``cli.py``'s ``watch`` command does not construct a
-    ``FaceStore`` as of this task), so the People routes must degrade to a
-    plain 404 rather than raising when either is absent -- the same
-    "dashboard failure never stops organizing" rule, applied to "the feature
-    isn't wired up here" rather than to a query that raised.
+    ``store``/``crop_dir`` are optional because faces are optional. ``cli.py``'s
+    ``watch`` does construct a ``FaceStore`` and passes both through to
+    :func:`serve`, but only when ``--faces`` is given; without it -- and in the
+    many tests that build a handler with neither -- both arrive as ``None``.
+    The People routes must then degrade to a plain 404 rather than raising:
+    the same "dashboard failure never stops organizing" rule, applied to "this
+    run has no face pipeline" rather than to a query that raised.
     """
 
     class Handler(BaseHTTPRequestHandler):
