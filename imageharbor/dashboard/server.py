@@ -204,7 +204,7 @@ def make_handler(
             self._send_text(HTTPStatus.OK, html, content_type="text/html")
 
         def _handle_stats(self) -> None:
-            document = stats.collect(catalog, control, breaker=breaker)
+            document = stats.collect(catalog, control, breaker=breaker, face_store=store)
             self._send_json(HTTPStatus.OK, document)
 
         def _handle_people(self) -> None:

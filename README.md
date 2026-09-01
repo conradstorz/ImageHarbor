@@ -31,7 +31,35 @@ Organizing is split into two independent passes:
   be upgraded by an AI-derived subject, but an AI subject can never displace a
   human-authored name). Safe to interrupt and resume at any time.
 
-`imageharbor watch` runs both passes continuously against a source directory.
+`imageharbor watch` runs both passes continuously against a source directory
+(plus the optional third pass below, with `--faces`).
+
+## Faces (optional)
+
+`imageharbor faces` detects faces in already-organized photos, embeds and
+clusters them, and proposes names from the people Google Photos already
+tagged in those same photos — entirely in-process, against local ONNX
+models. It needs no account and no API key, and no network beyond a one-time
+~261 MB model download (`imageharbor faces models download`). Faces never
+rename or move a file and **never appear in a filename** — identity lives in
+the catalog and, once confirmed, in the photo's JSON sidecar. **No name is
+written to a photo until a human confirms that cluster** in the operational
+dashboard's People review queue; until then, a cluster carries only a
+machine proposal.
+
+The clustering threshold has no sensible default — measure it from your own
+library before clustering, never guess it:
+
+```
+imageharbor faces scan      --dest DEST
+imageharbor faces calibrate --dest DEST
+imageharbor faces cluster   --dest DEST --threshold <measured value>
+```
+
+`imageharbor watch --faces` runs scanning and confirmed-name propagation as a
+third continuous pass every cycle; whole-library reclustering only runs when
+there's enough new, unclustered work to justify it (or no clustering has
+happened yet), never on every poll.
 
 ## Operational dashboard
 
@@ -88,9 +116,10 @@ image's JSON sidecar, not in the path or filename.
 | `imageharbor takeout ingest --archives DIR --dest DEST` | Ingest Google Takeout archives. |
 | `imageharbor takeout status --catalog DEST/catalog.db` | Report Takeout ingestion progress. |
 | `imageharbor takeout survey --archives DIR` | Measure an archive set and report what ingestion would do with it. Read-only and standalone: no catalog, no destination, no AI backend, no network. |
-| `imageharbor watch --source SRC --dest DEST` | Continuously run both passes on an interval. |
+| `imageharbor watch --source SRC --dest DEST` | Continuously run the facts and enrichment passes (and the faces pass, with `--faces`) on an interval. |
 | `imageharbor verify DEST` | Re-verify every organized file's digest against its filename. |
 | `imageharbor sidecar backfill --dest DEST` | Rebuild/merge sidecars for a library organized before sidecars were the default. Cannot recover Google Takeout metadata for already-organized files — that requires re-ingesting the original archives. |
+| `imageharbor faces scan --dest DEST` | Detect and embed faces in organized photos; `faces calibrate`/`faces cluster`/`faces status` group and review them (needs the optional `faces` extra). |
 
 Run `imageharbor --help` (or `<command> --help`) for the full flag list.
 

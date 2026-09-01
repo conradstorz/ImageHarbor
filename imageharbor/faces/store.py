@@ -328,6 +328,28 @@ class FaceStore:
                 out.setdefault(next(iter(names)), []).append(row["id"])
         return out
 
+    def unclustered_face_count(self, embed_model: str) -> int:
+        """How many *embed_model* faces have no cluster yet.
+
+        Read-only counting query, deliberately separate from
+        `iter_face_vectors` (which decodes every embedding just to iterate
+        them) -- `imageharbor/watcher.py`'s faces pass calls this every
+        cycle to decide whether a whole-library `build_clusters` run is due,
+        and a `COUNT(*)` that never touches the embedding BLOBs is what
+        keeps that decision cheap enough to make every cycle instead of
+        only when a recluster is already known to be needed.
+        """
+        with self.lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM faces
+                WHERE embed_model=? AND rejected IS NULL AND embedding IS NOT NULL
+                  AND cluster_id IS NULL
+                """,
+                (embed_model,),
+            ).fetchone()
+            return row["n"]
+
     def digests_by_cluster(self, embed_model: str) -> dict[int, list[str]]:
         """`{cluster_id: [digest, ...]}` for every clustered face under *embed_model*.
 

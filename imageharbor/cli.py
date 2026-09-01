@@ -485,6 +485,52 @@ def enrich(
     default=False,
     help="Disable the operational dashboard.",
 )
+@click.option(
+    "--faces/--no-faces",
+    "faces",
+    envvar="IMAGEHARBOR_FACES",
+    default=False,
+    show_default=True,
+    help="Detect and cluster faces as a third watch pass. Needs the 'faces' "
+         "extra (uv sync --extra faces / the image's onnxruntime install) --"
+         " with it missing, this only logs one warning and keeps organizing.",
+)
+@click.option(
+    "--face-model-dir",
+    "face_model_dir",
+    envvar="IMAGEHARBOR_FACE_MODEL_DIR",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory holding face model weights. Defaults to <dest>/.faces-models.",
+)
+@click.option(
+    "--face-threshold",
+    "face_threshold",
+    envvar="IMAGEHARBOR_FACE_THRESHOLD",
+    default=None,
+    # Deliberately a plain string, not type=float: docker-compose.yml ships
+    # IMAGEHARBOR_FACE_THRESHOLD="" on purpose (see its own comment and
+    # docs/deploy-docker.md) because the threshold cannot be honestly chosen
+    # before `faces calibrate` has measured it -- and click's FLOAT type
+    # calls float(value) on whatever envvar string it is handed, including
+    # "", which raises before this function ever runs. Parsed by hand below
+    # instead, where an empty/missing value can become None rather than a
+    # startup crash.
+    help="Cosine-similarity clustering threshold from `imageharbor faces "
+         "calibrate`. Faces are still scanned and their sidecars still "
+         "propagated with this unset -- only whole-library clustering is "
+         "skipped (with one warning) until it is.",
+)
+@click.option(
+    "--face-recluster-threshold",
+    "face_recluster_threshold",
+    envvar="IMAGEHARBOR_FACE_RECLUSTER_THRESHOLD",
+    default=500,
+    show_default=True,
+    type=int,
+    help="Whole-library reclustering runs when more than this many faces "
+         "are unclustered (or no clusters exist yet) -- never every cycle.",
+)
 def watch(
     source: Path,
     dest: Path,
@@ -505,8 +551,13 @@ def watch(
     quarantine_dir: Path | None,
     dashboard_port: int,
     no_dashboard: bool,
+    faces: bool,
+    face_model_dir: Path | None,
+    face_threshold: str | None,
+    face_recluster_threshold: int,
 ) -> None:
     """Continuously watch SOURCE and organize new/changed photos into DEST."""
+    import contextlib
     import signal
     import threading
 
@@ -521,6 +572,7 @@ def watch(
 
     classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
     dest.mkdir(parents=True, exist_ok=True)
+    parsed_face_threshold = _parse_face_threshold(face_threshold)
 
     stop_event = threading.Event()
 
@@ -531,7 +583,7 @@ def watch(
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
-    with Catalog(catalog_path) as catalog:
+    with Catalog(catalog_path) as catalog, contextlib.ExitStack() as face_stack:
         pipeline = Pipeline(
             source_dir=source,
             organized_dir=dest,
@@ -547,7 +599,52 @@ def watch(
         # backend), so that is the env-derived baseline for the dashboard's
         # 'enrich' override too -- a dashboard toggle can still turn it off
         # at runtime regardless of this default.
-        control = ControlPlane(catalog, env_interval=interval, env_enrich=True)
+        control = ControlPlane(
+            catalog, env_interval=interval, env_enrich=True, env_faces=faces,
+        )
+
+        # Detector/Embedder each load an ONNX session -- expensive enough
+        # that this happens once here, never per watch cycle (see
+        # `watcher.FacesConfig`'s own docstring). `--faces` requested but
+        # the extra not importable is NOT fatal here: `_watcher.watch`'s
+        # faces pass already handles `faces_available() is False` by
+        # logging one warning and skipping, so this command still starts
+        # and organizes/enriches normally -- only `face_store`/`face_config`
+        # stay `None`.
+        face_store = None
+        face_config = None
+        if faces:
+            from . import faces as faces_pkg
+
+            if not faces_pkg.HAS_ONNX:
+                click.echo(
+                    "--faces was requested but the 'faces' extra is not "
+                    "installed (uv sync --extra faces); the faces pass "
+                    "will be skipped until it is. See docs/deploy-docker.md.",
+                    err=True,
+                )
+            else:
+                from .faces.detect import Detector
+                from .faces.embed import Embedder
+                from .faces.runner import QualityGate
+                from .faces.store import FaceStore
+
+                resolved_face_model_dir = _faces_model_dir(face_model_dir, dest)
+                face_store = face_stack.enter_context(FaceStore(catalog_path))
+                face_config = _watcher.FacesConfig(
+                    store=face_store,
+                    detector=Detector(resolved_face_model_dir),
+                    embedder=Embedder(resolved_face_model_dir),
+                    # <catalog_dir>/face-crops, matching `faces scan`'s own
+                    # placement -- a derived, deletable cache that belongs on
+                    # the catalog volume, not necessarily the (possibly
+                    # NAS-mounted) --dest tree.
+                    crop_dir=catalog_path.parent / "face-crops",
+                    dest=dest,
+                    gate=QualityGate(),
+                    cluster_threshold=parsed_face_threshold,
+                    recluster_threshold=face_recluster_threshold,
+                )
 
         # A dashboard failure must NEVER stop the watcher (see
         # dashboard/server.py's module docstring): `serve()` already binds
@@ -560,6 +657,8 @@ def watch(
         else:
             dashboard_thread = dashboard_server.serve(
                 catalog, control, port=dashboard_port, breaker=breaker,
+                store=face_store,
+                crop_dir=face_config.crop_dir if face_config is not None else None,
                 stop_event=stop_event,
             )
             if dashboard_thread is None:
@@ -582,6 +681,8 @@ def watch(
             poison_max_fails=poison_max_fails,
             quarantine_dir=quarantine_dir,
             control=control,
+            faces_enabled=faces,
+            face_config=face_config,
         )
 
     click.echo(
@@ -590,6 +691,8 @@ def watch(
         f"Errors={stats.errors}] "
         f"Enrich[Enriched={stats.enriched} Renamed={stats.renamed} "
         f"Errors={stats.enrich_errors}] "
+        f"Faces[Scanned={stats.faces_scanned} Found={stats.faces_found} "
+        f"Errors={stats.faces_errors}] "
         f"Quarantined={stats.quarantined}"
     )
 
@@ -873,6 +976,28 @@ def _faces_model_dir(model_dir: Path | None, dest: Path | None) -> Path:
     )
 
 
+def _parse_face_threshold(raw: str | None) -> float | None:
+    """Parse `--face-threshold`/`IMAGEHARBOR_FACE_THRESHOLD`.
+
+    `""`/`None`/whitespace-only all mean "not set yet" -- exactly the state
+    `docker-compose.yml` ships in on purpose, since the threshold cannot be
+    honestly chosen before `faces calibrate` has measured it against this
+    library's own embeddings (see `docs/deploy-docker.md`). Anything else
+    that isn't a real number is a hand-edited mistake, not a silent 0 or
+    None -- reported clearly rather than guessed, matching this project's
+    other "hostile stored value" handling (see `dashboard/control.py`).
+    """
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise click.ClickException(
+            "--face-threshold / IMAGEHARBOR_FACE_THRESHOLD must be numeric "
+            f"(or empty), got {raw!r}"
+        ) from exc
+
+
 def _require_onnx() -> None:
     """Gate a subcommand on the optional 'faces' extra.
 
@@ -921,9 +1046,13 @@ def faces_cmd() -> None:
 @click.option(
     "--catalog",
     "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
     default=None,
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db. Reads "
+         "IMAGEHARBOR_CATALOG so a deployment where `watch` uses a catalog "
+         "path other than <dest>/catalog.db (see docker-compose.yml) doesn't "
+         "have to repeat it on every `faces` subcommand.",
 )
 @click.option(
     "--limit",
@@ -1007,6 +1136,7 @@ def faces_scan(
 @click.option(
     "--catalog",
     "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
     default=None,
     type=click.Path(dir_okay=False, path_type=Path),
     help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
@@ -1094,6 +1224,7 @@ def faces_cluster(
 @click.option(
     "--catalog",
     "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
     default=None,
     type=click.Path(dir_okay=False, path_type=Path),
     help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
@@ -1149,6 +1280,7 @@ def faces_calibrate(dest: Path, catalog_path: Path | None, target_precision: flo
 @click.option(
     "--catalog",
     "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
     default=None,
     type=click.Path(dir_okay=False, path_type=Path),
     help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",

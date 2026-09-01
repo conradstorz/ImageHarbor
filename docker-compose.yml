@@ -19,12 +19,16 @@ services:
       IMAGEHARBOR_AI_MODEL: llava
       IMAGEHARBOR_AI_API_KEY: not-needed
       IMAGEHARBOR_AI_TIMEOUT: "60"
+      IMAGEHARBOR_FACES: "1"
+      IMAGEHARBOR_FACE_MODEL_DIR: /data/models
+      IMAGEHARBOR_FACE_THRESHOLD: ""     # set from `faces calibrate` output
     ports:
       - "8080:8080"     # operational dashboard (see docs/superpowers/specs/2026-08-19-dashboard-design.md)
     volumes:
       - /mnt/nas/photos:/data/source:ro          # read-only source
       - /mnt/nas/photos-organized:/data/dest     # read-write organized library
       - imageharbor-catalog:/data/catalog        # local catalog volume (NOT on NAS)
+      - imageharbor-models:/data/models          # face model weights (261 MB, downloaded once)
     restart: unless-stopped
     # IMPORTANT finding #4 (2026-08-19 whole-branch review, pre-merge):
     # Docker's default stop_grace_period is 10s. A facts pass copying a
@@ -44,3 +48,4 @@ services:
 
 volumes:
   imageharbor-catalog:
+  imageharbor-models:
