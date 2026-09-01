@@ -3639,7 +3639,7 @@ Expected: FAIL with `AttributeError: module 'imageharbor.watcher' has no attribu
 
 **`control.py`** — add `faces` to the settings keys, beside `enrich`.
 
-**`stats.py`** — add a `faces` section from `FaceStore.stats()`.
+**`stats.py`** — add a `faces` section from `FaceStore.stats()`. **Post-hoc correction (fix round 1, 2026-08-31):** this section originally shipped with zero test coverage — `stats.py` was in this task's file list, but neither `_faces_section` nor `_handle_stats`'s face-store wiring in `server.py` had a single test anywhere in the suite. A reviewer replaced `_faces_section`'s entire body with `return {"MUTATED": True}` and all 77 existing dashboard tests (`tests/test_dashboard_stats.py`, `tests/test_dashboard_people_http.py`, `tests/test_dashboard_server.py`, `tests/faces/test_watch_faces.py`) still passed. Step 3/4 above must be read as also requiring: `stats.collect(...)` with a seeded `face_store` asserted against specific field values (not just key presence); the no-store degrade shape (`"wired": False`, every count field `None`) pinned explicitly; `GET /api/stats` asserted end to end against a seeded store; and a raising face store proven not to break `/api/stats` (it doesn't — `_faces_section` already runs through `collect()`'s `_safe` wrapper like every other section — but that must be a test, not an assumption). See `tests/test_dashboard_stats.py`'s `test_faces_section_*` and `tests/test_dashboard_server.py`'s `test_api_stats_faces_section_*` for the tests that closed this gap, and `.superpowers/sdd/task-16-report.md`'s "Fix round 1" for the mutation-testing evidence. A future re-run of this task must not ship `stats.py` without these.
 
 **`docker-compose.yml`** — add the model volume and the env vars:
 

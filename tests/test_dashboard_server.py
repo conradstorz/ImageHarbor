@@ -25,11 +25,15 @@ from http.client import HTTPResponse
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from imageharbor.catalog import Catalog
 from imageharbor.dashboard import server as dashboard_server
 from imageharbor.dashboard.control import ControlPlane
+from imageharbor.faces import cluster
+from imageharbor.faces.decode import Detection
+from imageharbor.faces.store import FaceStore
 
 # ---------------------------------------------------------------------------
 # Fake-socket harness
@@ -157,6 +161,53 @@ def handler_cls(catalog: Catalog, control: ControlPlane):
     return dashboard_server.make_handler(catalog, control)
 
 
+@pytest.fixture()
+def face_store(tmp_path: Path, catalog: Catalog):
+    # Same db_path as `catalog` -- see tests/test_dashboard_people_http.py,
+    # which wires catalog+face_store together the same way.
+    s = FaceStore(tmp_path / "catalog.db")
+    yield s
+    s.close()
+
+
+def _det() -> Detection:
+    return Detection(
+        x=0.0, y=0.0, w=50.0, h=50.0, score=0.9,
+        landmarks=((1.0, 1.0), (2.0, 1.0), (1.5, 2.0), (1.0, 3.0), (2.0, 3.0)),
+    )
+
+
+def _vec(vals) -> np.ndarray:
+    a = np.asarray(vals, dtype=np.float32)
+    return a / np.linalg.norm(a)
+
+
+def _seed_faces(store: FaceStore) -> dict:
+    """Same seeded shape as tests/test_dashboard_stats.py::_seed_faces --
+    kept as a small local copy so this HTTP-level test doesn't reach across
+    test modules for a fixture, per this suite's existing style of each test
+    file being self-contained.
+
+    faces=2, scanned=2, clusters=1, people=1, unreviewed=0, singletons=0.
+    """
+    ids = store.record_scan("d0", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids += store.record_scan("d1", "yunet", [(_det(), _vec([0, 1, 0]), "auraface")])
+    store.replace_clusters(
+        "auraface", [cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0]))]
+    )
+    cid = store.cluster_ids()[0]
+    store.confirm(cid, "Alice")
+    return {
+        "wired": True,
+        "faces": 2,
+        "scanned": 2,
+        "clusters": 1,
+        "people": 1,
+        "unreviewed": 0,
+        "singletons": 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # GET /api/stats
 # ---------------------------------------------------------------------------
@@ -169,6 +220,51 @@ def test_api_stats_on_empty_catalog_returns_200_and_valid_json(handler_cls) -> N
     assert body is not None
     for key in ("now", "library", "evidence", "queues", "history", "projection", "overrides"):
         assert key in body
+
+
+def test_api_stats_faces_section_reflects_a_seeded_face_store(
+    catalog: Catalog, control: ControlPlane, face_store: FaceStore
+) -> None:
+    """`/api/stats`'s `faces` key end to end, not merely present -- see
+    CLAUDE.md's task-16 fix brief: the reviewer's `{"MUTATED": True}` swap of
+    `_faces_section`'s whole body passed every existing test in this suite.
+    """
+    expected = _seed_faces(face_store)
+    handler_cls = dashboard_server.make_handler(catalog, control, store=face_store)
+
+    status, _, body = _dispatch_json(handler_cls, "GET", "/api/stats")
+
+    assert status == 200
+    assert body["faces"] == expected
+
+
+def test_api_stats_faces_section_is_none_when_face_store_raises(
+    catalog: Catalog, control: ControlPlane
+) -> None:
+    """A corrupt/missing face catalog must not 500 the whole `/api/stats`
+    endpoint -- 'a dashboard failure never stops organizing' applies to the
+    faces section exactly like every other one. `stats.collect()`'s `_safe`
+    wrapper already covers this (see test_dashboard_stats.py); this pins the
+    same guarantee at the HTTP boundary, through `make_handler`'s real
+    `store=` wiring.
+    """
+
+    class _RaisingFaceStore:
+        def stats(self) -> dict:
+            raise RuntimeError("simulated corrupt face catalog")
+
+    handler_cls = dashboard_server.make_handler(
+        catalog, control, store=_RaisingFaceStore()  # type: ignore[arg-type]
+    )
+
+    status, _, body = _dispatch_json(handler_cls, "GET", "/api/stats")
+
+    assert status == 200
+    assert body["faces"] is None
+    # The rest of the document must still be there -- one section raising
+    # must not take the others down with it.
+    for key in ("now", "library", "evidence", "queues", "history", "projection", "overrides"):
+        assert body[key] is not None
 
 
 # ---------------------------------------------------------------------------

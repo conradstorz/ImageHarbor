@@ -1,6 +1,6 @@
 """Tests for imageharbor.dashboard.stats.collect().
 
-Two things this suite exists to pin down (see the module docstring and
+Three things this suite exists to pin down (see the module docstring and
 CLAUDE.md's dashboard-stats task brief):
 
 - **A failing section must not fail the document.** `test_a_failing_section_...`
@@ -13,6 +13,13 @@ CLAUDE.md's dashboard-stats task brief):
   {0: 2, 10: 1}, descriptor: {0: 1, 30: 2}) specifically so that a query
   which accidentally swapped `date_tier`/`descriptor_tier` would fail this
   test rather than passing by coincidence.
+- **The `faces` section is pinned end to end.** `_faces_section` shipped
+  (Task 16) with no test anywhere in the suite -- a reviewer replaced its
+  whole body with `return {"MUTATED": True}` and the full dashboard test
+  suite still passed. `test_faces_section_*` below assert specific field
+  values against a seeded `FaceStore`, the no-store degrade shape, and that
+  a raising store is absorbed by `_safe` like every other section rather
+  than reporting something bespoke.
 
 Catalog fixtures for tier-count assertions are built by running the real
 `Pipeline`, not by hand-writing catalog rows, so the tiers under test are
@@ -25,12 +32,16 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.dashboard import stats
 from imageharbor.dashboard.control import ControlPlane
+from imageharbor.faces import cluster
+from imageharbor.faces.decode import Detection
+from imageharbor.faces.store import FaceStore
 from imageharbor.pipeline import Pipeline
 
 # ---------------------------------------------------------------------------
@@ -58,6 +69,69 @@ def catalog(tmp_path: Path) -> Catalog:
 @pytest.fixture()
 def control(catalog: Catalog) -> ControlPlane:
     return ControlPlane(catalog, env_interval=300, env_enrich=True)
+
+
+@pytest.fixture()
+def face_store(tmp_path: Path, catalog: Catalog):
+    # Same db_path as `catalog` -- FaceStore owns its own tables in the same
+    # SQLite file (see store.py's class docstring: it reaches its own
+    # connection rather than being handed a live Catalog), matching how
+    # tests/test_dashboard_people_http.py wires catalog+face_store together.
+    s = FaceStore(tmp_path / "catalog.db")
+    yield s
+    s.close()
+
+
+def _det(x: float = 0.0) -> Detection:
+    return Detection(
+        x=x, y=0.0, w=50.0, h=50.0, score=0.9,
+        landmarks=((1.0, 1.0), (2.0, 1.0), (1.5, 2.0), (1.0, 3.0), (2.0, 3.0)),
+    )
+
+
+def _vec(vals) -> np.ndarray:
+    a = np.asarray(vals, dtype=np.float32)
+    return a / np.linalg.norm(a)
+
+
+def _seed_faces(store: FaceStore) -> dict[str, int]:
+    """Populate *store* with a known, hand-countable shape and return it.
+
+    - 3 digests, 1 face each -> `faces`=3, `scanned`=3 (one `face_scan` row
+      per digest).
+    - cluster A: digest0's single face -> a singleton (`face_count`=1),
+      confirmed to a person ("Alice") -> `people`=1, and NOT in `unreviewed`.
+    - cluster B: digest1+digest2's two faces -> not a singleton, left
+      unconfirmed -> IS in `unreviewed`.
+
+    So: faces=3, scanned=3, clusters=2, people=1, unreviewed=1, singletons=1.
+    Deliberately not the trivial all-same-count shape (e.g. everything=1) --
+    a stats query that swapped e.g. `clusters` and `people`, or counted
+    singletons wrong, would still pass a degenerate fixture by coincidence.
+    """
+    ids0 = store.record_scan("digest0", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids1 = store.record_scan("digest1", "yunet", [(_det(), _vec([0, 1, 0]), "auraface")])
+    ids2 = store.record_scan("digest2", "yunet", [(_det(), _vec([0, 0, 1]), "auraface")])
+
+    store.replace_clusters(
+        "auraface",
+        [
+            cluster.Cluster(face_ids=tuple(ids0), centroid=_vec([1, 0, 0])),
+            cluster.Cluster(face_ids=tuple(ids1 + ids2), centroid=_vec([0, 1, 0])),
+        ],
+    )
+    cluster_a, cluster_b = store.cluster_ids()
+    store.confirm(cluster_a, "Alice")
+
+    return {
+        "wired": True,
+        "faces": 3,
+        "scanned": 3,
+        "clusters": 2,
+        "people": 1,
+        "unreviewed": 1,
+        "singletons": 1,
+    }
 
 
 @pytest.fixture()
@@ -558,6 +632,83 @@ def test_a_failing_section_does_not_fail_the_document(
 
     assert doc["library"] is None
     assert doc["now"] is not None
+    assert doc["evidence"] is not None
+    assert doc["queues"] is not None
+    assert doc["history"] is not None
+    assert doc["projection"] is not None
+    assert doc["overrides"] is not None
+
+
+# ---------------------------------------------------------------------------
+# faces -- Task 16's coverage gap: _faces_section had no test anywhere, and
+# a reviewer's `return {"MUTATED": True}` mutation was invisible to the
+# whole dashboard test suite. Every test below is written to fail against
+# that mutation.
+# ---------------------------------------------------------------------------
+
+
+def test_faces_section_reports_face_store_stats_when_wired(
+    catalog: Catalog, control: ControlPlane, face_store: FaceStore
+) -> None:
+    expected = _seed_faces(face_store)
+
+    doc = stats.collect(
+        catalog, control, now=datetime.now(timezone.utc), face_store=face_store
+    )
+
+    assert doc["faces"] == expected
+
+
+def test_faces_section_degrades_cleanly_without_a_face_store(
+    catalog: Catalog, control: ControlPlane
+) -> None:
+    """No `face_store` is the ordinary state of faces-disabled deployment.
+
+    Pins the exact degrade shape `_faces_section` documents: `"wired":
+    False` plus every count field explicitly `None` (not absent, not `{}`,
+    not `0`) -- distinct from `_safe`'s `None`-for-the-whole-section used
+    when a wired section's query itself raises.
+    """
+    doc = stats.collect(catalog, control, now=datetime.now(timezone.utc))
+
+    assert doc["faces"] == {
+        "wired": False,
+        "faces": None,
+        "scanned": None,
+        "clusters": None,
+        "people": None,
+        "unreviewed": None,
+        "singletons": None,
+    }
+
+
+def test_faces_section_does_not_break_the_document_when_face_store_raises(
+    catalog: Catalog, control: ControlPlane
+) -> None:
+    """A corrupt/missing face catalog must degrade like every other section.
+
+    `_faces_section` is called through `collect()`'s same `_safe` wrapper as
+    every other section, so a raising `face_store.stats()` should report
+    `doc["faces"] is None` -- not a 500, not a bespoke shape -- while the
+    rest of the document stays populated. This is the direct analog of
+    `test_a_failing_section_does_not_fail_the_document` above, scoped to
+    `faces`.
+    """
+
+    class _RaisingFaceStore:
+        def stats(self) -> dict:
+            raise RuntimeError("simulated corrupt face catalog")
+
+    doc = stats.collect(
+        catalog,
+        control,
+        now=datetime.now(timezone.utc),
+        face_store=_RaisingFaceStore(),  # type: ignore[arg-type]
+    )
+
+    assert doc["faces"] is None
+    assert doc["now"] is not None
+    assert doc["library"] is not None
     assert doc["evidence"] is not None
     assert doc["queues"] is not None
     assert doc["history"] is not None
