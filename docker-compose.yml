@@ -23,7 +23,11 @@ services:
       IMAGEHARBOR_FACE_MODEL_DIR: /data/models
       IMAGEHARBOR_FACE_THRESHOLD: ""     # set from `faces calibrate` output
     ports:
-      - "8080:8080"     # operational dashboard (see docs/superpowers/specs/2026-08-19-dashboard-design.md)
+      # Host 8087, not 8080: GTE's console already owns 8080 on this host.
+      # A collision here is SILENT -- `serve()` logs the bind failure and the
+      # watcher keeps organizing without a dashboard -- so the port is chosen
+      # deliberately rather than discovered by its absence.
+      - "8087:8080"     # operational dashboard (see docs/superpowers/specs/2026-08-19-dashboard-design.md)
     volumes:
       - /mnt/nas/photos:/data/source:ro          # read-only source
       - /mnt/nas/photos-organized:/data/dest     # read-write organized library

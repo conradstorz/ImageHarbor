@@ -57,9 +57,9 @@ docker compose run --rm imageharbor verify /data/dest
 
 ## 5. Reach the dashboard
 
-`docker-compose.yml` already publishes `8080:8080` and points its
+`docker-compose.yml` already publishes `8087:8080` and points its
 `healthcheck` at `/healthz`. Once the container is up, browse to
-`http://<docker-host>:8080/` for the operational dashboard: library stats,
+`http://<docker-host>:8087/` for the operational dashboard: library stats,
 evidence-quality tier tables, work queues, pass history, and a projection of
 when the remaining backlog will clear (or `stalled`/`unknown` when the AI
 backend is unreachable, the watcher is paused, or there isn't enough recent
