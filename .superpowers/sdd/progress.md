@@ -643,3 +643,59 @@ Base for this round: e08bc4b
   `test_watch_warns_once_when_clustering_due_but_no_threshold_configured`) had accidentally been
   exploiting the bug (asserting recluster fired with zero unclustered faces) and were corrected
   to seed a genuinely clusterable face. Full report: .superpowers/sdd/fix-task-4-report.md
+
+- Fix Task 4 (IMPORTANT 4, recluster gate spins on zero-cluster library): COMPLETE
+  (e868ccf..fb66573; suite 1154 passed/11 skipped; review clean, Approved)
+  watcher.py's recluster_due now requires unclustered>0 AND no clusters (or over-threshold),
+  so a library with zero clusterable faces stops spinning the expensive rglob every cycle.
+  cluster_ids() gained an OPTIONAL embed_model param (default None=unscoped) rather than the
+  brief's literal "mandatory, matching unclustered_face_count" -- deliberate deviation, flagged
+  by the implementer and independently endorsed by the reviewer: clusters.id is
+  AUTOINCREMENT and globally unique regardless of embed_model (the schema's own comment names
+  dashboard.people's existence check as the exact reason AUTOINCREMENT was chosen), so
+  _cluster_exists correctly stays unscoped -- forcing a model through that HTTP-facing check
+  would be wrong, not safer. watcher.py and both cli.py faces_cluster call sites now pass
+  embed_model explicitly. Reviewer also confirmed two pre-existing tests that had been
+  unknowingly asserting the buggy always-spin behavior were fixed by giving them a real
+  unclustered face, not by weakening their assertions.
+
+- Fix Task 5 (IMPORTANT 5, detect_model threading untested): COMPLETE
+  (fb66573..8b83b8d; suite 1155 passed/11 skipped; review clean, Approved)
+  TEST-ONLY task -- watcher.py's propagate_sidecars call was already correctly wired to
+  detector.model_name. New test drives two real watch() cycles (not a direct
+  runner.propagate_sidecars call, which would hand-supply the correct model name and be
+  structurally blind to the bug class) with a genuinely confirmed cluster, asserts cycle 1
+  writes the sidecar and advances sidecar_at, cycle 2 is a no-op. Reviewer traced
+  record_scan -> mark_sidecar_written -> iter_pending_sidecars by hand and confirmed the
+  detector/embedder model name strings actually differ in the fixture ("yunet" vs "auraface"),
+  so the described swap-mutation genuinely discriminates rather than coincidentally no-op'ing.
+
+- Fix Task 6 (IMPORTANT 6, false invariant wording): COMPLETE
+  (8b83b8d..40574fb; suite 1155 passed/11 skipped; review clean, Approved)
+  DOCUMENTATION-ONLY -- no behavior change. replace_clusters genuinely writes
+  clusters.person_id (restoring a previously-confirmed person after a recluster) but 5 places
+  claimed confirm/merge were the ONLY writers. Reworded all 5 (store.py module docstring,
+  merge()'s docstring, CLAUDE.md's architecture bullet, CLAUDE.md's "no identity without
+  confirmation" bullet, dashboard/people.py's module docstring) to "confirm/merge assign a
+  NEW person; replace_clusters only ever RESTORES an existing one, never invents." runner.py's
+  cluster() docstring was already correct and left untouched. Reviewer independently grepped
+  for the old absolute phrasing tree-wide and confirmed no location was missed.
+
+- Fix Task 7 (Elevated Minors 7a + 7b): COMPLETE
+  (40574fb..d70cdf0, 2 commits; suite 1157 passed/11 skipped; review clean, Approved)
+  7a: _faces_model_dir's explicit-arg > env-var > dest precedence was untested -- added
+  test_faces_model_dir_precedence pinning both orderings; no production change needed (already
+  correct). Reviewer independently traced the real function body and confirmed both assertions
+  genuinely discriminate their respective mutations.
+  7b: dashboard/server.py's _SETTINGS_KEYS lacked "faces", making the fully-built
+  ControlPlane.faces override storage/resolution layer unreachable via POST /api/settings.
+  Wired "faces" into _SETTINGS_KEYS and _handle_settings' validation, mirroring "enrich"
+  exactly; control.py needed no changes (confirmed already correct before touching anything);
+  watcher.py's "next cycle" comment is now true and was left as-is. New test verifies the
+  round-trip through an INDEPENDENT read (control.faces_enabled), not just the POST's own
+  echoed response, for both true and false -- reviewer confirmed this against ControlPlane's
+  actual property/fixture defaults.
+
+## FIX ROUND COMPLETE -- all 7 findings fixed, all reviews Approved (0 Critical/Important
+open). See docs/superpowers/plans/2026-09-01-final-review-fixes.md and
+.superpowers/sdd/final-review-fixes.md for the round report.
