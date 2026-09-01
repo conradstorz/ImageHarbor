@@ -1021,6 +1021,53 @@ def test_index_pair_rule_is_recorded_verbatim(
     assert prov["pair_rule"] == "index-only-rule"
 
 
+def test_index_only_paired_sidecar_is_not_filed_as_an_orphan(
+    dirs, catalog: Catalog, tmp_path: Path
+) -> None:
+    """I2: `_survey`'s claimed-sidecar accounting -- the set that gates
+    `_preserve_provenance`'s orphaned/ bucket -- must route through the
+    index too, not just the built-in ladder.
+
+    The sidecar here (`some-other-photo.jpg.json`) is deliberately
+    media-sidecar-SHAPED (`_looks_like_media_sidecar` requires its stem to
+    classify as an image/video, or it is never even a candidate for
+    orphaned/) but names a file that shares nothing with `weird1.jpg` --
+    the built-in ladder's naming rungs (exact, case-insensitive,
+    truncation-prefix) can never associate the two, only the index can (see
+    `_index_covering_weird1`'s pattern). Without this fix that sidecar is
+    filed under orphaned/ even though the index-only pairing DOES claim
+    it -- overstating the residue that has to stay honest.
+    """
+    from tests.test_takeout_index_reader import make_index
+
+    archives, dest = dirs
+    sidecar_member = f"{D}/some-other-photo.jpg.json"
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/weird1.jpg": _jpeg(3),
+        sidecar_member: _sidecar("weird1.jpg", 1425905792),
+    })
+    st = (archives / "takeout-001.zip").stat()
+    idx_path = make_index(
+        tmp_path / "index.sqlite",
+        archives=(("takeout-001.zip", st.st_size, int(st.st_mtime), 0, None),),
+        sidecars=[(1, "takeout-001.zip", sidecar_member, "some-other-photo.jpg.json")],
+        media=[("takeout-001.zip", f"{D}/weird1.jpg", "area", "folder",
+                "weird1.jpg", 1, "index-only-rule", "own")],
+    )
+
+    stats = ingest_archives(archives, dest, catalog, index_path=idx_path)
+    assert stats.index_archives_covered == 1
+
+    from imageharbor.takeout import provenance
+
+    identity = catalog.takeout_archives_all()[0]["archive_id"]
+    room = dest / provenance.ROOM_NAME / identity
+    orphaned = room / "orphaned" / "some-other-photo.jpg.json"
+    claimed = room / D / "some-other-photo.jpg.json"
+    assert not orphaned.exists(), "an index-only-paired sidecar must not be orphaned"
+    assert claimed.exists(), "it must be preserved at its normal member path instead"
+
+
 def test_index_null_sidecar_falls_back_to_builtin_pairing(
     dirs, catalog: Catalog, tmp_path: Path
 ) -> None:

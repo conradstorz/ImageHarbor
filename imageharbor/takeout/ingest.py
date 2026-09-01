@@ -461,17 +461,32 @@ class _Ingestor:
         self._all_members = frozenset(all_members)
 
         # Every sidecar path claimed by some media member, across the whole
-        # batch. `pairing.sidecar_for` already returns a `Pairing` with
-        # `sidecar=None` for a path that is itself sidecar-shaped, so this can
-        # run over every member path unfiltered -- no need to separate media
-        # from sidecars here. A
-        # failure for one member's path must not cost every OTHER member its
-        # orphan/claimed determination, so each call is isolated -- mirrors
-        # every other per-member try/except in this module.
+        # batch -- via the index when it covers a member's archive, exactly
+        # like every other pairing site (I2: this loop used to call
+        # `pairing.sidecar_for` directly, bypassing the index entirely, so an
+        # index-only pairing's sidecar was claimed for real but never counted
+        # here, and got filed under orphaned/ regardless). Routed through
+        # `_resolve_pairing` -- the pure lookup `_pairing_for` also uses -- so
+        # this whole-batch scan does NOT touch `self.stats`; counting stays
+        # exclusively in `_pairing_for`, called once per member actually
+        # ingested or re-checked (see its docstring).
+        #
+        # `pairing.sidecar_for` (reached here whenever the index doesn't
+        # supply an answer) already returns a `Pairing` with `sidecar=None`
+        # for a path that is itself sidecar-shaped, so this can run over
+        # every member path unfiltered -- no need to separate media from
+        # sidecars here. A failure for one member's path must not cost every
+        # OTHER member its orphan/claimed determination, so each call is
+        # isolated -- mirrors every other per-member try/except in this
+        # module.
         claimed: set[str] = set()
         for member_path in all_members:
+            owner_path = self.owner.get(member_path)
+            archive_name = owner_path.name if owner_path is not None else ""
             try:
-                pairing_result = pairing.sidecar_for(member_path, self.pairing_index)
+                pairing_result, _pair_rule, _fallback_stat = self._resolve_pairing(
+                    member_path, archive_name
+                )
             except Exception as exc:
                 logger.warning(
                     "sidecar_for failed for %s during provenance indexing: %s",
@@ -593,17 +608,31 @@ class _Ingestor:
     # producer-side schema drift, not a pairing this code may trust.
     _VALID_CONFIDENCES = frozenset({pairing.OWN, pairing.RELATED, pairing.NO_MATCH})
 
-    def _pairing_for(self, member_path: str, archive_name: str) -> tuple[pairing.Pairing, str]:
+    def _resolve_pairing(
+        self, member_path: str, archive_name: str,
+    ) -> tuple[pairing.Pairing, str, str | None]:
         """The pairing for one member, from the index when it covers this
         archive and knows this member, otherwise from the built-in rungs.
+        PURE: never touches `self.stats`.
 
-        Returns the pairing together with `pair_rule`: the index's own rule
-        name when the index supplied the pairing, or the literal string
-        `"builtin"` when the built-in ladder did -- it does not name its
-        rungs, and inventing names for them here would be fiction.
+        Returns `(pairing, pair_rule, fallback_stat)`. `pair_rule` is the
+        index's own rule name when the index supplied the pairing, or the
+        literal string `"builtin"` when the built-in ladder did -- it does
+        not name its rungs, and inventing names for them here would be
+        fiction. `fallback_stat` is the `IngestStats` field name to
+        increment for this fallback, or None when no fallback happened: the
+        index supplied the pairing directly, or the index simply does not
+        cover this archive at all (coverage itself is counted once per
+        archive in `_survey`, never once per member here).
 
-        Every fallback is counted. A silent fallback would make a stale index
-        indistinguishable from a working one.
+        `_pairing_for` wraps this and applies the counting; `_survey`'s
+        claimed-sidecar loop (I2) calls this directly instead, because it
+        scans every member in the WHOLE batch for orphan/provenance
+        accounting -- routing that scan through `_pairing_for` would
+        double-count `pairings_related`/`pairings_own`/the fallback counters
+        against the real per-ingest tallies produced where each member is
+        actually ingested or re-checked (`_ingest_image`, `_defer_video`,
+        and the late-sidecar reopen check in `_survey`'s second pass).
 
         The built-in ladder is always a correct answer, so it is consulted --
         not merely counted -- whenever the index cannot supply a trustworthy
@@ -618,30 +647,43 @@ class _Ingestor:
         if self.index is not None and self.index.covers(archive_name):
             found = self.index.sidecar_for(member_path)
             if found is None:
-                self.stats.index_members_fell_back += 1
-            elif found.confidence not in self._VALID_CONFIDENCES:
+                return (pairing.sidecar_for(member_path, self.pairing_index),
+                        "builtin", "index_members_fell_back")
+            if found.confidence not in self._VALID_CONFIDENCES:
                 logger.warning(
                     "Takeout index has an unrecognized confidence %r for %s; "
                     "falling back to built-in pairing", found.confidence, member_path,
                 )
-                self.stats.index_bad_confidence_fell_back += 1
-            elif found.sidecar is not None and found.sidecar not in self._all_members:
-                self.stats.index_sidecars_missing += 1
-            elif found.sidecar is None:
-                self.stats.index_no_sidecar_fell_back += 1
-            else:
-                result = pairing.Pairing(found.sidecar, found.confidence)
-                if result.confidence == pairing.RELATED:
-                    self.stats.pairings_related += 1
-                elif result.confidence == pairing.OWN:
-                    self.stats.pairings_own += 1
-                return result, found.rule
-        result = pairing.sidecar_for(member_path, self.pairing_index)
+                return (pairing.sidecar_for(member_path, self.pairing_index),
+                        "builtin", "index_bad_confidence_fell_back")
+            if found.sidecar is not None and found.sidecar not in self._all_members:
+                return (pairing.sidecar_for(member_path, self.pairing_index),
+                        "builtin", "index_sidecars_missing")
+            if found.sidecar is None:
+                return (pairing.sidecar_for(member_path, self.pairing_index),
+                        "builtin", "index_no_sidecar_fell_back")
+            return pairing.Pairing(found.sidecar, found.confidence), found.rule, None
+        return pairing.sidecar_for(member_path, self.pairing_index), "builtin", None
+
+    def _pairing_for(self, member_path: str, archive_name: str) -> tuple[pairing.Pairing, str]:
+        """The pairing for one member, counted. See `_resolve_pairing` for
+        the actual resolution logic -- this applies exactly one layer of
+        counting on top of it: the fallback counter (if any fallback
+        happened) and the own/related pairing counters, together, so a
+        caller of `_resolve_pairing` alone (the whole-batch orphan scan in
+        `_survey`) never contributes to either.
+
+        Every fallback is counted. A silent fallback would make a stale index
+        indistinguishable from a working one.
+        """
+        result, pair_rule, fallback_stat = self._resolve_pairing(member_path, archive_name)
+        if fallback_stat is not None:
+            setattr(self.stats, fallback_stat, getattr(self.stats, fallback_stat) + 1)
         if result.confidence == pairing.RELATED:
             self.stats.pairings_related += 1
         elif result.confidence == pairing.OWN:
             self.stats.pairings_own += 1
-        return result, "builtin"
+        return result, pair_rule
 
     def _zip_for(self, path: Path) -> zipfile.ZipFile:
         """Return a cached, open handle for *path*, opening it on first use.
