@@ -624,3 +624,114 @@ def test_watch_forwards_pause_check_into_the_faces_scan(
     # `None` or a copy that could drift out of sync with a pause landing
     # mid-pass.
     assert captured["should_stop"] == control.pause_check
+
+
+# ---------------------------------------------------------------------------
+# fix-round finding: `propagate_sidecars`'s `detect_model` arg is untested
+# ---------------------------------------------------------------------------
+
+
+def test_second_watch_cycle_does_not_rewrite_an_already_propagated_sidecar(
+    tmp_path: Path,
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    face_store: FaceStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the fix-round finding: watcher.py's faces-pass block
+    calls `face_runner.propagate_sidecars(face_config.store, face_config.dest,
+    face_config.detector.model_name)`. Swapping that last argument for
+    `face_config.embedder.model_name` passed all 290 previously-relevant
+    tests -- `detect_model` only matters one call deep, inside
+    `mark_sidecar_written`'s `UPDATE face_scan SET sidecar_at=? WHERE
+    sha256_b64url=? AND detect_model=?`, which then matches zero rows
+    (`face_scan.detect_model` is stamped with the DETECTOR's model name in
+    `record_scan`, never the embedder's). `sidecar_at` would then never
+    advance off NULL, so `iter_pending_sidecars` would keep yielding the same
+    already-propagated photo forever -- a full-library sidecar rewrite on
+    every single watch cycle, silently, forever.
+
+    This drives the REAL `watcher.watch()` code path across two cycles (not
+    a direct `runner.propagate_sidecars(store, dest, "yunet")` call, which
+    would hand-supply the correct model name and could never see this class
+    of wiring bug). Confirming a name is a human/dashboard action, not
+    something the faces pass itself does, so -- exactly like the
+    recluster-gate tests above -- the scanned+clustered+confirmed state is
+    seeded directly via `record_scan`/`replace_clusters`/`confirm` before any
+    cycle runs; only the sidecar *propagation* (the code actually under
+    test) is exercised through `watch()`.
+    """
+    from PIL import Image
+
+    path = organized_dir / "photo0.jpg"
+    Image.new("RGB", (200, 200), (10, 100, 100)).save(path)
+    catalog.upsert(
+        sha256_b64url="digest0", original_path=str(path), organized_path=str(path)
+    )
+
+    ids = face_store.record_scan(
+        "digest0", "yunet", [(_det(), _vec([1, 0, 0, 0]), "auraface")]
+    )
+    face_store.replace_clusters(
+        "auraface", [Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0, 0]))]
+    )
+    [cluster_id] = face_store.cluster_ids("auraface")
+    face_store.confirm(cluster_id, "Alice")
+
+    # A spy that still calls the real `propagate_sidecars` -- the code under
+    # test is watcher.py's *call site*, not this function, so it must keep
+    # running for real, not be stubbed out the way
+    # test_watch_forwards_pause_check_into_the_faces_scan stubs it.
+    written_counts: list[int] = []
+    real_propagate_sidecars = runner.propagate_sidecars
+
+    def _spy_propagate_sidecars(store, dest, detect_model):
+        n = real_propagate_sidecars(store, dest, detect_model)
+        written_counts.append(n)
+        return n
+
+    monkeypatch.setattr(
+        "imageharbor.faces.runner.propagate_sidecars", _spy_propagate_sidecars
+    )
+
+    def _sidecar_at() -> str | None:
+        row = face_store._conn.execute(
+            "SELECT sidecar_at FROM face_scan WHERE sha256_b64url=? AND detect_model=?",
+            ("digest0", "yunet"),
+        ).fetchone()
+        return row["sidecar_at"] if row is not None else None
+
+    pipeline = _make_pipeline(source_dir, organized_dir, catalog)
+    face_config = _basic_face_config(tmp_path, organized_dir, face_store)
+
+    # Cycle 1: the confirmation predates this cycle, so propagation should
+    # write the sidecar now and sidecar_at should move off NULL.
+    stop1 = threading.Event()
+    watch(
+        pipeline=pipeline,
+        catalog=catalog,
+        interval=1.0,
+        stop_event=stop1,
+        sleep=_one_cycle_sleep(stop1, n=1),
+        faces_enabled=True,
+        face_config=face_config,
+    )
+    sidecar_at_1 = _sidecar_at()
+    assert written_counts == [1]
+    assert sidecar_at_1 is not None
+
+    # Cycle 2: nothing changed since cycle 1 -- propagation must be a no-op.
+    stop2 = threading.Event()
+    watch(
+        pipeline=pipeline,
+        catalog=catalog,
+        interval=1.0,
+        stop_event=stop2,
+        sleep=_one_cycle_sleep(stop2, n=1),
+        faces_enabled=True,
+        face_config=face_config,
+    )
+    sidecar_at_2 = _sidecar_at()
+    assert written_counts == [1, 0]
+    assert sidecar_at_2 == sidecar_at_1
