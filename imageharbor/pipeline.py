@@ -66,6 +66,12 @@ class ExternalEvidence:
 
     date: datetime | None = None           # e.g. Google photoTakenTime
     original_name: str | None = None       # e.g. Google `title`, pre-truncation
+    # The tier `date` is resolved at, when it wins. Defaults to the ordinary
+    # external-sidecar rung; a caller supplying a `related` pairing's date
+    # (usually its unedited original's) passes `tiers.DATE_RELATED_SIDECAR`
+    # instead -- the capture instant is trustworthy, but one rung below a
+    # sidecar that names this file directly.
+    date_tier: int = tiers.DATE_EXTERNAL_SIDECAR
 
 
 @dataclass
@@ -282,7 +288,9 @@ class Pipeline:
 
         # Step 4: facts -- date decides the folder, descriptor decides the name.
         date = resolve_date(
-            source_path, exif_data, external_date=evidence.date if evidence else None
+            source_path, exif_data,
+            external_date=evidence.date if evidence else None,
+            external_date_tier=evidence.date_tier if evidence else tiers.DATE_EXTERNAL_SIDECAR,
         )
         descriptor = resolve_descriptor(
             source_path,
@@ -418,7 +426,9 @@ class Pipeline:
             return
 
         date = resolve_date(
-            source_path, {}, external_date=evidence.date if evidence else None
+            source_path, {},
+            external_date=evidence.date if evidence else None,
+            external_date_tier=evidence.date_tier if evidence else tiers.DATE_EXTERNAL_SIDECAR,
         )
         descriptor = resolve_descriptor(
             source_path,

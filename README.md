@@ -131,6 +131,48 @@ image's JSON sidecar, not in the path or filename.
 
 Run `imageharbor --help` (or `<command> --help`) for the full flag list.
 
+## Google Takeout ingestion
+
+`imageharbor takeout ingest --archives DIR --dest DEST` pairs each photo and
+video in a set of Google Takeout `.zip` exports with its Google JSON sidecar
+using a built-in six-rung matching ladder (exact name, the newer
+`supplemental-metadata` spelling, copy-suffix, `-edited` derivatives,
+case-insensitive retry, and truncation recovery) — no other tooling is
+required.
+
+`--takeout-index PATH` is **optional**. It points at a `takeout-index.sqlite`
+published by the separate `Takeout_Inventory` tool, which can resolve some
+pairings the built-in ladder deliberately never attempts (for example, a
+sidecar in a different folder from its photo). A
+`takeout-index.sqlite` sitting beside `--archives` is auto-detected and used
+automatically; pass `--takeout-index` only to point at one that's named or
+located differently. Without an index — the default — ingestion behaves
+exactly as it always has.
+
+Every pairing carries one of three confidence values, whether it came from
+an index or the built-in ladder, and that value — not which engine produced
+it — decides what the pairing may contribute:
+
+| Confidence | Sidecar names... | Contributes |
+|---|---|---|
+| `own` | this exact file | capture date, title, face tags |
+| `related` | a *different* file — usually this file's unedited original | capture date only |
+| `none` | nothing (no match found) | nothing — the file organizes from EXIF and its filename alone |
+
+A `related` pairing never contributes a title or face tags, because the
+sidecar it names describes a different photograph: applying its title would
+rename this file after its sibling, and its face tags belong to that other
+image. Its capture date is still trusted (one tier below a sidecar that
+names this file directly), because the related file is usually the same
+photograph before an edit.
+
+The raw Google JSON behind a `related` pairing is not discarded — it's
+preserved as provenance the same as any other sidecar, but labelled with its
+`confidence` and `pair_rule` rather than treated as authoritative. That
+labelling matters because the document's own fields (GPS coordinates
+included) describe the *related* file, not this one; reading them back later
+without the label would silently misattribute them.
+
 ## Learn more
 
 - [`CLAUDE.md`](CLAUDE.md) — architecture, module responsibilities, and the

@@ -58,6 +58,23 @@ _PAREN_RE = re.compile(r"^(?P<base>.*)\((?P<n>\d+)\)$")
 # coincidence: "abc.json" is a prefix of every "abc*" in the directory.
 _MIN_TRUNCATION_PREFIX = 12
 
+OWN = "own"           # the sidecar names this file: title and location are its own
+RELATED = "related"   # it names a different file (this one's unedited original)
+NO_MATCH = "none"
+
+
+@dataclass(frozen=True)
+class Pairing:
+    """A sidecar match and how far it may be trusted.
+
+    `confidence` follows the NAME VARIANT that produced the candidate, not the
+    rung number: rung 5 retries rungs 1-4 case-insensitively, so a
+    case-differing `-edited` file must still come back `related`.
+    """
+
+    sidecar: str | None
+    confidence: str
+
 
 @dataclass
 class PairingIndex:
@@ -106,21 +123,32 @@ def _is_sidecar(member_path: str) -> bool:
     return member_path.lower().endswith(_JSON_SUFFIX)
 
 
-def _name_variants(name: str) -> list[str]:
-    """The member name, then its pre-``-edited`` original (rung 4)."""
-    variants = [name]
+def _is_edited(name: str) -> bool:
+    """True if *name* (a basename) carries the `-edited` suffix before its
+    extension. An `-edited` file's own metadata belongs to its original, never
+    to itself -- used by rung 6 (m1) the same way `_name_variants` already
+    uses it for rungs 1-5."""
+    base, dot, _ext = name.rpartition(".")
+    return bool(dot) and base.lower().endswith(_EDITED)
+
+
+def _name_variants(name: str) -> list[tuple[str, str]]:
+    """(name, confidence) pairs: the member's own name, then its pre-`-edited`
+    original (rung 4), whose sidecar describes a different file."""
+    variants = [(name, OWN)]
     base, dot, ext = name.rpartition(".")
     if dot and base.lower().endswith(_EDITED):
-        variants.append(f"{base[: -len(_EDITED)]}.{ext}")
+        variants.append((f"{base[: -len(_EDITED)]}.{ext}", RELATED))
     return variants
 
 
-def _candidates(media_path: str) -> list[str]:
-    """Every exact sidecar path *media_path* could legitimately pair with."""
+def _candidates(media_path: str) -> list[tuple[str, str]]:
+    """Every exact sidecar path *media_path* could legitimately pair with,
+    paired with the confidence of the name variant that produced it."""
     directory, name = _split(media_path)
     prefix = f"{directory}/" if directory else ""
-    out: list[str] = []
-    for variant in _name_variants(name):
+    out: list[tuple[str, str]] = []
+    for variant, confidence in _name_variants(name):
         base, dot, ext = variant.rpartition(".")
         if not dot:  # no extension at all
             base, ext = variant, ""
@@ -128,15 +156,20 @@ def _candidates(media_path: str) -> list[str]:
         # by the generic rule, which some exports ALSO satisfy.
         match = _PAREN_RE.match(base)
         if match and ext:
-            out.append(f"{prefix}{match.group('base')}.{ext}({match.group('n')}){_JSON_SUFFIX}")
+            out.append(
+                (f"{prefix}{match.group('base')}.{ext}({match.group('n')}){_JSON_SUFFIX}", confidence)
+            )
             # Newer exports write the copy marker AFTER the supplemental-
             # metadata tag instead: NAME.EXT.supplemental-metadata(N).json.
             out.append(
-                f"{prefix}{match.group('base')}.{ext}"
-                f"{_SUPPLEMENTAL_TAG}({match.group('n')}){_JSON_SUFFIX}"
+                (
+                    f"{prefix}{match.group('base')}.{ext}"
+                    f"{_SUPPLEMENTAL_TAG}({match.group('n')}){_JSON_SUFFIX}",
+                    confidence,
+                )
             )
-        out.append(f"{prefix}{variant}{_JSON_SUFFIX}")
-        out.append(f"{prefix}{variant}{_SUPPLEMENTAL}")
+        out.append((f"{prefix}{variant}{_JSON_SUFFIX}", confidence))
+        out.append((f"{prefix}{variant}{_SUPPLEMENTAL}", confidence))
     return out
 
 
@@ -163,16 +196,16 @@ def _media_part(sidecar_name: str) -> str:
     return sidecar_name[: -len(_JSON_SUFFIX)]
 
 
-def _exact_match(media_path: str, index: PairingIndex) -> str | None:
+def _exact_match(media_path: str, index: PairingIndex) -> Pairing | None:
     """Rungs 1-4, then rung 5 (the same candidates, case-insensitively)."""
     candidates = _candidates(media_path)
-    for candidate in candidates:
+    for candidate, confidence in candidates:
         if candidate in index.sidecars:
-            return candidate
-    for candidate in candidates:
+            return Pairing(candidate, confidence)
+    for candidate, confidence in candidates:
         hit = index.sidecars_ci.get(candidate.lower())
         if hit is not None:
-            return hit
+            return Pairing(hit, confidence)
     return None
 
 
@@ -250,7 +283,7 @@ def build_index(members: Iterable[str]) -> PairingIndex:
     # already used, and a sidecar that can never be returned by `sidecar_for`
     # in the first place has nothing to protect.
     claimed = {
-        match
+        match.sidecar
         for media_path in media
         if (match := _exact_match(media_path, partial)) is not None
     }
@@ -276,13 +309,20 @@ def build_index(members: Iterable[str]) -> PairingIndex:
     return partial
 
 
-def sidecar_for(media_path: str, index: PairingIndex) -> str | None:
-    """Return *media_path*'s sidecar member path, or None if none is certain."""
-    if _is_sidecar(media_path):
-        return None
-    if media_path in index.ambiguous_media:
-        return None
+def sidecar_for(media_path: str, index: PairingIndex) -> Pairing:
+    """Return *media_path*'s pairing. `sidecar` is None if none is certain."""
+    if _is_sidecar(media_path) or media_path in index.ambiguous_media:
+        return Pairing(None, NO_MATCH)
     exact = _exact_match(media_path, index)
     if exact is not None:
         return exact
-    return _truncation_match(media_path, index)
+    # Rung 6 resolves a truncated spelling of this file's OWN name -- but
+    # for an `-edited` derivative that OWN name's sidecar (if truncation
+    # recovery hands it one) can only describe the ORIGINAL file, never the
+    # edit itself (m1). Confidence follows the name variant here exactly as
+    # it already does in `_name_variants` for rungs 1-5.
+    truncated = _truncation_match(media_path, index)
+    if truncated is None:
+        return Pairing(None, NO_MATCH)
+    _, name = _split(media_path)
+    return Pairing(truncated, RELATED if _is_edited(name) else OWN)

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -1039,6 +1041,55 @@ def _takeout_zip(path, entries):
     return path
 
 
+# Minimal Takeout_Inventory index schema -- mirrors
+# tests/test_takeout_index_reader.py's `SCHEMA`/`make_index`, kept local so
+# this module's CLI tests do not reach into another test module.
+_INDEX_SCHEMA = """
+CREATE TABLE sidecar (
+  id INTEGER PRIMARY KEY, archive TEXT, path TEXT NOT NULL, name TEXT NOT NULL,
+  title TEXT, taken_at TEXT, lat REAL, lon REAL, device TEXT,
+  trashed INTEGER, archived INTEGER, from_partner INTEGER,
+  parse_error TEXT, role TEXT);
+CREATE TABLE media (
+  id INTEGER PRIMARY KEY, archive TEXT, path TEXT NOT NULL, area TEXT NOT NULL,
+  folder TEXT NOT NULL, name TEXT NOT NULL, ext TEXT, size INTEGER,
+  actual_type TEXT, sidecar_id INTEGER REFERENCES sidecar(id),
+  rule TEXT NOT NULL, confidence TEXT NOT NULL);
+CREATE TABLE archive (
+  name TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
+  members INTEGER NOT NULL, error TEXT);
+CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def _make_takeout_index(
+    path, *, archive_name, archive_stat, media_path, sidecar_path,
+    sidecar_id=1, confidence="own", rule="exact",
+):
+    """Build a minimal, valid Takeout_Inventory index covering one archive,
+    pairing one media member to one sidecar with the given *confidence*."""
+    con = sqlite3.connect(path)
+    con.executescript(_INDEX_SCHEMA)
+    con.execute(
+        "INSERT INTO archive VALUES (?,?,?,?,?)",
+        (archive_name, archive_stat.st_size, int(archive_stat.st_mtime), 2, None),
+    )
+    con.execute(
+        "INSERT INTO sidecar (id, archive, path, name) VALUES (?,?,?,?)",
+        (sidecar_id, archive_name, sidecar_path, sidecar_path.rpartition("/")[2]),
+    )
+    con.execute(
+        "INSERT INTO media (archive, path, area, folder, name, sidecar_id, rule, confidence)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (archive_name, media_path, "GP", "GP", media_path.rpartition("/")[2],
+         sidecar_id, rule, confidence),
+    )
+    con.execute("INSERT INTO index_meta VALUES ('schema_version', '1')")
+    con.commit()
+    con.close()
+    return path
+
+
 def test_takeout_ingest(tmp_path) -> None:
     archives = tmp_path / "archives"
     archives.mkdir()
@@ -1123,6 +1174,188 @@ def test_takeout_ingest_dry_run_writes_nothing(tmp_path) -> None:
     assert result.exit_code == 0, result.output
     assert "[DRY-RUN]" in result.output
     assert not (dest / "catalog.db").exists()
+
+
+def test_takeout_ingest_rejects_an_explicit_missing_index(tmp_path) -> None:
+    """You named something specific and did not get it."""
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    _takeout_zip(
+        archives / "t.zip",
+        {"Takeout/a/x.jpg": b"\xff\xd8\xff\xe0" + b"\x05" * 16 + b"\xff\xd9"},
+    )
+    missing = tmp_path / "absent.sqlite"
+
+    result = CliRunner().invoke(main, [
+        "takeout", "ingest", "--archives", str(archives), "--dest", str(dest),
+        "--takeout-index", str(missing),
+    ])
+    assert result.exit_code != 0
+    assert "index" in result.output.lower()
+    # Pins the failure to the missing INDEX specifically. "index" alone is
+    # too weak a check on its own: before --takeout-index exists at all,
+    # Click's own "No such option: --takeout-index" rejection also contains
+    # the substring "index" and would make this assertion pass vacuously for
+    # the wrong reason. Naming the missing file rules that out.
+    assert missing.name in result.output
+    # An explicit, unusable index is an error that aborts the survey before
+    # any archive is opened -- not a fallback that continues ingesting with
+    # weaker pairing. `--dest`'s catalog.db is created merely by opening the
+    # Catalog (true of every run, success or failure), so the meaningful
+    # check is that nothing was actually extracted into it.
+    assert not any(dest.rglob("*.jpg"))
+
+
+def test_takeout_ingest_without_an_index_says_so(tmp_path) -> None:
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    _takeout_zip(
+        archives / "t.zip",
+        {"Takeout/a/x.jpg": b"\xff\xd8\xff\xe0" + b"\x06" * 16 + b"\xff\xd9"},
+    )
+
+    result = CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    # "Did it use the index?" must never be answered by reading logs.
+    assert "no index" in result.output.lower()
+
+
+def test_takeout_ingest_auto_detects_a_usable_index_beside_archives(tmp_path) -> None:
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    archive_path = _takeout_zip(
+        archives / "t.zip",
+        {
+            "Takeout/AlbumArchive/a/2015-03-09.jpg":
+                b"\xff\xd8\xff\xe0" + b"\x07" * 16 + b"\xff\xd9",
+            "Takeout/AlbumArchive/a/2015-03-09.jpg.json": json.dumps(
+                {"title": "2015-03-09.jpg",
+                 "photoTakenTime": {"timestampSeconds": "1425905792"}}
+            ).encode(),
+        },
+    )
+    _make_takeout_index(
+        archives / "takeout-index.sqlite",
+        archive_name="t.zip",
+        archive_stat=archive_path.stat(),
+        media_path="Takeout/AlbumArchive/a/2015-03-09.jpg",
+        sidecar_path="Takeout/AlbumArchive/a/2015-03-09.jpg.json",
+    )
+
+    result = CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "ingested 1" in result.output
+    # No --takeout-index flag was passed -- this index was only found because
+    # it sits beside --archives, and the summary must show that it was used.
+    assert "takeout-index.sqlite" in result.output
+    assert "1 indexed, 0 fell back" in result.output
+    assert "1 own" in result.output
+
+
+def test_takeout_ingest_falls_back_when_the_auto_detected_index_is_unusable(tmp_path) -> None:
+    """A stale or broken index must never fail an ingest -- only an
+    explicitly-named one may."""
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    _takeout_zip(
+        archives / "t.zip",
+        {"Takeout/a/x.jpg": b"\xff\xd8\xff\xe0" + b"\x08" * 16 + b"\xff\xd9"},
+    )
+    (archives / "takeout-index.sqlite").write_bytes(b"not a database")
+
+    result = CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "ingested 1" in result.output
+    assert "no index" in result.output.lower()
+
+
+def test_takeout_ingest_pairings_summary_never_goes_negative(tmp_path) -> None:
+    """Reviewer repro: one archive holding a fresh image, a duplicate of it,
+    and a deferred video, all paired via a real index (own/related/related).
+
+    The "own" figure used to be derived as `ingested - pairings_related`.
+    That subtraction is not a partition: `pairings_related` is incremented in
+    `_pairing_for` for EVERY member routed through it -- fresh images,
+    duplicates, and deferred videos alike -- while `ingested` counts only
+    freshly-copied, non-duplicate images. A real export always mixes all
+    three categories, so on this fixture the old formula printed
+    `-1 own \xb7 2 related \xb7 0 unpaired`. Kills that regression by pinning
+    both that no figure is negative AND that the three figures are a true
+    partition of every member `_pairing_for` actually routed.
+    """
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    dest = tmp_path / "organized"
+    fresh_bytes = b"\xff\xd8\xff\xe0" + b"\x0a" * 16 + b"\xff\xd9"
+    archive_path = _takeout_zip(
+        archives / "t.zip",
+        {
+            "Takeout/A/fresh.jpg": fresh_bytes,
+            "Takeout/A/dup.jpg": fresh_bytes,          # byte-identical -> duplicate
+            "Takeout/A/clip.mp4": b"not really an mp4",  # -> deferred
+            "Takeout/A/fresh.jpg.json": json.dumps(
+                {"title": "fresh.jpg",
+                 "photoTakenTime": {"timestampSeconds": "1425905792"}}
+            ).encode(),
+        },
+    )
+    stat = archive_path.stat()
+    con = sqlite3.connect(archives / "takeout-index.sqlite")
+    con.executescript(_INDEX_SCHEMA)
+    con.execute(
+        "INSERT INTO archive VALUES (?,?,?,?,?)",
+        ("t.zip", stat.st_size, int(stat.st_mtime), 4, None),
+    )
+    con.execute(
+        "INSERT INTO sidecar (id, archive, path, name) VALUES (?,?,?,?)",
+        (1, "t.zip", "Takeout/A/fresh.jpg.json", "fresh.jpg.json"),
+    )
+    con.executemany(
+        "INSERT INTO media (archive, path, area, folder, name, sidecar_id, rule, confidence)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        [
+            ("t.zip", "Takeout/A/fresh.jpg", "GP", "GP", "fresh.jpg", 1, "exact", "own"),
+            ("t.zip", "Takeout/A/dup.jpg", "GP", "GP", "dup.jpg", 1, "exact", "related"),
+            ("t.zip", "Takeout/A/clip.mp4", "GP", "GP", "clip.mp4", 1, "exact", "related"),
+        ],
+    )
+    con.execute("INSERT INTO index_meta VALUES ('schema_version', '1')")
+    con.commit()
+    con.close()
+
+    result = CliRunner().invoke(
+        main, ["takeout", "ingest", "--archives", str(archives), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    # No --takeout-index flag -- auto-detected, exactly as in the reviewer's run.
+    assert "takeout-index.sqlite" in result.output
+    assert "ingested 1 / duplicates 1 / deferred 1" in result.output
+
+    pairings_line = next(
+        line for line in result.output.splitlines() if "pairings" in line
+    )
+    assert "-1" not in pairings_line, pairings_line
+    numbers = [int(n) for n in re.findall(r"-?\d+", pairings_line)]
+    assert len(numbers) == 3
+    own, related, unpaired = numbers
+    assert own >= 0 and related >= 0 and unpaired >= 0
+    # `_pairing_for` was called exactly three times in this run (fresh.jpg and
+    # dup.jpg via `_ingest_image`, clip.mp4 via `_defer_video`); own/related/
+    # unpaired must be a true partition of that routed total.
+    assert own + related + unpaired == 3
+    assert own == 1
+    assert related == 2
+    assert unpaired == 0
 
 
 def test_takeout_status(tmp_path) -> None:

@@ -722,6 +722,22 @@ Module responsibilities:
   into this photo's name and folder, which is exactly the quiet corruption the
   SHA-256 discipline exists to prevent. Separately: archives are opened `'r'`
   only, and Google's `creationTime` must never reach `resolve_date`.
+- **A pairing's confidence decides what it may contribute — never which engine
+  produced it.** `own` may supply capture date, title, and face tags. `related`
+  supplies the capture date only: its sidecar names a *different* file (usually
+  this file's unedited original before an `-edited` copy), so the title and
+  `people` inside it describe that other photo, not this one, and
+  `_ingest_image`/`_merge_takeout_sidecar` must never apply them here. This
+  holds identically whether the pairing came from a `Takeout_Inventory` index
+  read by `index_reader.py` (`--takeout-index`, optional and auto-detected —
+  without it, ingestion behaves exactly as it always has) or from the built-in
+  six-rung ladder in `pairing.py` — `confidence` is the only thing either path
+  is allowed to branch on, so a photo's title and face tags can never depend on
+  whether a second tool was run. A `related` pairing's raw Google JSON is still
+  preserved as provenance (never dropped — see the previous invariant) but
+  labelled with its `confidence` and `pair_rule`, so the GPS coordinates and
+  other fields inside it read as self-describing rather than silently
+  authoritative.
 - **The 43-char digest is located by counting back from the end of the stem, NOT by
   splitting on the last `_`.** Base64url legitimately contains `_`, so a naive rsplit
   corrupts parsing. This logic is duplicated in `hashing.extract_digest_from_stem`
