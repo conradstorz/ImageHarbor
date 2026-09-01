@@ -1120,6 +1120,40 @@ def test_an_unexpected_exception_from_an_explicit_index_open_is_not_hidden(
         ingest_archives(archives, dest, catalog, index_path=idx_path)
 
 
+def test_an_unreadable_auto_detected_index_does_not_fail_the_run(
+    dirs, catalog: Catalog, monkeypatch
+) -> None:
+    """I1: `Path.is_file()` only swallows ENOENT/ENOTDIR/EBADF/ELOOP -- a
+    PermissionError (EACCES), or a stale network handle, re-raises. That
+    call used to sit OUTSIDE the try/except that treats an auto-detected
+    index's failures as warn-and-fall-back, so an unreadable
+    takeout-index.sqlite beside the archives -- no --takeout-index flag --
+    failed the ENTIRE ingest with the raw PermissionError. A broken
+    auto-detected index must never fail an ingest."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792),
+    })
+    index_candidate = archives / "takeout-index.sqlite"
+    index_candidate.write_bytes(b"")
+
+    real_is_file = Path.is_file
+
+    def _boom(self):
+        if self == index_candidate:
+            raise PermissionError(13, "Access is denied")
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", _boom)
+
+    stats = ingest_archives(archives, dest, catalog)
+
+    assert stats.ingested == 1                # the run completed, unfailed
+    assert stats.index_path is None            # the index was never actually loaded
+    assert stats.missing_metadata == 0         # built-in ladder still found the sidecar
+
+
 def test_an_unexpected_exception_from_an_auto_detected_index_still_falls_back(
     dirs, catalog: Catalog, monkeypatch
 ) -> None:

@@ -312,31 +312,41 @@ class _Ingestor:
         # both key off it to decide whether an index was used at all.
         explicit = self.index_path is not None
         candidate = self.index_path if explicit else self.archives_dir / "takeout-index.sqlite"
-        if explicit or candidate.is_file():
-            try:
-                archive_stats = {p.name: p.stat() for p in archive_paths}
-                self.index = index_reader.IndexPairings.open(candidate, archive_stats)
-            except Exception as exc:
-                if explicit:
-                    if isinstance(exc, index_reader.IndexUnusable):
-                        raise
-                    if isinstance(exc, (OSError, sqlite3.Error)):
-                        # These are the shapes a genuinely-unusable FILE takes
-                        # (missing, permission-denied, not a database, I/O
-                        # error). Anything else is a bug in this code, not a
-                        # problem with the caller's index, and must surface as
-                        # a real traceback -- wrapping it into IndexUnusable
-                        # would send troubleshooting at the wrong file.
-                        raise index_reader.IndexUnusable(
-                            f"cannot use {candidate}: {exc}"
-                        ) from exc
-                    raise
-                logger.warning(
-                    "Takeout index %s is unusable (%s); falling back to built-in "
-                    "pairing for the whole run", candidate, exc,
-                )
+        # `candidate.is_file()` itself can raise: `Path.is_file()` only
+        # swallows ENOENT/ENOTDIR/EBADF/ELOOP, so a PermissionError (EACCES)
+        # or a stale network handle re-raises. That check must live INSIDE
+        # this try, not gate entry to it -- otherwise an unreadable
+        # auto-detected index (no --takeout-index given) fails the whole
+        # ingest with a raw PermissionError instead of warning and falling
+        # back, exactly like every other auto-detect failure below.
+        try:
+            if not explicit and not candidate.is_file():
                 self.index = None
             else:
+                archive_stats = {p.name: p.stat() for p in archive_paths}
+                self.index = index_reader.IndexPairings.open(candidate, archive_stats)
+        except Exception as exc:
+            if explicit:
+                if isinstance(exc, index_reader.IndexUnusable):
+                    raise
+                if isinstance(exc, (OSError, sqlite3.Error)):
+                    # These are the shapes a genuinely-unusable FILE takes
+                    # (missing, permission-denied, not a database, I/O
+                    # error). Anything else is a bug in this code, not a
+                    # problem with the caller's index, and must surface as
+                    # a real traceback -- wrapping it into IndexUnusable
+                    # would send troubleshooting at the wrong file.
+                    raise index_reader.IndexUnusable(
+                        f"cannot use {candidate}: {exc}"
+                    ) from exc
+                raise
+            logger.warning(
+                "Takeout index %s is unusable (%s); falling back to built-in "
+                "pairing for the whole run", candidate, exc,
+            )
+            self.index = None
+        else:
+            if self.index is not None:
                 self.index_path = candidate
                 self.stats.index_path = candidate
 
