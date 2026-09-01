@@ -342,3 +342,32 @@ Any future "pre-existing failure" claim must first confirm
   bookkeeping for content-addressed organized copies (fail_count accrues with no consumer);
   _work_queue materializes catalog.iter_all() per scan() call, an accepted one-time O(n) at
   ~77k photos.
+- Task 12: build_clusters / measure_threshold / propagate_sidecars — COMPLETE (78ac5df..90c3911; 10 tests, suite 1023 passed/10 skipped; review clean, NO Critical or Important)
+  REAL SHIPPED BUG FOUND BY THE IMPLEMENTER: proposals.untagged_photos was NEVER PERSISTED
+  -- missing both the schema column and the INSERT field -- while the brief's own first test
+  asserted it came back. That number is the FEATURE'S HEADLINE: the review UI's whole value
+  proposition is "confirming names 340 photos Google never tagged". A silent zero would have
+  gutted the feature while everything still looked green. Reviewer independently reproduced
+  the bug by mutation (assert 0 == 1) and confirmed the fix.
+  Two API corrections, both additive rather than widening shipped signatures: store.anchors()
+  returns (name, embedding) not face ids, so anchor_face_ids() was added for seed-building;
+  and digests_by_cluster() was added because nothing existed to build cluster_photos.
+  DETERMINISM GUARD WAS A TAUTOLOGY RISK AND THE IMPLEMENTER SAW IT: removing the explicit
+  sorted() in build_clusters is invisible to any store-backed test, because
+  FaceStore.iter_face_vectors already sorts by id. They added a guard that patches the store
+  to yield REVERSED order; the reviewer re-ran that mutation and confirmed it genuinely
+  fails, so the guard is real and not circular.
+  SIDECAR IDEMPOTENCE VERIFIED BY EXERCISE, NOT ASSUMPTION -- which mattered, because the
+  _ANNOTATION_FIELDS registry this relies on was itself broken for keyed lists in Task 8.
+  The reviewer wrote a standalone script with a MONKEYPATCHED CLOCK: two real propagations
+  with distinct confirmed_at values yield exactly one imageharbor_faces entry, no history
+  key, confirmed_at advancing in place.
+  Minor rolled up for final review: google_names() does not normalize before returning (every
+  consumer normalizes on ingestion, so inert, but inconsistent with the module's normalize-
+  early habit); measure_threshold guards only on <2 distinct names, so >=2 names with no
+  same-name PAIR raises a raw ValueError from calibrate rather than a ClickException -- still
+  fails safely, never fabricates a number; propagate_sidecars' `dest` parameter is unused
+  because organized_path_for resolves full paths (brief-mandated signature, not an
+  implementer choice).
+  One reviewer mutation was blocked by the tool-permission classifier before applying; it
+  verified that invariant statically instead and said so rather than claiming a run.
