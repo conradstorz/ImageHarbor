@@ -264,13 +264,21 @@ def test_supplemental_copy_suffix_splits_on_the_last_parenthesised_group() -> No
 
 
 def test_edited_variant_with_copy_suffix_inherits_supplemental_sidecar() -> None:
-    """`-edited` stripping (rung 4) must also see the supplemental-copy form."""
+    """`-edited` stripping (rung 4) must also see the supplemental-copy form.
+
+    m9: the pairing's `confidence` must follow the NAME VARIANT that
+    produced it (see `Pairing`'s own docstring) -- the original's own
+    sidecar is `own`, but the `-edited` copy inherits that SAME sidecar
+    while it describes a different file, so it must come back `related`.
+    """
     original = "d/photo(1).jpg"
     edited = "d/photo(1)-edited.jpg"
     sidecar = "d/photo.jpg.supplemental-metadata(1).json"
     index = build_index([original, edited, sidecar])
     assert sidecar_for(original, index).sidecar == sidecar
     assert sidecar_for(edited, index).sidecar == sidecar
+    assert sidecar_for(original, index).confidence == OWN
+    assert sidecar_for(edited, index).confidence == RELATED
 
 
 def test_supplemental_copy_sidecar_shared_by_two_archives_is_never_paired() -> None:
@@ -403,6 +411,21 @@ def test_truncation_recovery_is_own():
         f"T/GP/2019/{long_name[:40]}.supplemental-metadata.json"])
     p = sidecar_for(f"T/GP/2019/{long_name}", index)
     assert p.confidence == OWN
+
+    # m1: truncation recovery must not hardcode OWN regardless of the name
+    # variant, the way rungs 1-5 already vary confidence via
+    # `_name_variants`. An `-edited` derivative's OWN name can also be
+    # recovered by truncation, but any sidecar it picks up can only
+    # describe the ORIGINAL file, never the edit itself -- so this must
+    # come back RELATED, exactly like an exact-match `-edited` pairing
+    # does.
+    long_edited_name = f"{long_name[:-len('.jpg')]}-edited.jpg"
+    edited_index = build_index([
+        f"T/GP/2019/{long_edited_name}",
+        f"T/GP/2019/{long_edited_name[:40]}.supplemental-metadata.json"])
+    p_edited = sidecar_for(f"T/GP/2019/{long_edited_name}", edited_index)
+    assert p_edited.sidecar is not None    # the truncation match did fire
+    assert p_edited.confidence == RELATED
 
 
 def test_no_match_is_none():

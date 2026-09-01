@@ -123,6 +123,15 @@ def _is_sidecar(member_path: str) -> bool:
     return member_path.lower().endswith(_JSON_SUFFIX)
 
 
+def _is_edited(name: str) -> bool:
+    """True if *name* (a basename) carries the `-edited` suffix before its
+    extension. An `-edited` file's own metadata belongs to its original, never
+    to itself -- used by rung 6 (m1) the same way `_name_variants` already
+    uses it for rungs 1-5."""
+    base, dot, _ext = name.rpartition(".")
+    return bool(dot) and base.lower().endswith(_EDITED)
+
+
 def _name_variants(name: str) -> list[tuple[str, str]]:
     """(name, confidence) pairs: the member's own name, then its pre-`-edited`
     original (rung 4), whose sidecar describes a different file."""
@@ -307,6 +316,13 @@ def sidecar_for(media_path: str, index: PairingIndex) -> Pairing:
     exact = _exact_match(media_path, index)
     if exact is not None:
         return exact
-    # Rung 6 resolves a truncated spelling of this file's OWN name.
+    # Rung 6 resolves a truncated spelling of this file's OWN name -- but
+    # for an `-edited` derivative that OWN name's sidecar (if truncation
+    # recovery hands it one) can only describe the ORIGINAL file, never the
+    # edit itself (m1). Confidence follows the name variant here exactly as
+    # it already does in `_name_variants` for rungs 1-5.
     truncated = _truncation_match(media_path, index)
-    return Pairing(truncated, OWN if truncated is not None else NO_MATCH)
+    if truncated is None:
+        return Pairing(None, NO_MATCH)
+    _, name = _split(media_path)
+    return Pairing(truncated, RELATED if _is_edited(name) else OWN)

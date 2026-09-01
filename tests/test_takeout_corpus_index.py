@@ -159,6 +159,12 @@ def test_indexed_and_builtin_agree_on_the_real_export(tmp_path):
                         f"{member}: built-in ladder says {builtin.sidecar}, "
                         f"index says {indexed.sidecar}"
                     )
+                    # m6: the branch's headline property is `confidence`,
+                    # not merely which sidecar gets named.
+                    assert builtin.confidence == indexed.confidence, (
+                        f"{member}: built-in confidence {builtin.confidence}, "
+                        f"index confidence {indexed.confidence}"
+                    )
             assert compared > 0, (
                 "no member had both a built-in and an indexed answer to "
                 "compare -- this run proves nothing"

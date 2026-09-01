@@ -300,6 +300,13 @@ def test_the_two_pairing_paths_never_name_different_sidecars(tmp_path):
         assert builtin.sidecar == indexed.sidecar, (
             f"{member}: built-in says {builtin.sidecar}, "
             f"index says {indexed.sidecar}")
+        # m6: the branch's headline property is `confidence`, not merely
+        # which sidecar gets named -- a disagreement there silently flips
+        # the RELATED date-tier/title/people policy even when both engines
+        # point at the same document.
+        assert builtin.confidence == indexed.confidence, (
+            f"{member}: built-in confidence {builtin.confidence}, "
+            f"index confidence {indexed.confidence}")
 
     # Neither arm of the loop may be dead code, or this test proves nothing:
     # a run that never actually compared two real answers would pass
