@@ -13,6 +13,7 @@ names throughout.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import threading
 from pathlib import Path
@@ -28,6 +29,18 @@ from imageharbor.faces.decode import Detection
 from imageharbor.faces.store import FaceStore
 from imageharbor import watcher
 from imageharbor.watcher import FacesConfig, watch
+
+# These tests exercise the branch the *real* import state opens -- they do not
+# monkeypatch `HAS_ONNX`, they need it to be genuinely True -- so they need the
+# `faces` extra actually installed. Under the documented `uv sync --extra dev`
+# they skip rather than fail, the same way tests/faces/test_detect.py and
+# test_embed.py already do via `pytest.importorskip`. `find_spec` rather than
+# `faces.HAS_ONNX`: a marker is evaluated at collection time, and reading the
+# flag would make this sensitive to whichever test last monkeypatched it.
+requires_faces_extra = pytest.mark.skipif(
+    importlib.util.find_spec("onnxruntime") is None,
+    reason="needs the faces extra (uv sync --extra faces)",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +236,7 @@ def test_faces_available_true_when_onnx_importable(monkeypatch: pytest.MonkeyPat
 # ---------------------------------------------------------------------------
 
 
+@requires_faces_extra
 def test_watch_runs_the_faces_pass_when_enabled_and_available(
     tmp_path: Path,
     source_dir: Path,
@@ -380,6 +394,7 @@ def test_watch_does_not_recluster_below_threshold_with_clusters_already_present(
     assert calls == []
 
 
+@requires_faces_extra
 def test_watch_reclusters_when_unclustered_exceeds_threshold(
     tmp_path: Path,
     source_dir: Path,
@@ -421,6 +436,7 @@ def test_watch_reclusters_when_unclustered_exceeds_threshold(
     assert calls == [1]
 
 
+@requires_faces_extra
 def test_watch_reclusters_when_no_clusters_exist_yet(
     tmp_path: Path,
     source_dir: Path,
@@ -530,6 +546,7 @@ def test_watch_does_not_recluster_forever_with_nothing_to_cluster(
     assert face_store.cluster_ids("auraface") == []
 
 
+@requires_faces_extra
 def test_watch_warns_once_when_clustering_due_but_no_threshold_configured(
     tmp_path: Path,
     source_dir: Path,
@@ -583,6 +600,7 @@ def test_watch_warns_once_when_clustering_due_but_no_threshold_configured(
 # ---------------------------------------------------------------------------
 
 
+@requires_faces_extra
 def test_watch_forwards_pause_check_into_the_faces_scan(
     tmp_path: Path,
     source_dir: Path,
@@ -631,6 +649,7 @@ def test_watch_forwards_pause_check_into_the_faces_scan(
 # ---------------------------------------------------------------------------
 
 
+@requires_faces_extra
 def test_second_watch_cycle_does_not_rewrite_an_already_propagated_sidecar(
     tmp_path: Path,
     source_dir: Path,

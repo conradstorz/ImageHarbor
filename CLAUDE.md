@@ -35,6 +35,7 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 |------|---------|
 | Install deps + dev tools | `uv sync --extra dev` |
 | Add OpenAI classifier support | `uv sync --extra dev --extra openai` |
+| Add face recognition | `uv sync --extra dev --extra faces` |
 | Run all tests | `uv run pytest` |
 | Run one test file | `uv run pytest tests/test_pipeline.py` |
 | Run one test | `uv run pytest tests/test_pcs.py::test_resolve_code_known` |

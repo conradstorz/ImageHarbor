@@ -15,6 +15,7 @@ genuinely extra-free, so it alone is exempt.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
@@ -26,6 +27,18 @@ from imageharbor.catalog import Catalog
 from imageharbor.cli import _faces_model_dir, main
 from imageharbor.faces.decode import Detection
 from imageharbor.faces.store import FaceStore
+
+# These tests exercise the branch the *real* import state opens -- they do not
+# monkeypatch `HAS_ONNX`, they need it to be genuinely True -- so they need the
+# `faces` extra actually installed. Under the documented `uv sync --extra dev`
+# they skip rather than fail, the same way tests/faces/test_detect.py and
+# test_embed.py already do via `pytest.importorskip`. `find_spec` rather than
+# `faces.HAS_ONNX`: a marker is evaluated at collection time, and reading the
+# flag would make this sensitive to whichever test last monkeypatched it.
+requires_faces_extra = pytest.mark.skipif(
+    importlib.util.find_spec("onnxruntime") is None,
+    reason="needs the faces extra (uv sync --extra faces)",
+)
 
 
 def _det(x: float = 10.0) -> Detection:
@@ -76,6 +89,7 @@ def test_scan_requires_a_destination():
     assert "--dest" in result.output
 
 
+@requires_faces_extra
 def test_status_on_an_empty_library_reports_zero(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -215,6 +229,7 @@ def test_faces_model_dir_precedence(tmp_path, monkeypatch):
     assert _faces_model_dir(explicit_dir, dest) == explicit_dir
 
 
+@requires_faces_extra
 def test_cluster_builds_clusters_and_reports_proposal_counts(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -236,6 +251,7 @@ def test_cluster_builds_clusters_and_reports_proposal_counts(tmp_path):
     assert "proposals=1" in result.output
 
 
+@requires_faces_extra
 def test_cluster_refuses_a_second_run_without_recluster(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -253,6 +269,7 @@ def test_cluster_refuses_a_second_run_without_recluster(tmp_path):
     assert "--recluster" in second.output
 
 
+@requires_faces_extra
 def test_cluster_reclusters_when_the_flag_is_passed(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -270,6 +287,7 @@ def test_cluster_reclusters_when_the_flag_is_passed(tmp_path):
     assert result.exit_code == 0, result.output
 
 
+@requires_faces_extra
 def test_calibrate_reports_a_measured_threshold(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -292,6 +310,7 @@ def test_calibrate_reports_a_measured_threshold(tmp_path):
     assert "faces cluster" in result.output
 
 
+@requires_faces_extra
 def test_calibrate_reports_needs_two_names(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -344,6 +363,7 @@ _ROSTER_SAMPLE = b"""<?xml version="1.0"?>
 """
 
 
+@requires_faces_extra
 def test_roster_imports_names_and_reports_the_count(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -359,6 +379,7 @@ def test_roster_imports_names_and_reports_the_count(tmp_path):
     store.close()
 
 
+@requires_faces_extra
 def test_roster_import_is_idempotent_through_the_cli(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -383,6 +404,7 @@ def test_roster_without_onnxruntime_fails_clearly(tmp_path, monkeypatch):
     assert "faces" in result.output and "extra" in result.output
 
 
+@requires_faces_extra
 def test_roster_with_no_provenance_directory_reports_zero(tmp_path):
     dest = tmp_path / "dest"
     dest.mkdir()
