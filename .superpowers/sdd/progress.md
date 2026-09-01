@@ -506,3 +506,18 @@ Any future "pre-existing failure" claim must first confirm
   So provenance.py's "the Picasa face tags name 73 people across 1,496 entries" is NOT true of
   this export. Recorded here because it is a live doc-drift claim in shipped code.
   OWNER DECISION: build Task 17 defensively anyway, for exports that do contain one.
+- Task 17: faces/roster.py — COMPLETE (2aa05a0..3544fe3; 14 tests, suite 1144 passed/11 skipped, 1154/1 with weights)
+  Built DEFENSIVELY by owner decision, knowing no roster exists in this export. The parser
+  targets Picasa's DOCUMENTED contacts.xml shape and is tested only against a synthetic
+  fixture; that caveat is stated in three places so a future reader knows the format came
+  from documentation rather than observation. The implementer did NOT search the archives
+  and did not claim to have inspected a real file.
+  provenance.py's stale claim corrected: it asserted "the Picasa face tags name 73 people
+  across 1,496 entries" as fact when no such file is in the export. The preserve-everything
+  reasoning around it is sound and was left intact -- only the factual claim was wrong.
+  BRIEF CORRECTION THAT MATTERED: FaceStore.add_person ALWAYS returns the person id, never
+  None, so it does not signal idempotency the way the brief assumed. import_names now tracks
+  new-vs-existing against a known_names() snapshot. Taking the brief at its word would have
+  made the "N new names imported" count wrong on every re-run.
+
+## ALL 17 TASKS COMPLETE — suite 1144 passed / 11 skipped (1154 / 1 with weights)
