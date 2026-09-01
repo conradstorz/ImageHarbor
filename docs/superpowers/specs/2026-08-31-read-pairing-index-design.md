@@ -1,7 +1,7 @@
 # Read the Takeout pairing index
 
 **Date:** 2026-08-31
-**Status:** approved; not yet implemented.
+**Status:** implemented on `feat/read-pairing-index`.
 Consumes the index published by `Takeout_Inventory` (AGPL-3.0, same owner),
 designed in that repo's
 `docs/superpowers/specs/2026-08-29-inventory-scout-merge-design.md`.
