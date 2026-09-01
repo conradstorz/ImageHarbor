@@ -88,6 +88,32 @@ def test_confirm_rejects_an_unknown_cluster(store):
         people.confirm(store, 9999, "Emma")
 
 
+def test_confirm_lets_a_racing_recluster_s_keyerror_propagate(store, monkeypatch):
+    # `people.confirm`'s own `_cluster_exists` pre-check is the fast,
+    # friendly path -- it can't see a recluster that lands *after* it
+    # released `store.lock` but *before* `store.confirm` acquires it again.
+    # Simulated here by monkeypatching the pre-check to believe a
+    # nonexistent cluster is fine, so the call falls straight through to
+    # `store.confirm`'s own inside-the-lock check -- exactly what happens
+    # for real when a recluster wins the race. `dashboard.people.split`
+    # doesn't catch `FaceStore.split`'s `KeyError`; `confirm` deliberately
+    # matches that (see the docstring): the `KeyError` must reach the
+    # caller unconverted, not get silently swallowed or turned into a
+    # falsely-reassuring `ValueError`.
+    monkeypatch.setattr(people, "_cluster_exists", lambda store, cid: True)
+    with pytest.raises(KeyError, match="9999"):
+        people.confirm(store, 9999, "Emma")
+
+
+def test_merge_lets_a_racing_recluster_s_keyerror_propagate(store, monkeypatch):
+    # Same simulated race as confirm's, for merge's per-id loop.
+    cid = _one_cluster(store)
+    person_id = store.confirm(cid, "Emma")
+    monkeypatch.setattr(people, "_cluster_exists", lambda store, cid: True)
+    with pytest.raises(KeyError, match="9999"):
+        people.merge(store, person_id, [9999])
+
+
 def test_case_variants_are_surfaced_as_suggestions_not_applied(store):
     cid_a = _one_cluster(store)
     people.confirm(store, cid_a, "pete storz")

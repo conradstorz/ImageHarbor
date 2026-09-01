@@ -110,6 +110,98 @@ def test_merge_points_several_clusters_at_one_person(store):
     assert store.person_for_cluster(b) == person_id
 
 
+def test_confirm_raises_for_a_cluster_id_recycled_away_by_a_racing_recluster(store):
+    # The reviewer's finding: dashboard.people.confirm's own `_cluster_exists`
+    # check runs under a *separate* `with store.lock:` block that releases
+    # before `store.confirm` is called -- a `replace_clusters` (whole-library
+    # recluster) can run in that gap. `clusters.id` is a plain
+    # (non-AUTOINCREMENT) INTEGER PRIMARY KEY, so a recluster that produces
+    # fewer clusters than before doesn't just drop the *content* of a
+    # validated id -- it can make the id itself stop existing. Simulated
+    # here directly (no threads needed): seed 3 single-face clusters, confirm
+    # one of them elsewhere first (so a real `person_id` exists, matching how
+    # `merge` is exercised below), then race a second `replace_clusters` that
+    # excludes the third face's photo entirely -- its old cluster id is
+    # provably gone by the time the stale `confirm(..)` call lands.
+    ids = store.record_scan("d", "yunet", [
+        (_det(x=0), _vec([1, 0, 0]), "auraface"),
+        (_det(x=200), _vec([0, 1, 0]), "auraface"),
+        (_det(x=400), _vec([0, 0, 1]), "auraface"),
+    ])
+    fx, fy, fz = ids
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(fx,), centroid=_vec([1, 0, 0])),
+        cluster.Cluster(face_ids=(fy,), centroid=_vec([0, 1, 0])),
+        cluster.Cluster(face_ids=(fz,), centroid=_vec([0, 0, 1])),
+    ])
+    _rx, _ry, rz = store.cluster_ids()
+    # rz is the id the (imagined) HTTP wrapper just validated as existing.
+
+    # The race: a whole-library recluster completes before the confirm call
+    # actually lands, and this round doesn't reproduce fz's cluster at all
+    # (e.g. its photo dropped out of the run) -- rz is now provably gone.
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(fx,), centroid=_vec([1, 0, 0])),
+        cluster.Cluster(face_ids=(fy,), centroid=_vec([0, 1, 0])),
+    ])
+    assert rz not in store.cluster_ids()
+
+    with pytest.raises(KeyError, match=str(rz)):
+        store.confirm(rz, "Emma")
+
+    # Nothing leaked from the failed attempt: no stray "Emma" person row
+    # (the pre-fix code created one via INSERT OR IGNORE before ever
+    # checking whether the cluster existed), and no cluster was mislabeled.
+    assert store._conn.execute(
+        "SELECT 1 FROM people WHERE name='Emma'"
+    ).fetchone() is None
+    for cid in store.cluster_ids():
+        assert store.person_for_cluster(cid) is None
+
+
+def test_merge_raises_naming_the_stale_id_and_leaves_the_valid_one_untouched(store):
+    # Same race as confirm's, but for `merge`'s per-id loop: brief item 2's
+    # exact worry is a *partial* write -- a stale id silently matching zero
+    # rows while a real id in the same call matches and gets mutated, with
+    # nothing telling the caller only half the batch actually happened.
+    ids = store.record_scan("d", "yunet", [
+        (_det(x=0), _vec([1, 0, 0]), "auraface"),
+        (_det(x=200), _vec([0, 1, 0]), "auraface"),
+        (_det(x=400), _vec([0, 0, 1]), "auraface"),
+    ])
+    fx, fy, fz = ids
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(fx,), centroid=_vec([1, 0, 0])),
+        cluster.Cluster(face_ids=(fy,), centroid=_vec([0, 1, 0])),
+        cluster.Cluster(face_ids=(fz,), centroid=_vec([0, 0, 1])),
+    ])
+    rx, _ry, rz = store.cluster_ids()
+    person_id = store.confirm(rx, "Judy")  # a real, already-confirmed person
+
+    # Race: fz's cluster (rz) drops out of the next recluster round entirely,
+    # while fy's survives (under a freshly allocated, but currently valid,
+    # id) -- exactly the "one id real, one id stale" batch item 2 describes.
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(fx,), centroid=_vec([1, 0, 0])),
+        cluster.Cluster(face_ids=(fy,), centroid=_vec([0, 1, 0])),
+    ])
+    current_ids = store.cluster_ids()
+    assert rz not in current_ids
+    valid_cid = next(
+        cid for cid in current_ids
+        if store._conn.execute(
+            "SELECT 1 FROM faces WHERE cluster_id=? AND id=?", (cid, fy)
+        ).fetchone() is not None
+    )
+
+    with pytest.raises(KeyError, match=str(rz)):
+        store.merge(person_id, [valid_cid, rz])
+
+    # The whole batch must fail together -- valid_cid must not have been
+    # quietly merged while rz was silently skipped.
+    assert store.person_for_cluster(valid_cid) is None
+
+
 def test_split_rejects_a_face_id_not_in_the_cluster(store):
     # Defense-in-depth: FaceStore.split is the layer that actually mutates,
     # so it must refuse even when a caller bypasses dashboard.people's

@@ -177,6 +177,19 @@ def confirm(store: FaceStore, cluster_id: int, name: str) -> dict[str, Any]:
     """Confirm *cluster_id* as *name*. See the module docstring: this is the
     only place outside `FaceStore` itself that this module calls to write
     identity, and it never does the sidecar propagation work synchronously.
+
+    The `_cluster_exists` check below is the fast, friendly path -- it gives
+    a normal bad request a `ValueError` -> HTTP 400 without ever touching
+    `store.lock`. It is *not* the real guard: `store.lock` is released
+    between that check and `store.confirm`, and a `replace_clusters` recycle
+    landing in that window can make the validated id stop resolving to
+    anything (or, less commonly, resolve to a different, currently-real
+    cluster -- `store.confirm`'s docstring covers why only the first case is
+    actually caught) by the time `store.confirm` runs. `store.confirm`
+    re-checks existence itself, inside its own lock acquisition, and raises
+    `KeyError` when the id no longer resolves -- deliberately left uncaught
+    here, same as `split` below leaves `FaceStore.split`'s `KeyError`
+    uncaught, so the two mutations fail the same way at the HTTP boundary.
     """
     clean = normalize(name)
     if not clean:
@@ -207,7 +220,16 @@ def reject(store: FaceStore, cluster_id: int, name: str) -> dict[str, Any]:
 
 
 def merge(store: FaceStore, person_id: int, cluster_ids: list[int]) -> dict[str, Any]:
-    """Point several clusters at one already-confirmed person -- the aging repair."""
+    """Point several clusters at one already-confirmed person -- the aging repair.
+
+    Same two-layer shape as `confirm`: the `_cluster_exists` loop below is
+    the fast pre-lock check for a normal bad request, not the real guard --
+    `store.merge` re-validates every id itself, inside its own lock
+    acquisition, and raises `KeyError` (left uncaught here, matching `split`)
+    naming any id that stopped resolving to anything in the window between
+    this check and that call. See `store.merge`'s docstring for the residual
+    gap this does not close.
+    """
     if not cluster_ids:
         raise ValueError("cluster_ids must not be empty")
     with store.lock:

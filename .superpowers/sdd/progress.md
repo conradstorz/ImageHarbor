@@ -521,3 +521,41 @@ Any future "pre-existing failure" claim must first confirm
   made the "N new names imported" count wrong on every re-run.
 
 ## ALL 17 TASKS COMPLETE — suite 1144 passed / 11 skipped (1154 / 1 with weights)
+
+## FIX ROUND — final whole-branch review findings (fix-plan: docs/superpowers/plans/2026-09-01-final-review-fixes.md)
+Base for this round: e08bc4b
+
+- Fix Task 1 (CRITICAL 1, optional extra mandatory): COMPLETE (e08bc4b..6fab6af; suite 1145 passed/11 skipped; review clean, Approved)
+  Brief under-scoped the bug: it named only people.py/stats.py, but dashboard/server.py
+  itself also had an independent module-scope `from imageharbor.faces.store import
+  FaceStore`, reached directly by cli.py's unconditional `from .dashboard import server`.
+  Implementer found this, verified empirically (reverting server.py alone reproduces the
+  ImportError even with the other two fixed), and fixed all three under TYPE_CHECKING,
+  matching the existing watcher.py precedent. Reviewer independently re-verified the
+  server.py necessity claim (grepped FaceStore usage: type annotations only, no runtime
+  use) rather than taking it on trust.
+
+- Fix Task 2 (CRITICAL 2): DONE_WITH_CONCERNS (suite 1149 passed/11 skipped)
+  Gave FaceStore.confirm/merge an inside-the-lock cluster-id existence check
+  (raise KeyError, matching split's precedent), left dashboard/people.py's
+  confirm/merge wrappers NOT catching the new KeyError -- matches how
+  people.split already leaves FaceStore.split's KeyError uncaught (both
+  become an unhandled 500 at the HTTP boundary, not a friendly 400).
+  CONCERN, evidenced with a real repro: the fix does not close the brief's
+  own exact worked example. `SELECT 1 FROM clusters WHERE id=?` can only
+  tell "this id resolves to *a* row," not "still the *same* row" -- when a
+  racing recluster produces the same cluster count and merely permutes which
+  new row gets which recycled id, the check passes and the wrong identity
+  still gets silently written. What IS closed: the id vanishing entirely
+  (recluster produces a different count / the face drops out of the run) --
+  now raises KeyError for confirm and for merge's partial-write case,
+  instead of a silent no-op (that used to also leak a spurious `people` row
+  for confirm). Full closure needs cluster identity to survive a recluster
+  (AUTOINCREMENT ids + migration, or a version/ETag token through the HTTP
+  boundary) -- out of scope, flagged as follow-up rather than attempted.
+  Also flagged (not fixed, same scope discipline): `reject` has the
+  identical two-lock-acquisition shape, narrower blast radius (proposals
+  rows for the old id get cleaned up by replace_clusters before the
+  recluster completes) and lower severity (flips a proposal's decided
+  state, not a person's identity). Full report:
+  .superpowers/sdd/fix-task-2-report.md

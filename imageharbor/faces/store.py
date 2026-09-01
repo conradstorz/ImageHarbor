@@ -617,8 +617,34 @@ class FaceStore:
         Normalizes *name*, creates the `people` row if this is a new name
         (`source='human'`), and stamps `assigned_at` -- the timestamp
         `iter_pending_sidecars` compares against `face_scan.sidecar_at`.
+
+        Re-validates *cluster_id* here, inside the same lock acquisition that
+        does the write -- mirroring `split`'s precedent. `dashboard.people`'s
+        wrapper checks existence too, but releases `store.lock` between that
+        check and this call; `replace_clusters` can run in the gap and, since
+        `clusters.id` is a plain (non-AUTOINCREMENT) INTEGER PRIMARY KEY,
+        can make a validated id stop resolving to anything at all by the
+        time this runs. Without this check that case is a silent no-op --
+        zero rows matched, but a success is still returned, and the
+        `INSERT OR IGNORE` above would even leave a spurious unused `people`
+        row behind.
+
+        This does NOT close every shape of the race: if the recluster
+        happens to recycle the id onto a *different*, currently real
+        cluster (rather than leaving it unused), this check sees a row and
+        proceeds -- there is no way to tell "the same cluster, still there"
+        from "a new cluster that happens to reuse the old id" without a
+        caller-supplied fingerprint of what it last saw, which no caller
+        here provides. Known, reported residual gap, not an oversight;
+        closing it needs cluster identity to survive a recluster (e.g.
+        AUTOINCREMENT ids, or a version stamp threaded through the HTTP
+        boundary) -- out of scope for this check.
         """
         with self.lock:
+            if self._conn.execute(
+                "SELECT 1 FROM clusters WHERE id=?", (cluster_id,)
+            ).fetchone() is None:
+                raise KeyError(f"no such cluster: {cluster_id}")
             clean = normalize(name)
             now = _now_iso()
             self._conn.execute(
@@ -649,12 +675,34 @@ class FaceStore:
         """Point several clusters at one already-confirmed person.
 
         Along with `confirm`, the only method that writes `clusters.person_id`.
+
+        Re-validates every id in *cluster_ids* here, inside the same lock
+        acquisition that does the write -- see `confirm`'s docstring for why
+        (same residual gap applies: this catches an id that stopped
+        resolving to anything, not one recycled onto different-but-real
+        content). Checking all ids up front (rather than relying on the
+        `UPDATE ... WHERE id IN (...)` matching fewer rows than requested)
+        matters because a *partial* match is the dangerous case within what
+        this check *does* cover: some ids in the batch can be stale while
+        others are real, and a silent partial `UPDATE` would merge some
+        clusters onto *person_id* while quietly dropping the rest with no
+        signal to the caller that only part of the batch happened.
         """
         with self.lock:
             if not cluster_ids:
                 return
-            now = _now_iso()
             placeholders = ",".join("?" * len(cluster_ids))
+            existing = {
+                row["id"]
+                for row in self._conn.execute(
+                    f"SELECT id FROM clusters WHERE id IN ({placeholders})",
+                    tuple(cluster_ids),
+                )
+            }
+            missing = sorted(set(cluster_ids) - existing)
+            if missing:
+                raise KeyError(f"no such cluster(s): {missing}")
+            now = _now_iso()
             self._conn.execute(
                 f"UPDATE clusters SET person_id=?, assigned_at=? WHERE id IN ({placeholders})",
                 (person_id, now, *cluster_ids),
