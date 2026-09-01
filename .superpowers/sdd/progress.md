@@ -371,3 +371,35 @@ Any future "pre-existing failure" claim must first confirm
   implementer choice).
   One reviewer mutation was blocked by the tool-permission classifier before applying; it
   verified that invariant statically instead and said so rather than claiming a run.
+- Task 13: faces CLI group — COMPLETE (ee698d6..50cd4b5; 23 tests, suite 1046 passed/10 skipped; review clean, NO Critical)
+  *** MILESTONE C COMPLETE: the pipeline now runs end to end from the command line.
+  MY OWN EARLIER VERIFICATION WAS INCOMPLETE, and this task caught it. In Task 1 I dispatched
+  a fix for a sys.modules leak in tests/faces/test_extra.py and confirmed it with a probe
+  test that passed. The probe only checked `import imageharbor.faces`, which resolves through
+  sys.modules -- but monkeypatch.delitem never restored the `imageharbor` PACKAGE'S OWN
+  `faces` ATTRIBUTE, a different lookup path the probe could not see. The leak survived in
+  subtler form and only manifested under a full-suite run. This implementer found it, fixed
+  it, and the reviewer independently reproduced it (removing the fix reproduces
+  `assert 1 == 0`) and confirmed the fix closes it. Third time this class of bug has bitten
+  this branch. A probe that exercises one lookup path does not prove module isolation.
+  TWO DISCLOSED DEVIATIONS, both reasoned and tested, FLAGGED FOR OWNER SIGN-OFF:
+    - `models download --dest` was made OPTIONAL against the brief's blanket "all taking
+      --dest (required)". Rationale: model weights are not library data, and forcing a
+      library to exist in order to download them contradicts the spec's docker model-volume
+      deployment. The brief's own per-subcommand table lists only --model-dir for this verb,
+      so the brief contradicts itself. I accept the deviation.
+    - `status` had to be gated on HAS_ONNX even though it only reads the database, because
+      store.py imports numpy at module scope and numpy lives only in the optional extra.
+      Reviewer confirmed this is forced by the import graph, not a shortcut. Note HAS_ONNX
+      is an onnxruntime signal being used as a numpy proxy; a try/except ModuleNotFoundError
+      around the store import would be more precise. Functionally identical in every real
+      deployment, since `uv sync --extra faces` installs both.
+    - `--recluster` was given an invented semantic (refuses a second cluster run without it).
+      Sensible and explained in both --help and the exception text, so it will not silently
+      confuse -- but it is a design call the brief did not make.
+  Reviewer checked the 23 tests for padding and found 16 assert real behaviour; only the
+  7-case --help parametrize is bare exit_code==0.
+  Minor rolled up for final review: _faces_model_dir's env-var-over---dest precedence is
+  UNTESTED -- the reviewer mutated the resolution order and all 23 tests still passed;
+  store.cluster_ids() is not scoped by embed_model, so --recluster's guard checks for ANY
+  clusters store-wide (moot today, since no --embed-model flag is exposed).
