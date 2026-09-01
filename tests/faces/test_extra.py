@@ -1,5 +1,6 @@
 """The faces package must import with or without onnxruntime installed."""
 
+import builtins
 import sys
 
 import imageharbor
@@ -46,7 +47,6 @@ def test_package_imports_when_onnxruntime_raises_non_import_error(monkeypatch):
     # Patch builtins.__import__ to raise RuntimeError for onnxruntime,
     # simulating a broken C extension or ABI mismatch. The original __import__
     # is called for all other modules.
-    import builtins
     original_import = builtins.__import__
 
     def mock_import_with_broken_onnx(name, *args, **kwargs):
@@ -64,3 +64,82 @@ def test_package_imports_when_onnxruntime_raises_non_import_error(monkeypatch):
     # If the exception handler only caught ImportError, this would fail
     # because RuntimeError would propagate. With the proper fix, it is False.
     assert faces_reloaded.HAS_ONNX is False
+
+
+def test_watch_no_faces_no_dashboard_survives_missing_numpy_and_onnxruntime(
+    monkeypatch, tmp_path
+):
+    """`watch --no-faces --no-dashboard` must not require numpy or
+    onnxruntime -- see this package's module docstring ("importing this
+    package must never require the optional `faces` extra"), `cli.py`'s
+    `--faces` help text, and CLAUDE.md's "a missing extra degrades to one
+    warning, not a crash" invariant.
+
+    Regression test for the whole-branch-review CRITICAL finding: `watch`
+    imports `dashboard.server` unconditionally, before the `--no-dashboard`
+    check further down; `dashboard/server.py` (and the `dashboard.people`/
+    `dashboard.stats` modules it imports) pulled in
+    `imageharbor.faces.store` at module scope, which does `import numpy as
+    np` at module scope -- so numpy was required even with both `--no-faces`
+    and `--no-dashboard` given.
+
+    Blocks both `numpy` and `onnxruntime` at the same `builtins.__import__`
+    patch point `test_package_imports_when_onnxruntime_raises_non_import_error`
+    above uses. Every module in the numpy-reachable chain is first cleared
+    from `sys.modules` (same technique as that test, for the same reason):
+    this dev environment has the `faces` extra installed, so an earlier
+    test's real numpy-backed import of these modules would otherwise stay
+    cached and this test would pass even against the unfixed bug.
+    """
+    from imageharbor import watcher as _watcher
+    from imageharbor.watcher import WatchStats
+
+    original_faces_module = sys.modules["imageharbor.faces"]
+    monkeypatch.setattr(imageharbor, "faces", original_faces_module)
+
+    to_remove = [
+        k
+        for k in list(sys.modules.keys())
+        if k == "imageharbor.faces"
+        or k.startswith("imageharbor.faces.")
+        or k
+        in (
+            "imageharbor.dashboard.server",
+            "imageharbor.dashboard.people",
+            "imageharbor.dashboard.stats",
+        )
+    ]
+    for k in to_remove:
+        monkeypatch.delitem(sys.modules, k, raising=False)
+
+    original_import = builtins.__import__
+
+    def mock_import_blocking_numpy_and_onnx(name, *args, **kwargs):
+        if name in ("numpy", "onnxruntime"):
+            raise ImportError(f"No module named {name!r}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import_blocking_numpy_and_onnx)
+
+    # Bound the watch loop to one pass -- same pattern as
+    # tests/test_cli.py's `_fake_watch_cli` helper -- so this test doesn't
+    # block on the real (looping) watcher.
+    monkeypatch.setattr(_watcher, "watch", lambda **kwargs: WatchStats(passes=1))
+
+    from click.testing import CliRunner
+
+    from imageharbor.cli import main
+
+    src = tmp_path / "src"
+    src.mkdir()
+    dest = tmp_path / "dest"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--no-faces", "--no-dashboard",
+        ],
+    )
+    assert result.exit_code == 0, result.output

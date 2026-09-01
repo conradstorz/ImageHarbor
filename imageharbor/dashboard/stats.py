@@ -78,14 +78,23 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from imageharbor import tiers
 from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.dashboard import projections
 from imageharbor.dashboard.control import ControlPlane
-from imageharbor.faces.store import FaceStore
+
+# FaceStore is only ever used in type annotations here (never instantiated
+# or called), and this module has `from __future__ import annotations`
+# above, so the annotation is never evaluated at runtime. Importing it at
+# module scope would still require numpy (see imageharbor/faces/store.py's
+# module-scope `import numpy as np`) even when the dashboard is running
+# without faces enabled -- the exact bug this TYPE_CHECKING guard exists to
+# avoid. See CLAUDE.md's "a missing extra degrades to one warning" invariant.
+if TYPE_CHECKING:
+    from imageharbor.faces.store import FaceStore
 
 logger = logging.getLogger(__name__)
 

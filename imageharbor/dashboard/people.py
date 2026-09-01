@@ -24,10 +24,19 @@ here, guarded by the same lock every `FaceStore` method takes internally.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from imageharbor.faces.names import case_variants, normalize
-from imageharbor.faces.store import FaceStore
+
+# FaceStore is only ever used in type annotations here (never instantiated
+# or called), and this module has `from __future__ import annotations`
+# above, so the annotation is never evaluated at runtime. Importing it at
+# module scope would still require numpy (see imageharbor/faces/store.py's
+# module-scope `import numpy as np`) even when the dashboard is running
+# without faces enabled -- the exact bug this TYPE_CHECKING guard exists to
+# avoid. See CLAUDE.md's "a missing extra degrades to one warning" invariant.
+if TYPE_CHECKING:
+    from imageharbor.faces.store import FaceStore
 
 
 def _cluster_exists(store: FaceStore, cluster_id: Any) -> bool:

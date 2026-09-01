@@ -31,14 +31,24 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
 from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.dashboard import people, stats
 from imageharbor.dashboard.control import ControlPlane
-from imageharbor.faces.store import FaceStore
+
+# FaceStore is only ever used in type annotations here (never instantiated
+# or called), and this module has `from __future__ import annotations`
+# above, so the annotation is never evaluated at runtime. Importing it at
+# module scope would still require numpy (see imageharbor/faces/store.py's
+# module-scope `import numpy as np`) even when `watch` starts with faces and
+# the dashboard both disabled -- this module is imported unconditionally by
+# `cli.py`'s `watch` command before its own `--no-dashboard` check runs. See
+# CLAUDE.md's "a missing extra degrades to one warning" invariant.
+if TYPE_CHECKING:
+    from imageharbor.faces.store import FaceStore
 
 logger = logging.getLogger(__name__)
 
