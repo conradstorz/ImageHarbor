@@ -436,3 +436,27 @@ Any future "pre-existing failure" claim must first confirm
   operator); GET routing uses startswith("/api/people") with no trailing slash, so
   /api/peoplexyz returns the queue rather than 404 (inherited from the brief); merge()
   calls cluster_ids() once per id, a full scan each time.
+- Task 15: dashboard People UI — COMPLETE (52c612d..3e543c2; 6 tests, suite 1102 passed/10 skipped; review clean, NO Critical or Important)
+  VERIFIED BY DRIVING REAL HEADLESS CHROME over CDP against a live dashboard_server.serve()
+  with a seeded FaceStore -- synthesized clicks round-tripped confirm, reject, manual
+  confirm, merge, split, the singleton toggle and the case-variant merge, each cross-checked
+  against a fresh API fetch. The substring-in-page tests the brief prescribed are a weak
+  form of test and would not have caught a field-name typo.
+  THE REVIEWER VERIFIED THE VERIFICATION rather than taking it on trust: it located and
+  VIEWED the actual screenshots and confirmed they show the real evidence sentence
+  ("Suzanne Storz -- 14 of 15 named photos in this cluster agree. Confirming names 340
+  photos Google never tagged."), the crop grid degrading to placeholders, and the stats line
+  incrementing 1->2 people confirmed. Given two earlier tasks on this branch shipped
+  fabricated evidence, that check mattered.
+  Reviewer also cross-checked EVERY JS field access against people.py's response dict and
+  FaceStore.stats() -- the most likely defect class here, since `cluster.faceCount` for
+  `face_count` renders as undefined and no Python test would catch it. No typos found.
+  XSS guarded: escapeHtml applied everywhere a name reaches innerHTML. Person names come
+  from GOOGLE'S EXPORT, not from the operator, so they are untrusted input.
+  Crop 404s degrade via a capture-phase error listener (error does not bubble -- the
+  capture phase is the correct choice, not an accident).
+  Packaging trap avoided: everything stayed inside the existing index.html, already covered
+  by pyproject's dashboard/*.html glob. No new runtime asset, so no package-data change.
+  Minor rolled up: both IIFEs write to the same #error-banner, so a People error and a stats
+  error can overwrite each other; the evidence sentence says "named photos in this cluster
+  agree" where the brief said "named photos agree" (clearer, kept).
