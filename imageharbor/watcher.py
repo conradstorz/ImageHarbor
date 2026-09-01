@@ -833,9 +833,22 @@ def watch(
 
                     embed_model = face_config.embedder.model_name
                     unclustered = face_config.store.unclustered_face_count(embed_model)
-                    recluster_due = (
-                        unclustered > face_config.recluster_threshold
-                        or not face_config.store.cluster_ids()
+                    # `not face_config.store.cluster_ids()` used to be
+                    # unconditional and unscoped -- on a library where every
+                    # detected face is gate-rejected (or nothing has ever
+                    # been scanned), `unclustered` stays 0 forever and no
+                    # cluster is ever produced for *this* embed_model, so
+                    # that clause was True on every single cycle: an
+                    # unbounded spin re-running `google_names` (a full
+                    # `rglob`) each time for a library that structurally has
+                    # nothing to cluster. Requiring `unclustered > 0` closes
+                    # that; scoping `cluster_ids` by `embed_model` fixes the
+                    # sibling bug where a stale cluster left behind by a
+                    # since-abandoned embed_model masked a genuine "no
+                    # clusters yet" for the current one.
+                    recluster_due = unclustered > face_config.recluster_threshold or (
+                        unclustered > 0
+                        and not face_config.store.cluster_ids(embed_model)
                     )
                     if recluster_due:
                         if face_config.cluster_threshold is None:

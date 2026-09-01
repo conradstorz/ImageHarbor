@@ -388,11 +388,37 @@ class FaceStore:
     # Clusters
     # ------------------------------------------------------------------
 
-    def cluster_ids(self) -> list[int]:
+    def cluster_ids(self, embed_model: str | None = None) -> list[int]:
+        """All cluster ids, optionally scoped to one `embed_model`.
+
+        Unlike `unclustered_face_count`/`digests_by_cluster` (always scoped
+        -- every caller of those needs one model's view), this method has two
+        genuinely different callers: `watcher.py`'s recluster gate needs "are
+        there any clusters for *this run's* model" (an unscoped answer made
+        `not store.cluster_ids()` true forever on a library that has never
+        had a face survive the quality gate under the *current* model, even
+        while a stale cluster from a since-abandoned model still sat in the
+        table -- see the fix-round finding this docstring was added for).
+        `dashboard/people.py`'s `_cluster_exists` needs "does this id exist
+        at all", validating an operator-supplied primary key regardless of
+        which model produced it -- scoping that check would reject a
+        perfectly valid id just because it belongs to a different model.
+        `embed_model` defaults to `None` (unscoped) so that second, legitimate
+        use keeps working; pass it explicitly wherever the answer must be
+        model-specific.
+        """
         with self.lock:
+            if embed_model is None:
+                return [
+                    row["id"]
+                    for row in self._conn.execute("SELECT id FROM clusters ORDER BY id")
+                ]
             return [
                 row["id"]
-                for row in self._conn.execute("SELECT id FROM clusters ORDER BY id")
+                for row in self._conn.execute(
+                    "SELECT id FROM clusters WHERE embed_model=? ORDER BY id",
+                    (embed_model,),
+                )
             ]
 
     def person_for_cluster(self, cluster_id: int) -> int | None:

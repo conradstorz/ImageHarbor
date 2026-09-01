@@ -429,7 +429,14 @@ def test_watch_reclusters_when_no_clusters_exist_yet(
     face_store: FaceStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert face_store.cluster_ids() == []
+    # A genuinely clusterable face (embedding present, no cluster yet) is
+    # required here: "no clusters exist" alone must NOT be enough to fire
+    # the gate (see test_watch_does_not_recluster_forever_with_nothing_to_
+    # cluster below) -- it only fires when there is also something to build
+    # clusters from.
+    face_store.record_scan("d0", "yunet", [(_det(), _vec([1, 0, 0, 0]), "auraface")])
+    assert face_store.cluster_ids("auraface") == []
+    assert face_store.unclustered_face_count("auraface") == 1
 
     calls: list[int] = []
     monkeypatch.setattr(
@@ -457,6 +464,72 @@ def test_watch_reclusters_when_no_clusters_exist_yet(
     assert calls == [1]
 
 
+def test_watch_does_not_recluster_forever_with_nothing_to_cluster(
+    tmp_path: Path,
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    face_store: FaceStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the recluster-gate spin (fix-round finding): a library
+    where every detected face is gate-rejected has zero clusters AND zero
+    unclustered faces, forever. The old gate read `not
+    store.cluster_ids()` unconditionally, so `recluster_due` was True on
+    every cycle no matter how many cycles ran, each one re-running
+    `google_names` -- a full `rglob("*.json")` over the organized tree --
+    for a library that structurally has nothing to cluster. This must not
+    fire even once, across several cycles, and `google_names` must not be
+    called either.
+    """
+    from PIL import Image
+
+    path = organized_dir / "photo0.jpg"
+    Image.new("RGB", (200, 200), (10, 100, 100)).save(path)
+    catalog.upsert(sha256_b64url="digest0", original_path=str(path), organized_path=str(path))
+
+    build_calls: list[int] = []
+    monkeypatch.setattr(
+        "imageharbor.faces.runner.build_clusters",
+        lambda *a, **k: build_calls.append(1) or 0,
+    )
+    names_calls: list[int] = []
+    monkeypatch.setattr(
+        "imageharbor.faces.runner.google_names",
+        lambda *a, **k: names_calls.append(1) or {},
+    )
+
+    pipeline = _make_pipeline(source_dir, organized_dir, catalog)
+    # min_score above FakeDetector's fixed 0.9 score -- every detected face
+    # is gate-rejected (recorded with embed_model=None, no embedding), so
+    # the store never produces a clusterable ("auraface") face.
+    face_config = _basic_face_config(
+        tmp_path, organized_dir, face_store,
+        gate=runner.QualityGate(min_score=0.95, min_box=10),
+        recluster_threshold=500,
+    )
+    stop = threading.Event()
+
+    watch(
+        pipeline=pipeline,
+        catalog=catalog,
+        interval=1.0,
+        stop_event=stop,
+        sleep=_one_cycle_sleep(stop, n=4),
+        faces_enabled=True,
+        face_config=face_config,
+    )
+
+    assert face_store.unclustered_face_count("auraface") == 0
+    # The actual spin, checked before the (unscoped-in-old-code)
+    # `cluster_ids` call below so a failure here is unambiguous: with the
+    # old gate, `names_calls`/`build_calls` grow by one on every one of the
+    # 4 cycles above instead of staying empty.
+    assert names_calls == []
+    assert build_calls == []
+    assert face_store.cluster_ids("auraface") == []
+
+
 def test_watch_warns_once_when_clustering_due_but_no_threshold_configured(
     tmp_path: Path,
     source_dir: Path,
@@ -468,6 +541,12 @@ def test_watch_warns_once_when_clustering_due_but_no_threshold_configured(
 ) -> None:
     """`IMAGEHARBOR_FACE_THRESHOLD` ships empty in docker-compose.yml on
     purpose (see docs/deploy-docker.md) -- this must warn once, not spam."""
+    # A genuinely clusterable face, same as test_watch_reclusters_when_no_
+    # clusters_exist_yet above: recluster_due (and so this warning) must
+    # never fire on an empty/nothing-to-cluster library, so the warning path
+    # needs a real unclustered face to reach at all.
+    face_store.record_scan("d0", "yunet", [(_det(), _vec([1, 0, 0, 0]), "auraface")])
+
     calls: list[int] = []
     monkeypatch.setattr(
         "imageharbor.faces.runner.build_clusters",

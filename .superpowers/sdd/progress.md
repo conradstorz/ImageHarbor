@@ -607,3 +607,39 @@ Base for this round: e08bc4b
   `reversed(list(enumerate(...)))`; dropping `AND rejected IS NULL` from people.py's rank
   query) -- each reverted before committing; shipped runner.py/people.py unchanged. Full report:
   .superpowers/sdd/fix-task-3-report.md
+
+- Fix Task 3 (IMPORTANT 3, crop-rank contract has no test): COMPLETE
+  (acfd754..e868ccf; suite 1151 passed/11 skipped; review clean, Approved)
+  TEST-ONLY task -- shipped runner.py/people.py were already correct, just uncovered. New test
+  scans a photo with one gate-rejected face plus two kept faces through the real
+  runner._scan_one write path into a real FaceStore/crop dir, then asserts
+  dashboard.people.crop_bytes returns each kept face's OWN crop. Oracle for "which id is
+  physically which face" uses bbox_x (independent of both dangerous mutations), not id/
+  insertion order, so the test doesn't beg the question. Reviewer independently re-derived,
+  from the shipped code rather than the report's narrative, why reversing runner.py's kept-face
+  append order and why dropping people.py's `AND rejected IS NULL` each flip the assertions,
+  and ran the test itself (45 passed) rather than trusting the pasted output.
+
+- Fix Task 4 (IMPORTANT 4, recluster gate spins forever on a zero-cluster library): COMPLETE
+  (suite 1154 passed/11 skipped)
+  `watcher.py`'s `recluster_due` read `not store.cluster_ids()` unconditionally -- on a library
+  where every detected face is gate-rejected (or nothing has ever been scanned), `unclustered`
+  stays 0 forever and no cluster is ever produced, so that clause was True on every single watch
+  cycle: an unbounded spin re-running `google_names` (a full `rglob("*.json")`) each cycle for a
+  library that structurally has nothing to cluster. Fixed the gate to require BOTH
+  `unclustered > 0` AND `not cluster_ids(embed_model)`. Also scoped `store.cluster_ids()` by
+  `embed_model` (optional, default `None` = unscoped) rather than making it mandatory like its
+  sibling `unclustered_face_count`: it has two genuinely different callers --
+  `dashboard/people.py`'s `_cluster_exists` validates an operator-supplied primary key regardless
+  of model (an unrelated, legitimate use the brief didn't anticipate; forcing a mandatory
+  embed_model there would reject valid ids), while `watcher.py`'s recluster gate and `cli.py`'s
+  `faces cluster` guard both need the model-scoped answer and now pass it explicitly. New tests:
+  `test_watch_does_not_recluster_forever_with_nothing_to_cluster` (real `watch()`/`FaceStore`
+  wiring, a gate-rejected face across 4 cycles, spies on both `google_names` and
+  `build_clusters` -- confirmed RED first: `names_calls == [1, 1, 1, 1]` against the old gate);
+  `test_cluster_ids_scoped_by_embed_model_excludes_other_models` and
+  `test_cluster_ids_is_unscoped_by_default` in test_store.py. Two existing tests
+  (`test_watch_reclusters_when_no_clusters_exist_yet`,
+  `test_watch_warns_once_when_clustering_due_but_no_threshold_configured`) had accidentally been
+  exploiting the bug (asserting recluster fired with zero unclustered faces) and were corrected
+  to seed a genuinely clusterable face. Full report: .superpowers/sdd/fix-task-4-report.md

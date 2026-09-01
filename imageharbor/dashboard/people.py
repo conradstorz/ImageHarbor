@@ -40,6 +40,11 @@ if TYPE_CHECKING:
 
 
 def _cluster_exists(store: FaceStore, cluster_id: Any) -> bool:
+    # Deliberately unscoped: this validates an operator-supplied primary key
+    # against the `clusters` table, not "does this id belong to the current
+    # embed_model" -- confirm/reject/merge never carry a model in scope, and
+    # a cluster id is unique across the whole table regardless of which
+    # model produced it. See `FaceStore.cluster_ids`'s docstring.
     return cluster_id in store.cluster_ids()
 
 

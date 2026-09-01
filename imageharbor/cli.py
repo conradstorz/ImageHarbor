@@ -1193,7 +1193,7 @@ def faces_cluster(
     embed_model = face_models.DEFAULT_EMBEDDER
 
     with FaceStore(catalog_path) as store:
-        existing = store.cluster_ids()
+        existing = store.cluster_ids(embed_model)
         if existing and not recluster:
             raise click.ClickException(
                 f"{len(existing)} cluster(s) already exist; pass --recluster "
@@ -1209,7 +1209,9 @@ def faces_cluster(
             min_score=min_score,
             min_support=min_support,
         )
-        proposals = sum(len(store.proposals_for(cid)) for cid in store.cluster_ids())
+        proposals = sum(
+            len(store.proposals_for(cid)) for cid in store.cluster_ids(embed_model)
+        )
 
     click.echo(f"clusters={made} proposals={proposals}")
 

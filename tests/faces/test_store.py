@@ -414,6 +414,50 @@ def test_pending_sidecars_lists_a_photo_after_confirmation(store):
     assert dict(store.iter_pending_sidecars()) == {}
 
 
+def test_cluster_ids_is_unscoped_by_default(store):
+    # `dashboard/people.py`'s `_cluster_exists` relies on this: it validates
+    # an operator-supplied cluster id against the primary key, regardless of
+    # which embed_model produced it.
+    ids_a = store.record_scan("a", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b", "yunet", [(_det(x=200), _vec([0, 1, 0]), "sface")])
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=tuple(ids_a), centroid=_vec([1, 0, 0]))
+    ])
+    store.replace_clusters("sface", [
+        cluster.Cluster(face_ids=tuple(ids_b), centroid=_vec([0, 1, 0]))
+    ])
+    assert len(store.cluster_ids()) == 2
+
+
+def test_cluster_ids_scoped_by_embed_model_excludes_other_models(store):
+    # Cross-model isolation, matching how `unclustered_face_count` and
+    # `digests_by_cluster` are already scoped: a cluster built for one
+    # embed_model must never appear in another model's `cluster_ids(...)`.
+    # This is the exact bug the fix-round finding described -- watcher.py's
+    # recluster gate calling the unscoped form let a cluster left behind by
+    # a since-abandoned embed_model mask "no clusters yet" for the model
+    # actually in use.
+    ids_a = store.record_scan("a", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b", "yunet", [(_det(x=200), _vec([0, 1, 0]), "sface")])
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=tuple(ids_a), centroid=_vec([1, 0, 0]))
+    ])
+    store.replace_clusters("sface", [
+        cluster.Cluster(face_ids=tuple(ids_b), centroid=_vec([0, 1, 0]))
+    ])
+
+    auraface_ids = store.cluster_ids("auraface")
+    sface_ids = store.cluster_ids("sface")
+
+    assert len(auraface_ids) == 1
+    assert len(sface_ids) == 1
+    assert auraface_ids != sface_ids
+    # The discriminating assertion: without the WHERE clause, both scoped
+    # calls degrade to the same unscoped, 2-element list.
+    assert set(auraface_ids).isdisjoint(sface_ids)
+    assert store.cluster_ids() == sorted(auraface_ids + sface_ids)
+
+
 def test_anchors_are_single_face_single_name_photos(store):
     store.record_scan("one", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
     store.record_scan("two", "yunet", [
