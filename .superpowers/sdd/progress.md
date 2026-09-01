@@ -472,3 +472,37 @@ Any future "pre-existing failure" claim must first confirm
   `Pete Storz` (clusters [2]), confirmed no cluster-id input exists in the rendered DOM,
   dispatched a real click, then an INDEPENDENT fetch showed Pete Storz -> [1, 2] and
   pete storz -> []. The write reached SQLite through the click.
+- Task 16: watch integration, deploy, docs — COMPLETE (da568f9..a18aab0; suite 1130 passed/11 skipped; review clean after 1 fix round)
+  Clustering is gated off the per-cycle path (unclustered > threshold, default 500, OR no
+  clusters yet); reviewer confirmed the "no clusters yet" branch cannot spin, since
+  cluster_faces always places every face into some accumulator. One-warning-per-run flags
+  are locals inside watch(), so a second watcher gets its own.
+  BRIEF NAMED FOUR MORE NON-EXISTENT APIS: control.get_setting/set_setting/revert_setting
+  (real: Catalog.setting_get/set/delete) and CircuitBreaker(threshold=)/.consecutive_failures
+  (real: trip_threshold, private _consecutive). The implementer used the PUBLIC state/
+  BreakerState.CLOSED rather than reaching for _consecutive -- the right call.
+  Scope expansion into cli.py/server.py/store.py was individually justified: without the CLI
+  wiring the docker-compose env vars this task documents would have been INERT. Reviewer
+  confirmed watch never wired a FaceStore before this task.
+  IMPORTANT FOUND BY THE REVIEWER: stats.py's _faces_section shipped with ZERO tests --
+  replacing its whole body with {"MUTATED": True} passed all 77 relevant tests. It was in the
+  brief's own file list. Fixed at a18aab0 with 5 tests; the same mutation now fails 5/5.
+  Bonus: a RAISING face store already degrades to `faces: null` with a 200 via collect()'s
+  existing _safe wrapper -- the dashboard's founding rule held by construction, and there is
+  now a test proving it rather than an assumption.
+  propagate_sidecars deliberately left unpaused: bounded by human-confirmation rate, not
+  library size, so it is not the mid-photo concern the invariant targets. Explicit decision.
+  Docs verified claim-by-claim against real --help output and source greps, not read for
+  plausibility -- flag defaults, env var names, "faces never rename/move" (zero tiers/
+  relocate hits under imageharbor/faces/), and "only confirm/merge write person_id".
+  Minor rolled up: no dashboard toggle for the faces pass (server.py's _SETTINGS_KEYS is
+  still ("interval","enrich")) -- openly disclosed, not hidden.
+
+## FINDING: there is no Picasa roster in this export (Task 17)
+  I scanned all 175 archives before dispatching Task 17. The COMPLETE non-media inventory is
+  31 files -- .kmz My Maps, Keep .html notes, one .ico, a .webm -- and the non-media JSONs are
+  206 album metadata.json plus Maps/Keep/vehicle-profile data. Nothing resembling contacts.xml
+  or Picasa face tags exists.
+  So provenance.py's "the Picasa face tags name 73 people across 1,496 entries" is NOT true of
+  this export. Recorded here because it is a live doc-drift claim in shipped code.
+  OWNER DECISION: build Task 17 defensively anyway, for exports that do contain one.
