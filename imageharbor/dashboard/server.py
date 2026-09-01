@@ -32,11 +32,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
-from imageharbor.dashboard import stats
+from imageharbor.dashboard import people, stats
 from imageharbor.dashboard.control import ControlPlane
+from imageharbor.faces.store import FaceStore
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,8 @@ def make_handler(
     control: ControlPlane,
     *,
     breaker: CircuitBreaker | None = None,
+    store: FaceStore | None = None,
+    crop_dir: Path | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a ``BaseHTTPRequestHandler`` subclass closed over one dashboard.
 
@@ -76,6 +80,13 @@ def make_handler(
     caught here and turned into a JSON error response rather than an
     unhandled exception reaching ``http.server``'s own default (which would
     print a traceback to the client).
+
+    ``store``/``crop_dir`` are optional: the face pipeline is not wired into
+    every caller yet (``cli.py``'s ``watch`` command does not construct a
+    ``FaceStore`` as of this task), so the People routes must degrade to a
+    plain 404 rather than raising when either is absent -- the same
+    "dashboard failure never stops organizing" rule, applied to "the feature
+    isn't wired up here" rather than to a query that raised.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -153,6 +164,10 @@ def make_handler(
                     self._handle_stats()
                 elif self.path == "/healthz":
                     self._send_text(HTTPStatus.OK, "ok")
+                elif self.path.startswith("/api/people"):
+                    self._handle_people()
+                elif self.path.startswith("/api/face-crop/"):
+                    self._handle_face_crop()
                 else:
                     self._send_text(HTTPStatus.NOT_FOUND, "not found")
             except Exception:
@@ -167,6 +182,8 @@ def make_handler(
                     self._handle_settings()
                 elif self.path == "/api/settings/revert":
                     self._handle_revert()
+                elif self.path.startswith("/api/people/"):
+                    self._handle_people_action()
                 else:
                     self._send_text(HTTPStatus.NOT_FOUND, "not found")
             except Exception:
@@ -189,6 +206,44 @@ def make_handler(
         def _handle_stats(self) -> None:
             document = stats.collect(catalog, control, breaker=breaker)
             self._send_json(HTTPStatus.OK, document)
+
+        def _handle_people(self) -> None:
+            if store is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND, {"error": "face review is not enabled"}
+                )
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            include_singletons = query.get("include_singletons", ["0"])[0].lower() in (
+                "1", "true",
+            )
+            document = people.review_queue(store, include_singletons=include_singletons)
+            self._send_json(HTTPStatus.OK, document)
+
+        def _handle_face_crop(self) -> None:
+            if store is None or crop_dir is None:
+                self._send_text(HTTPStatus.NOT_FOUND, "not found")
+                return
+            raw_id = urlsplit(self.path).path[len("/api/face-crop/"):]
+            try:
+                face_id = int(raw_id)
+            except ValueError:
+                self._send_text(HTTPStatus.NOT_FOUND, "not found")
+                return
+            data = people.crop_bytes(crop_dir, face_id, store=store)
+            if data is None:
+                self._send_text(HTTPStatus.NOT_FOUND, "not found")
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            # Derived, deletable-at-any-time cache data (see
+            # dashboard/people.py's crop_bytes docstring) -- never cached by
+            # the browser, so a re-crop after a regeneration is visible on
+            # the very next load rather than stuck behind a stale copy.
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
 
         # -- POST handlers ----------------------------------------------------
 
@@ -310,6 +365,50 @@ def make_handler(
             control.revert(key)
             self._send_json(HTTPStatus.OK, {"overrides": control.overrides()})
 
+        def _handle_people_action(self) -> None:
+            if store is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND, {"error": "face review is not enabled"}
+                )
+                return
+            body, err_status, err_msg = self._read_json_body()
+            if err_status is not None:
+                self._send_json(err_status, {"error": err_msg})
+                return
+            if not isinstance(body, dict):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": "expected a JSON object"}
+                )
+                return
+
+            # dispatch on the final path segment, matching the routes in
+            # the design doc's "Dashboard" table: confirm/reject/merge/split
+            action = self.path.rsplit("/", 1)[-1]
+            try:
+                if action == "confirm":
+                    result = people.confirm(
+                        store, body.get("cluster_id"), body.get("name", "")
+                    )
+                elif action == "reject":
+                    result = people.reject(
+                        store, body.get("cluster_id"), body.get("name", "")
+                    )
+                elif action == "merge":
+                    result = people.merge(
+                        store, body.get("person_id"), body.get("cluster_ids") or []
+                    )
+                elif action == "split":
+                    result = people.split(
+                        store, body.get("cluster_id"), body.get("face_ids") or []
+                    )
+                else:
+                    self._send_text(HTTPStatus.NOT_FOUND, "not found")
+                    return
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, result)
+
     return Handler
 
 
@@ -336,6 +435,8 @@ def serve(
     *,
     port: int,
     breaker: CircuitBreaker | None = None,
+    store: FaceStore | None = None,
+    crop_dir: Path | None = None,
     stop_event: threading.Event,
 ) -> threading.Thread | None:
     """Start the dashboard on a daemon thread, sharing *stop_event* with the caller.
@@ -358,7 +459,9 @@ def serve(
     `docker stop` (which sets *stop_event*) still triggers a clean
     `server_close()`.
     """
-    handler_cls = make_handler(catalog, control, breaker=breaker)
+    handler_cls = make_handler(
+        catalog, control, breaker=breaker, store=store, crop_dir=crop_dir
+    )
     try:
         httpd = _DashboardHTTPServer(("0.0.0.0", port), handler_cls)
     except OSError:
