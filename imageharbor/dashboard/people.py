@@ -88,6 +88,22 @@ def review_queue(store: FaceStore, *, include_singletons: bool = False) -> dict[
                 """
             )
         ]
+        # The case-variant "merge" button's whole reason for existing:
+        # POST /api/people/merge takes cluster_ids, and without them here the
+        # operator has no way to discover which ids to send short of typing
+        # them in by hand. A second, separate query rather than folding this
+        # into the GROUP BY above -- GROUP_CONCAT would hand back a string
+        # that needs re-parsing into ints, and a person with zero clusters
+        # (the LEFT JOIN case just above) would GROUP_CONCAT to NULL, which
+        # is the same ambiguity this is trying to avoid. Ids only, no
+        # per-cluster detail the page doesn't use.
+        cluster_ids_by_person: dict[int, list[int]] = {}
+        for row in conn.execute(
+            "SELECT id, person_id FROM clusters WHERE person_id IS NOT NULL ORDER BY person_id, id"
+        ):
+            cluster_ids_by_person.setdefault(row["person_id"], []).append(row["id"])
+        for row in people_rows:
+            row["cluster_ids"] = cluster_ids_by_person.get(row["person_id"], [])
 
         unreviewed = [r for r in cluster_rows if r["person_id"] is None]
         singletons_hidden = sum(1 for r in unreviewed if r["face_count"] == 1)

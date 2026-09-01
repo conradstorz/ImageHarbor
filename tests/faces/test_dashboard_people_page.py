@@ -30,3 +30,14 @@ def test_page_shows_the_payoff_number():
 
 def test_page_reports_hidden_singletons():
     assert "singletons_hidden" in PAGE
+
+
+def test_case_variant_merge_does_not_require_typed_cluster_ids():
+    # The gap this closes: POST /api/people/merge needs cluster_ids, and the
+    # roster now carries them (people.py's review_queue) -- the page must
+    # read them from there instead of asking the operator to type IDs by
+    # hand. Both the old input and its old prompt text must be gone...
+    assert "merge-cluster-ids" not in PAGE
+    assert "cluster IDs to move" not in PAGE
+    # ...and the replacement must actually consult the roster's cluster ids.
+    assert "cluster_ids" in PAGE

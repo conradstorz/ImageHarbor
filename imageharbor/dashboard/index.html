@@ -826,8 +826,10 @@
   // imageharbor/faces/names.py); only the *values* are real names, and
   // this renders only those. This is a suggestion list -- see the
   // module docstring in dashboard/people.py -- never an automatic merge:
-  // the operator supplies which variant to keep and which cluster IDs
-  // to move, same as the manual "Merge into..." control per cluster.
+  // the operator still supplies which variant to keep. What they no longer
+  // supply is cluster IDs -- `people[].cluster_ids` (added alongside this
+  // control) lets the click handler discover the other spellings' cluster
+  // ids itself, so there is nothing left to type.
   function renderCaseVariants(doc) {
     const container = $("people-case-variants");
     if (!container) return;
@@ -847,14 +849,13 @@
         '<li data-group="' + escapeHtml(key) + '">' +
           "<span>These may be the same person: " + chips + "</span>" +
           '<select data-role="keep-as">' + options + "</select>" +
-          '<input type="text" class="merge-cluster-ids" placeholder="cluster IDs to move, comma-separated">' +
           '<button class="small" data-action="merge-variants">Merge into selected</button>' +
         "</li>"
       );
     }).join("");
     container.innerHTML =
       '<p class="muted" style="margin-top:0;">These may be the same person (spellings differ only by case) --' +
-      " review and merge by hand, nothing here merges on its own:</p>" +
+      " pick which spelling to keep, nothing here merges on its own:</p>" +
       '<ul class="case-variant-list">' + items + "</ul>";
   }
 
@@ -965,15 +966,25 @@
       } else if (action === "merge-variants") {
         const li = btn.closest("li[data-group]");
         const targetName = li.querySelector('[data-role="keep-as"]').value;
-        const person = ((lastDoc && lastDoc.people) || []).find((p) => p.name === targetName);
+        const people = (lastDoc && lastDoc.people) || [];
+        const person = people.find((p) => p.name === targetName);
         if (!person) {
           showPeopleError('"' + targetName + '" has no confirmed person yet -- confirm a cluster with that name first');
           return;
         }
-        const idsRaw = li.querySelector(".merge-cluster-ids").value;
-        const clusterIds = idsRaw.split(",").map((s) => s.trim()).filter(Boolean).map(Number);
-        if (!clusterIds.length || clusterIds.some((n) => Number.isNaN(n))) {
-          showPeopleError("enter the cluster ID(s) to move as numbers, comma-separated");
+        // The other spellings in this group -- everything but the one the
+        // operator chose to keep. `data-group` round-trips through the DOM
+        // HTML-decoded, so it matches a `case_variants` key exactly (see
+        // renderCaseVariants above).
+        const variants = ((lastDoc && lastDoc.case_variants) || {})[li.dataset.group] || [];
+        const clusterIds = variants
+          .filter((name) => name !== targetName)
+          .flatMap((name) => {
+            const p = people.find((pp) => pp.name === name);
+            return p ? p.cluster_ids : [];
+          });
+        if (!clusterIds.length) {
+          showPeopleError("nothing to merge -- the other spelling(s) have no clusters left to move");
           return;
         }
         await postJSON("/api/people/merge", { person_id: person.person_id, cluster_ids: clusterIds });

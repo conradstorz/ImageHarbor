@@ -3441,6 +3441,24 @@ cluster. See `tests/faces/test_dashboard_people.py`,
 the regression tests, and `.superpowers/sdd/task-14-report.md` ("Fix round
 1") for the full writeup.
 
+**Post-review fix (2026-08-31, round 2):** `review_queue`'s `people` roster
+exposed `person_id`/`name`/`cluster_count`/`photo_count` but not the cluster
+ids themselves, and `POST /api/people/merge` requires `cluster_ids` --
+Task 15's own case-variant "merge" suggestion button was consequently
+unusable without the operator typing cluster IDs by hand, which the page
+gave them no way to discover (this was disclosed, not hidden, in Task 15's
+report). Fixed by adding `cluster_ids: list[int]` to each roster entry, via
+a second query (`SELECT id, person_id FROM clusters WHERE person_id IS NOT
+NULL`) rather than folding it into the existing `GROUP BY` -- a
+`GROUP_CONCAT` would need re-parsing into ints and collapses to `NULL` for
+exactly the zero-cluster person the LEFT JOIN above exists to keep visible,
+reintroducing the ambiguity this is meant to remove. This is read-side only:
+`FaceStore.confirm`/`FaceStore.merge` remain the only writers of
+`clusters.person_id`. See `tests/faces/test_dashboard_people.py` (roster
+`cluster_ids`, the zero-cluster case, and a case-variant merge driven by
+those ids) and `.superpowers/sdd/task-15-report.md` ("Fix round 1") for the
+full writeup.
+
 ---
 
 ## Task 15: Dashboard People UI
@@ -3522,6 +3540,27 @@ Then start a watcher against a test library and open `http://localhost:8080/` to
 git add imageharbor/dashboard/index.html imageharbor/dashboard/server.py tests/faces/test_dashboard_people_page.py
 git commit -m "feat(faces): add the People review section to the dashboard"
 ```
+
+**Post-review fix (2026-08-31):** the case-variant "merge" suggestion this
+task shipped was a real gap disclosed in its own report, not a hidden bug:
+`POST /api/people/merge` needs `cluster_ids`, and the roster had no way to
+expose which clusters belonged to which spelling, so the control asked the
+operator to type cluster IDs by hand with nothing on the page to look them
+up against. Fixed by Task 14's round-2 correction (roster entries now carry
+`cluster_ids`) plus a matching change here: `renderCaseVariants` dropped the
+free-text `.merge-cluster-ids` input, and the `merge-variants` click handler
+now computes the clusters to move itself -- every other spelling in the
+group, looked up by name in `doc.people`, its `cluster_ids` flattened -- and
+merges them onto whichever person the operator picked as the spelling to
+keep. The operator still always chooses the target; nothing merges without
+that click. Verified against a real `dashboard_server.serve()` and a real
+headless-Chrome click (no Playwright): seeded `pete storz` (cluster_ids
+`[1]`) and `Pete Storz` (cluster_ids `[2]`), clicked "Merge into selected"
+with "Pete Storz" chosen, and a fresh, independent `fetch('/api/people')`
+afterward showed `Pete Storz` at `cluster_ids: [1, 2]` and `pete storz` at
+`cluster_ids: []`. See `tests/faces/test_dashboard_people.py`,
+`tests/faces/test_dashboard_people_page.py`, and
+`.superpowers/sdd/task-15-report.md` ("Fix round 1") for the full writeup.
 
 ---
 

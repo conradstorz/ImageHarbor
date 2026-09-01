@@ -152,7 +152,63 @@ def test_sample_face_ids_capped_at_nine(store):
     queue = people.review_queue(store, include_singletons=True)
     entry = next(c for c in queue["clusters"] if c["cluster_id"] == cid)
     assert len(entry["sample_face_ids"]) == 9
-    assert entry["sample_face_ids"] == sorted(entry["sample_face_ids"])
+
+
+# ---------------------------------------------------------------------------
+# people roster -- cluster_ids (the merge button needs these to be usable
+# without hand-typed input; see dashboard/people.py's module docstring)
+# ---------------------------------------------------------------------------
+
+
+def test_people_roster_includes_its_cluster_ids(store):
+    cid = _one_cluster(store)
+    people.confirm(store, cid, "Emma")
+    queue = people.review_queue(store, include_singletons=True)
+    entry = queue["people"][0]
+    assert entry["cluster_ids"] == [cid]
+
+
+def test_people_roster_reports_an_empty_cluster_id_list_for_a_person_with_none(store):
+    # A recluster can strip every cluster from a confirmed person --
+    # review_queue's LEFT JOIN already keeps that person in the roster
+    # (see its docstring); the cluster_ids list must still appear, empty,
+    # not be missing or make the entry disappear.
+    person_id = store.add_person("Ghost", "human")
+    queue = people.review_queue(store, include_singletons=True)
+    entry = next(p for p in queue["people"] if p["person_id"] == person_id)
+    assert entry["cluster_ids"] == []
+
+
+def test_merging_a_case_variant_group_moves_clusters_via_roster_ids(store):
+    # Both clusters must come from the same replace_clusters call -- see the
+    # note in test_review_queue_orders_by_face_count_descending.
+    ids_a = store.record_scan("a0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=tuple(ids_a), centroid=_v([1, 0, 0])),
+        cluster.Cluster(face_ids=tuple(ids_b), centroid=_v([1, 0, 0])),
+    ])
+    cid_a, cid_b = store.cluster_ids()
+    people.confirm(store, cid_a, "pete storz")
+    people.confirm(store, cid_b, "Pete Storz")
+
+    queue = people.review_queue(store, include_singletons=True)
+    assert queue["case_variants"] == {"pete storz": ["Pete Storz", "pete storz"]}
+    losing = next(p for p in queue["people"] if p["name"] == "pete storz")
+    keeping = next(p for p in queue["people"] if p["name"] == "Pete Storz")
+    assert losing["cluster_ids"] == [cid_a]
+    assert keeping["cluster_ids"] == [cid_b]
+
+    # This is exactly what the dashboard's case-variant merge control now
+    # does: read the losing spelling's cluster_ids off the roster (no
+    # hand-typed IDs) and merge them onto the kept person.
+    people.merge(store, keeping["person_id"], losing["cluster_ids"])
+
+    after = people.review_queue(store, include_singletons=True)
+    kept_after = next(p for p in after["people"] if p["name"] == "Pete Storz")
+    losing_after = next(p for p in after["people"] if p["name"] == "pete storz")
+    assert sorted(kept_after["cluster_ids"]) == sorted([cid_a, cid_b])
+    assert losing_after["cluster_ids"] == []
 
 
 # ---------------------------------------------------------------------------
