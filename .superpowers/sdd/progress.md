@@ -559,3 +559,51 @@ Base for this round: e08bc4b
   recluster completes) and lower severity (flips a proposal's decided
   state, not a person's identity). Full report:
   .superpowers/sdd/fix-task-2-report.md
+
+- Fix Task 2 (CRITICAL 2, recluster mid-confirm writes wrong identity): COMPLETE
+  (6fab6af..acfd754, 2 commits; suite 1150 passed/11 skipped; review clean, Approved)
+  TWO-STAGE FIX, and the honesty of stage 1's own report is what caught the gap. Stage 1
+  (fabdc12) added an inside-the-lock existence check to FaceStore.confirm/merge, matching
+  FaceStore.split's precedent -- but the implementer proved, before declaring done, that this
+  did NOT close the brief's exact worked example: a SAME-COUNT recluster recycles a plain
+  (non-AUTOINCREMENT) clusters.id onto genuinely different content, and a bare existence check
+  can't tell "same row" from "recycled row" apart. Reported as DONE_WITH_CONCERNS rather than
+  claiming victory.
+  Stage 2 (acfd754) fixed the actual root cause: clusters.id -> INTEGER PRIMARY KEY
+  AUTOINCREMENT, so SQLite never reuses a deleted cluster id for the table's lifetime. No
+  production data on this pre-merge branch to migrate. Reviewer independently verified this is
+  correct SQLite behavior with a standalone in-memory comparison (plain PK recycles 1,2,3 after
+  delete+reinsert; AUTOINCREMENT gets fresh 4,5,6) rather than trusting the report, confirmed
+  the shipped test reproduces the brief's exact scenario verbatim, confirmed RED isolates the
+  recycling mechanism itself (not a retest of stage 1's already-fixed vanished-id case), and
+  independently grepped for `DELETE FROM people` (zero hits) to confirm people.id genuinely
+  does not need the same fix.
+  reject() has the identical race shape, flagged but deliberately left unfixed (narrower
+  exposure: flips a proposal's decided state, not a person's identity) -- reviewer confirmed
+  it is INCIDENTALLY also protected by the AUTOINCREMENT fix, since replace_clusters deletes
+  proposals rows for old cluster ids before reinserting, so a stale id can only resolve to
+  nothing post-recluster, never to a different real proposal row.
+  Minor rolled up for final review: CREATE TABLE IF NOT EXISTS clusters means AUTOINCREMENT is
+  a no-op against any already-existing on-disk clusters table from before this fix -- fine on
+  this pre-merge branch, worth remembering if a stale dev/test DB gets reused post-merge;
+  faces.id is also plain INTEGER PRIMARY KEY with no evidence of the same bug in this diff, but
+  not exhaustively checked codebase-wide (out of this review's scope).
+
+- Fix Task 3 (IMPORTANT 3, crop-rank contract had no test on either side): COMPLETE
+  (test-only; suite 1151 passed/11 skipped, +1 over the 1150/11 baseline).
+  `runner.py`'s `_scan_one` names crop files by rank-among-kept (via `enumerate` over the
+  post-gate, post-align loop) and `people.py`'s `crop_bytes` re-derives that same rank by
+  filtering `faces` to `rejected IS NULL` and indexing by ascending id -- both sides of that
+  contract were correct but untested together with a gate-rejected face actually present ahead
+  of the kept ones. Added
+  `test_crop_bytes_matches_each_kept_face_s_own_crop_past_a_gate_rejection` to
+  tests/faces/test_runner.py: scans a synthetic photo (one low-score gate-rejected detection
+  plus two kept detections over visually distinct red/blue regions) through the real
+  `runner._scan_one` write path against a real `FaceStore` and crop directory, then asserts
+  `dashboard.people.crop_bytes` returns each kept face's own saved crop bytes. Physical face
+  identity is recovered via `bbox_x` (untouched by either dangerous mutation), not via id order,
+  so the oracle stays valid regardless of which side of the contract regresses. Confirmed RED
+  against both mutations named in the brief (reversing runner.py's kept-face append order via
+  `reversed(list(enumerate(...)))`; dropping `AND rejected IS NULL` from people.py's rank
+  query) -- each reverted before committing; shipped runner.py/people.py unchanged. Full report:
+  .superpowers/sdd/fix-task-3-report.md

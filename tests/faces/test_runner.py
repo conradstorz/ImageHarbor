@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from PIL import Image, JpegImagePlugin
+from PIL import Image, ImageDraw, JpegImagePlugin
 
 from imageharbor.catalog import Catalog
+from imageharbor.dashboard import people
 from imageharbor.faces import runner
 from imageharbor.faces.decode import Detection
 from imageharbor.faces.store import FaceStore
@@ -178,6 +179,107 @@ def test_draft_is_called_before_decode_for_every_photo(library, monkeypatch):
                 gate=runner.QualityGate(0.5, 10))
     cat.close()
     assert calls == [("RGB", runner.DECODE_SIZE)] * 3
+
+
+# ---------------------------------------------------------------------------
+# crop-rank contract: runner.py's file-naming rank and people.py's
+# id-derived rank must agree even when a gate-rejected face sits at a
+# lower id than the kept faces around it. See CLAUDE.md invariant 7 and
+# dashboard/people.py's crop_bytes docstring.
+# ---------------------------------------------------------------------------
+
+
+class _ThreeDetectionDetector:
+    """One low-score (gate-rejected) detection plus two kept detections
+    positioned over visually distinct regions of the fixture image, so each
+    kept face's aligned crop is pixel-distinguishable from the other's."""
+
+    model_name = "yunet"
+
+    def detect(self, image):
+        return [
+            # Rejected by the quality gate -- occupies the *first* slot in
+            # `detections`, so it lands at the lowest id once inserted,
+            # ahead of both kept faces below.
+            Detection(
+                x=0.0, y=100.0, w=50.0, h=50.0, score=0.1,
+                landmarks=((10.0, 110.0), (30.0, 110.0), (20.0, 120.0),
+                           (12.0, 130.0), (28.0, 130.0)),
+            ),
+            # Kept face "A" -- over the red region.
+            Detection(
+                x=0.0, y=0.0, w=50.0, h=50.0, score=0.9,
+                landmarks=((20.0, 20.0), (40.0, 20.0), (30.0, 30.0),
+                           (22.0, 42.0), (38.0, 42.0)),
+            ),
+            # Kept face "B" -- over the blue region, translated +100 in x.
+            Detection(
+                x=100.0, y=0.0, w=50.0, h=50.0, score=0.9,
+                landmarks=((120.0, 20.0), (140.0, 20.0), (130.0, 30.0),
+                           (122.0, 42.0), (138.0, 42.0)),
+            ),
+        ]
+
+
+def _crop_rank_fixture(tmp_path):
+    """A photo with a gate-rejected face ahead of two visually distinct kept
+    faces, scanned through the real `_scan_one` write path against a real
+    `FaceStore` and crop directory."""
+    img = Image.new("RGB", (200, 200), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, 80, 100], fill=(220, 20, 20))     # red -- face A
+    draw.rectangle([100, 0, 180, 100], fill=(20, 20, 220))  # blue -- face B
+    photo_path = tmp_path / "photo.jpg"
+    img.save(photo_path)
+
+    db = tmp_path / "catalog.db"
+    Catalog(db).close()
+    store = FaceStore(db)
+    digest = "crops_digest_0123456789"
+    crop_dir = tmp_path / ".crops"
+    gate = runner.QualityGate(min_score=0.6, min_box=10)
+
+    kept, rejected = runner._scan_one(
+        photo_path, _ThreeDetectionDetector(), FakeEmbedder(), gate, crop_dir,
+        digest, store,
+    )
+    assert (kept, rejected) == (2, 1)
+    return store, crop_dir, digest
+
+
+def test_crop_bytes_matches_each_kept_face_s_own_crop_past_a_gate_rejection(tmp_path):
+    # This is the regression the review flagged: runner.py names crop files
+    # by rank-among-kept (assigned via enumerate over the post-gate,
+    # post-align loop), and people.py's crop_bytes re-derives that same rank
+    # by filtering `faces` to `rejected IS NULL` and indexing by ascending
+    # id. Nothing before this test exercised both halves of that contract
+    # together with a rejected face actually present ahead of the kept
+    # ones -- two independently-broken mutations (reversing runner.py's
+    # kept-face append order, or dropping `rejected IS NULL` from people.py's
+    # rank query) both pass all 239 pre-existing tests.
+    store, crop_dir, digest = _crop_rank_fixture(tmp_path)
+
+    photo_dir = crop_dir / digest[:2] / digest[2:4]
+    crop_a_bytes = (photo_dir / f"{digest}-0.jpg").read_bytes()
+    crop_b_bytes = (photo_dir / f"{digest}-1.jpg").read_bytes()
+    # Sanity: the fixture is actually distinguishable, or a swap bug could
+    # coincidentally still produce a byte-identical "match".
+    assert crop_a_bytes != crop_b_bytes
+
+    # Recover which face id is physically which face via bbox_x -- a column
+    # neither dangerous mutation touches, so this identification is a valid
+    # oracle regardless of which side of the id<->rank contract regresses.
+    rows = store._conn.execute(
+        "SELECT id, bbox_x FROM faces WHERE sha256_b64url=? AND rejected IS NULL "
+        "ORDER BY bbox_x",
+        (digest,),
+    ).fetchall()
+    assert len(rows) == 2
+    face_id_a, face_id_b = rows[0]["id"], rows[1]["id"]
+
+    assert people.crop_bytes(crop_dir, face_id_a, store=store) == crop_a_bytes
+    assert people.crop_bytes(crop_dir, face_id_b, store=store) == crop_b_bytes
+    store.close()
 
 
 def test_rejected_face_reasons_are_distinguishable(library):
