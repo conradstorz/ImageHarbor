@@ -2,6 +2,7 @@
 
 import sys
 
+import imageharbor
 import imageharbor.faces as faces
 
 
@@ -24,6 +25,19 @@ def test_package_imports_when_onnxruntime_raises_non_import_error(monkeypatch):
     # original module object is restored at teardown regardless of whether the
     # test passes or fails — a bare pop() here leaked the reloaded, ONNX-less
     # module into every later test in the session.
+    #
+    # This alone is NOT enough (found by Task 13's CLI tests, which failed
+    # only when the full suite ran, never in isolation): `import
+    # imageharbor.faces` below re-executes the package and, as a side effect
+    # of the import machinery, overwrites `imageharbor`'s own `faces`
+    # attribute -- not just the `sys.modules["imageharbor.faces"]` entry.
+    # `imageharbor/cli.py`'s `from . import faces as faces_pkg` resolves
+    # through that attribute, not through `sys.modules` directly, so without
+    # the extra `monkeypatch.setattr` below, the poisoned HAS_ONNX=False
+    # module stayed live for the rest of the session even though
+    # `sys.modules` looked clean.
+    original_faces_module = sys.modules["imageharbor.faces"]
+    monkeypatch.setattr(imageharbor, "faces", original_faces_module)
     monkeypatch.delitem(sys.modules, "imageharbor.faces", raising=False)
     to_remove = [k for k in list(sys.modules.keys()) if k.startswith("imageharbor.faces.")]
     for k in to_remove:
