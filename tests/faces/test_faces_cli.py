@@ -298,6 +298,7 @@ def test_calibrate_reports_needs_two_names(tmp_path):
         ["faces", "cluster", "--help"],
         ["faces", "calibrate", "--help"],
         ["faces", "status", "--help"],
+        ["faces", "roster", "--help"],
         ["faces", "models", "--help"],
         ["faces", "models", "download", "--help"],
     ],
@@ -305,3 +306,72 @@ def test_calibrate_reports_needs_two_names(tmp_path):
 def test_every_subcommand_help_renders(args):
     result = CliRunner().invoke(main, args)
     assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# faces roster: Picasa roster names as autocomplete vocabulary, never
+# attached to a photo or cluster (Task 17).
+# ---------------------------------------------------------------------------
+
+
+def _seed_roster(dest: Path, sample: bytes) -> None:
+    room = dest / ".takeout-provenance" / "abc"
+    room.mkdir(parents=True)
+    (room / "contacts.xml").write_bytes(sample)
+
+
+_ROSTER_SAMPLE = b"""<?xml version="1.0"?>
+<contacts>
+  <contact id="a1" name="Conrad Storz"/>
+  <contact id="b2" name="Gladys Blankenbeker "/>
+</contacts>
+"""
+
+
+def test_roster_imports_names_and_reports_the_count(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _seed_store(dest)
+    _seed_roster(dest, _ROSTER_SAMPLE)
+
+    result = CliRunner().invoke(main, ["faces", "roster", "--dest", str(dest)])
+    assert result.exit_code == 0, result.output
+    assert "2" in result.output
+
+    store = FaceStore(dest / "catalog.db")
+    assert sorted(store.known_names()) == ["Conrad Storz", "Gladys Blankenbeker"]
+    store.close()
+
+
+def test_roster_import_is_idempotent_through_the_cli(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _seed_store(dest)
+    _seed_roster(dest, _ROSTER_SAMPLE)
+
+    runner = CliRunner()
+    runner.invoke(main, ["faces", "roster", "--dest", str(dest)])
+    result = runner.invoke(main, ["faces", "roster", "--dest", str(dest)])
+    assert result.exit_code == 0, result.output
+    assert "0" in result.output
+
+
+def test_roster_without_onnxruntime_fails_clearly(tmp_path, monkeypatch):
+    import imageharbor.faces as faces_pkg
+
+    monkeypatch.setattr(faces_pkg, "HAS_ONNX", False)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    result = CliRunner().invoke(main, ["faces", "roster", "--dest", str(dest)])
+    assert result.exit_code != 0
+    assert "faces" in result.output and "extra" in result.output
+
+
+def test_roster_with_no_provenance_directory_reports_zero(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _seed_store(dest)
+
+    result = CliRunner().invoke(main, ["faces", "roster", "--dest", str(dest)])
+    assert result.exit_code == 0, result.output
+    assert "0" in result.output

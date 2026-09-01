@@ -1299,6 +1299,41 @@ def faces_status(dest: Path, catalog_path: Path | None) -> None:
         click.echo(f"{key:<12} {stats[key]}")
 
 
+@faces_cmd.command(name="roster")
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Root of the organized library.",
+)
+@click.option(
+    "--catalog",
+    "catalog_path",
+    envvar="IMAGEHARBOR_CATALOG",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the SQLite catalog. Defaults to <dest>/catalog.db.",
+)
+def faces_roster(dest: Path, catalog_path: Path | None) -> None:
+    """Import a preserved Picasa roster as autocomplete vocabulary.
+
+    These names are never attached to a photo or a cluster -- the roster
+    carries no photo reference at all. They only populate the review UI's
+    name list. Finding no preserved roster is the expected case and reports
+    0, not an error.
+    """
+    _require_onnx()
+
+    from .faces import roster
+    from .faces.store import FaceStore
+
+    catalog_path = _faces_catalog_path(dest, catalog_path)
+    with FaceStore(catalog_path) as store:
+        added = roster.import_names(store, dest)
+
+    click.echo(f"{added} new names imported")
+
+
 @faces_cmd.group(name="models")
 def faces_models_cmd() -> None:
     """Manage local face model weights."""

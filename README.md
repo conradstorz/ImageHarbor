@@ -61,6 +61,13 @@ third continuous pass every cycle; whole-library reclustering only runs when
 there's enough new, unclustered work to justify it (or no clustering has
 happened yet), never on every poll.
 
+If a Takeout export preserved a Picasa contact roster
+(`.takeout-provenance/<archive_id>/contacts.xml`), `imageharbor faces roster
+--dest DEST` imports its names into the review UI's autocomplete list. The
+roster carries no photo reference at all, so those names seed vocabulary
+only — they are never attached to a cluster or a photo. Running it against a
+library with no such file is the normal case and reports `0`, not an error.
+
 ## Operational dashboard
 
 `imageharbor watch` serves a small operational dashboard on
@@ -120,6 +127,7 @@ image's JSON sidecar, not in the path or filename.
 | `imageharbor verify DEST` | Re-verify every organized file's digest against its filename. |
 | `imageharbor sidecar backfill --dest DEST` | Rebuild/merge sidecars for a library organized before sidecars were the default. Cannot recover Google Takeout metadata for already-organized files — that requires re-ingesting the original archives. |
 | `imageharbor faces scan --dest DEST` | Detect and embed faces in organized photos; `faces calibrate`/`faces cluster`/`faces status` group and review them (needs the optional `faces` extra). |
+| `imageharbor faces roster --dest DEST` | Import a preserved Picasa contact roster's names as autocomplete vocabulary, if the export had one — never attached to a cluster or photo. |
 
 Run `imageharbor --help` (or `<command> --help`) for the full flag list.
 
