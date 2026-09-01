@@ -608,9 +608,10 @@ Module responsibilities:
     `onnxruntime`, wrapping a loaded ONNX session — construct one per
     long-lived worker, never per photo), `store.py` (`FaceStore` — owns the
     `faces`/`face_scan`/`clusters`/`people`/`proposals` tables in the same
-    SQLite file `Catalog` uses, via its own connection; the only methods
-    that ever write `clusters.person_id` are `confirm`/`merge`), and
-    `runner.py` (`scan` — per-photo, resumable; `build_clusters` —
+    SQLite file `Catalog` uses, via its own connection; only `confirm`/`merge`
+    ever *assign a new* person to a cluster — `replace_clusters` also writes
+    `clusters.person_id`, but only to restore one a human already confirmed),
+    and `runner.py` (`scan` — per-photo, resumable; `build_clusters` —
     whole-library; `propagate_sidecars` — writes confirmed names into
     sidecars, guarded so a repeat run is byte-identical; `google_names` —
     reads Google-tagged names straight from sidecars for `cluster`/
@@ -754,16 +755,19 @@ Module responsibilities:
   sidecar, not the name" posture PCS classification already has, applied to a
   fact that is far more personal to get wrong.
 - **No identity is written without human confirmation.** `FaceStore.confirm`
-  and `FaceStore.merge` are the *only* two methods that ever write
-  `clusters.person_id`; `record_proposals` (what `faces cluster` calls) only
+  and `FaceStore.merge` are the *only* two methods that ever *assign a new*
+  person to a cluster; `record_proposals` (what `faces cluster` calls) only
   ever writes to the `proposals` table and is guaranteed never to touch
-  `person_id` — see `store.py`'s own mutation-tested guarantee. A rejected
-  proposal is recorded as rejected, not deleted, so the same wrong guess
-  isn't re-proposed every pass. This mirrors `pairing.sidecar_for` returning
-  `None` rather than guessing a Takeout pairing, and `date_resolver` refusing
-  mtime rather than assert a date it can't support — applied here to a
-  person's name, which is both easier to get wrong unnoticed and more
-  personal than a wrong date.
+  `person_id` — see `store.py`'s own mutation-tested guarantee.
+  `replace_clusters` (a recluster) also writes `clusters.person_id`, but only
+  to restore a person a human already confirmed onto its old cluster; it
+  never invents one, so no identity is ever written without a human behind
+  it. A rejected proposal is recorded as rejected, not deleted, so the same
+  wrong guess isn't re-proposed every pass. This mirrors `pairing.sidecar_for`
+  returning `None` rather than guessing a Takeout pairing, and
+  `date_resolver` refusing mtime rather than assert a date it can't support —
+  applied here to a person's name, which is both easier to get wrong
+  unnoticed and more personal than a wrong date.
 - **Embeddings are never compared across `embed_model` values.** A vector from
   one model shares a coordinate space with another only by coincidence, so a
   cross-model comparison is not merely wrong, it's a *plausible-looking*

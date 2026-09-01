@@ -1,9 +1,11 @@
 """SQLite persistence for faces, clusters, and the human confirmation gate.
 
 This is the only place a person's identity is ever written. `record_proposals`
-writes machine guesses to `proposals` and nothing else; `confirm` and `merge`
-are the only two methods that touch `clusters.person_id` -- see the module's
-tests for the mutation-tested guarantee.
+writes machine guesses to `proposals` and nothing else; only `confirm` and
+`merge` ever assign a *new* person to a cluster -- see the module's tests for
+the mutation-tested guarantee. `replace_clusters` also writes
+`clusters.person_id`, but only to restore a person a human already confirmed
+onto its old cluster; it never invents one (see its own docstring).
 
 Mirrors `imageharbor.catalog.Catalog`'s connection setup (`check_same_thread`,
 row factory, WAL, busy timeout, a lock around every write) so the two stores
@@ -714,7 +716,9 @@ class FaceStore:
     def merge(self, person_id: int, cluster_ids: Sequence[int]) -> None:
         """Point several clusters at one already-confirmed person.
 
-        Along with `confirm`, the only method that writes `clusters.person_id`.
+        Along with `confirm`, the only method that assigns a *new* person to a
+        cluster. (`replace_clusters` also writes `clusters.person_id`, but only
+        to restore a person a human already confirmed -- see its docstring.)
 
         Re-validates every id in *cluster_ids* here, inside the same lock
         acquisition that does the write -- see `confirm`'s docstring for why,

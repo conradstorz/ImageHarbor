@@ -2,9 +2,11 @@
 
 Every mutation here (`confirm`, `reject`, `merge`, `split`) is a thin,
 validating wrapper around the matching `FaceStore` method. `FaceStore`'s own
-docstring guarantees `confirm`/`merge` are the only two places that ever write
-`clusters.person_id` -- this module must never become a second one; it only
-turns a bad request into `ValueError` (the same boundary contract
+docstring guarantees `confirm`/`merge` are the only two places that ever
+*assign a new* person to a cluster (a recluster's `replace_clusters` only
+ever restores one a human already confirmed) -- this module must never
+become a place that assigns one either; it only turns a bad request into
+`ValueError` (the same boundary contract
 `dashboard/control.py`'s `set_override` uses) and delegates.
 
 `confirm` in particular must not write sidecars: `FaceStore.confirm` only
