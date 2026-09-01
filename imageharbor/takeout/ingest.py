@@ -659,7 +659,15 @@ class _Ingestor:
             if found.sidecar is not None and found.sidecar not in self._all_members:
                 return (pairing.sidecar_for(member_path, self.pairing_index),
                         "builtin", "index_sidecars_missing")
-            if found.sidecar is None:
+            if found.sidecar is None or found.confidence == pairing.NO_MATCH:
+                # I3: `confidence='none'` is a VALID confidence value, but a
+                # NON-NULL sidecar paired with it is not top-rung evidence --
+                # `pairing.py`'s own README-documented contract is that
+                # `none` contributes nothing. Treated exactly like
+                # `sidecar is None`: fall back to the built-in ladder and
+                # count it the same way, rather than silently applying this
+                # sidecar's date at DATE_EXTERNAL_SIDECAR while dropping
+                # title/people and never touching the own/related counters.
                 return (pairing.sidecar_for(member_path, self.pairing_index),
                         "builtin", "index_no_sidecar_fell_back")
             return pairing.Pairing(found.sidecar, found.confidence), found.rule, None

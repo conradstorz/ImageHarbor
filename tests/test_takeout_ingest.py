@@ -1109,6 +1109,102 @@ def test_index_null_sidecar_falls_back_to_builtin_pairing(
     assert row["date_source"] == "external_sidecar"
 
 
+def test_index_none_confidence_with_a_real_sidecar_falls_back_to_builtin_pairing(
+    dirs, catalog: Catalog, tmp_path: Path
+) -> None:
+    """I3: `confidence='none'` (`pairing.NO_MATCH`) is a VALID confidence
+    (`_VALID_CONFIDENCES` includes it), so an index row naming a real,
+    present sidecar with `confidence='none'` used to fall to the final
+    `else` branch and be trusted directly -- applying its date at tier 30
+    (external_sidecar, the rung reserved for "this sidecar names this
+    file") while dropping title/people, and never incrementing
+    `pairings_own`/`pairings_related` at all, so the member silently
+    vanished from the own/related/unpaired summary line. The README table
+    this branch adds says `none` contributes nothing -- it must be treated
+    exactly like `sidecar is None` and fall back to the built-in ladder,
+    which here still finds the real sidecar on its own."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792),
+    })
+    st = (archives / "takeout-001.zip").stat()
+    from tests.test_takeout_index_reader import make_index
+    idx_path = make_index(
+        tmp_path / "index.sqlite",
+        archives=(("takeout-001.zip", st.st_size, int(st.st_mtime), 0, None),),
+        sidecars=[(1, "takeout-001.zip", f"{D}/IMG_1.jpg.json", "IMG_1.jpg.json")],
+        media=[("takeout-001.zip", f"{D}/IMG_1.jpg", "area", "folder",
+                "IMG_1.jpg", 1, "some-rule", "none")],
+    )
+    stats = ingest_archives(archives, dest, catalog, index_path=idx_path)
+
+    assert stats.index_archives_covered == 1
+    assert stats.index_no_sidecar_fell_back == 1
+    # The built-in ladder found IMG_1.jpg.json on its own -- correctly
+    # counted as an OWN pairing, not silently dropped from the summary.
+    assert stats.pairings_own == 1
+    assert stats.pairings_related == 0
+    assert stats.missing_metadata == 0
+    organized = list((dest / "2015" / "2015-03").glob("*.jpg"))
+    assert len(organized) == 1
+    assert not list(dest.glob("Undated/*.jpg"))
+
+    from imageharbor.hashing import compute_sha256_b64url_bytes
+    sha = compute_sha256_b64url_bytes(_jpeg(1))
+    row = catalog.get_by_sha256(sha)
+    assert row is not None
+    assert row["date_tier"] == 30
+    assert row["date_source"] == "external_sidecar"
+
+
+def test_index_sidecar_missing_from_the_batch_falls_back_to_builtin_pairing(
+    dirs, catalog: Catalog, tmp_path: Path
+) -> None:
+    """I4: the index can name a sidecar that never actually arrived in this
+    batch -- it lives in a part the operator hasn't downloaded yet, or the
+    producer's own view of the export has drifted from what's actually on
+    disk. Trusting that name directly means `_read_sidecar_bytes` can never
+    find it (there is no `self.owner` entry for a phantom member path), so
+    the photo silently loses its date with no fallback and no
+    `missing_metadata` signal -- the same silent-date-loss shape as this
+    branch's original Critical finding (Task 5). The guard
+    (`found.sidecar not in self._all_members`) must fall back to the
+    built-in ladder, which here still finds the real, same-archive
+    sidecar."""
+    archives, dest = dirs
+    _zip(archives / "takeout-001.zip", {
+        f"{D}/IMG_1.jpg": _jpeg(1),
+        f"{D}/IMG_1.jpg.json": _sidecar("IMG_1.jpg", 1425905792),
+    })
+    st = (archives / "takeout-001.zip").stat()
+    from tests.test_takeout_index_reader import make_index
+    idx_path = make_index(
+        tmp_path / "index.sqlite",
+        archives=(("takeout-001.zip", st.st_size, int(st.st_mtime), 0, None),),
+        sidecars=[(1, "takeout-001.zip", f"{D}/phantom-sidecar.json", "phantom-sidecar.json")],
+        media=[("takeout-001.zip", f"{D}/IMG_1.jpg", "area", "folder",
+                "IMG_1.jpg", 1, "some-rule", "own")],
+    )
+    stats = ingest_archives(archives, dest, catalog, index_path=idx_path)
+
+    assert stats.index_archives_covered == 1
+    assert stats.index_sidecars_missing == 1
+    # The built-in ladder found the real sidecar on its own -- no metadata
+    # loss, and no phantom sidecar path was accepted.
+    assert stats.missing_metadata == 0
+    organized = list((dest / "2015" / "2015-03").glob("*.jpg"))
+    assert len(organized) == 1
+    assert not list(dest.glob("Undated/*.jpg"))
+
+    from imageharbor.hashing import compute_sha256_b64url_bytes
+    sha = compute_sha256_b64url_bytes(_jpeg(1))
+    row = catalog.get_by_sha256(sha)
+    assert row is not None
+    assert row["date_tier"] == 30
+    assert row["date_source"] == "external_sidecar"
+
+
 def test_index_unrecognized_confidence_falls_back_and_is_counted(
     dirs, catalog: Catalog, tmp_path: Path
 ) -> None:
