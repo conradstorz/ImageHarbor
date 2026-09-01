@@ -73,7 +73,19 @@ CREATE TABLE IF NOT EXISTS face_scan (                -- work queue + idempotenc
 );
 
 CREATE TABLE IF NOT EXISTS clusters (
-  id           INTEGER PRIMARY KEY,
+  -- AUTOINCREMENT (not just INTEGER PRIMARY KEY): a plain rowid PK lets
+  -- SQLite hand out max(id)+1, which after `replace_clusters` deletes every
+  -- row for an embed_model and reinserts fresh ones, is free to recycle a
+  -- just-deleted id onto a brand-new row with completely different face
+  -- content. A stale id captured by a caller before the recluster (e.g.
+  -- `dashboard.people`'s pre-lock existence check, which releases the lock
+  -- before `confirm`/`merge` actually run) would then pass `confirm`'s and
+  -- `merge`'s own inside-the-lock existence check too -- it resolves, just
+  -- to the wrong cluster -- and silently write a person's identity onto the
+  -- wrong faces. AUTOINCREMENT (backed by `sqlite_sequence`) guarantees a
+  -- rowid is never reused for the life of the table, so a stale id can only
+  -- ever resolve to the *same* row it always did, or to nothing.
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
   embed_model  TEXT    NOT NULL,        -- never compared across models
   centroid     BLOB,
   face_count   INTEGER NOT NULL,
@@ -442,9 +454,12 @@ class FaceStore:
             if old_ids:
                 placeholders = ",".join("?" * len(old_ids))
                 # Proposals reference cluster ids that are about to stop
-                # existing; without this cleanup a plain (non-AUTOINCREMENT)
-                # `INTEGER PRIMARY KEY` could later reuse a deleted id and
-                # silently resurrect a stale, unrelated proposal row.
+                # existing; without this cleanup they'd become orphan rows
+                # pointing at nothing. `clusters.id` is AUTOINCREMENT, so a
+                # deleted id is never reused for a later, unrelated cluster
+                # -- but the orphans would still sit there unreferenced, and
+                # a future non-AUTOINCREMENT table wouldn't get this
+                # protection for free, so the cleanup stays.
                 self._conn.execute(
                     f"DELETE FROM proposals WHERE cluster_id IN ({placeholders})",
                     old_ids,
@@ -621,24 +636,23 @@ class FaceStore:
         Re-validates *cluster_id* here, inside the same lock acquisition that
         does the write -- mirroring `split`'s precedent. `dashboard.people`'s
         wrapper checks existence too, but releases `store.lock` between that
-        check and this call; `replace_clusters` can run in the gap and, since
-        `clusters.id` is a plain (non-AUTOINCREMENT) INTEGER PRIMARY KEY,
-        can make a validated id stop resolving to anything at all by the
-        time this runs. Without this check that case is a silent no-op --
-        zero rows matched, but a success is still returned, and the
-        `INSERT OR IGNORE` above would even leave a spurious unused `people`
-        row behind.
+        check and this call; `replace_clusters` can run in the gap. Without
+        this check a race that makes the id stop resolving to anything is a
+        silent no-op -- zero rows matched, but a success is still returned,
+        and the `INSERT OR IGNORE` above would even leave a spurious unused
+        `people` row behind.
 
-        This does NOT close every shape of the race: if the recluster
-        happens to recycle the id onto a *different*, currently real
-        cluster (rather than leaving it unused), this check sees a row and
-        proceeds -- there is no way to tell "the same cluster, still there"
-        from "a new cluster that happens to reuse the old id" without a
-        caller-supplied fingerprint of what it last saw, which no caller
-        here provides. Known, reported residual gap, not an oversight;
-        closing it needs cluster identity to survive a recluster (e.g.
-        AUTOINCREMENT ids, or a version stamp threaded through the HTTP
-        boundary) -- out of scope for this check.
+        Previously this check alone did NOT close every shape of the race:
+        `clusters.id` was a plain (non-AUTOINCREMENT) INTEGER PRIMARY KEY, so
+        a recluster could recycle a validated id onto a *different*,
+        currently real cluster -- this check would see a row and proceed,
+        writing the wrong identity. `clusters.id` is now
+        `INTEGER PRIMARY KEY AUTOINCREMENT` (see the schema comment), which
+        guarantees a rowid is never reused for the table's lifetime -- so a
+        stale id can only ever resolve to the same row it always did, or to
+        nothing. Combined with this existence check, that closes the race:
+        there is no longer a way for *cluster_id* to resolve to different
+        content than the caller last validated.
         """
         with self.lock:
             if self._conn.execute(
@@ -677,16 +691,17 @@ class FaceStore:
         Along with `confirm`, the only method that writes `clusters.person_id`.
 
         Re-validates every id in *cluster_ids* here, inside the same lock
-        acquisition that does the write -- see `confirm`'s docstring for why
-        (same residual gap applies: this catches an id that stopped
-        resolving to anything, not one recycled onto different-but-real
-        content). Checking all ids up front (rather than relying on the
-        `UPDATE ... WHERE id IN (...)` matching fewer rows than requested)
-        matters because a *partial* match is the dangerous case within what
-        this check *does* cover: some ids in the batch can be stale while
-        others are real, and a silent partial `UPDATE` would merge some
-        clusters onto *person_id* while quietly dropping the rest with no
-        signal to the caller that only part of the batch happened.
+        acquisition that does the write -- see `confirm`'s docstring for why,
+        including how pairing this check with `clusters.id` now being
+        AUTOINCREMENT closes the race fully (a stale id can no longer
+        resolve to different-but-real content). Checking all ids up front
+        (rather than relying on the `UPDATE ... WHERE id IN (...)` matching
+        fewer rows than requested) matters because a *partial* match is the
+        dangerous case within what this check covers: some ids in the batch
+        can be stale while others are real, and a silent partial `UPDATE`
+        would merge some clusters onto *person_id* while quietly dropping
+        the rest with no signal to the caller that only part of the batch
+        happened.
         """
         with self.lock:
             if not cluster_ids:

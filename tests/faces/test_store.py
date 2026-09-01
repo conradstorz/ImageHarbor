@@ -114,11 +114,12 @@ def test_confirm_raises_for_a_cluster_id_recycled_away_by_a_racing_recluster(sto
     # The reviewer's finding: dashboard.people.confirm's own `_cluster_exists`
     # check runs under a *separate* `with store.lock:` block that releases
     # before `store.confirm` is called -- a `replace_clusters` (whole-library
-    # recluster) can run in that gap. `clusters.id` is a plain
-    # (non-AUTOINCREMENT) INTEGER PRIMARY KEY, so a recluster that produces
-    # fewer clusters than before doesn't just drop the *content* of a
-    # validated id -- it can make the id itself stop existing. Simulated
-    # here directly (no threads needed): seed 3 single-face clusters, confirm
+    # recluster) can run in that gap. A recluster that produces fewer
+    # clusters than before doesn't just drop the *content* of a validated
+    # id -- it can make the id itself stop existing (this holds regardless
+    # of AUTOINCREMENT: a shrinking id space just means nothing ever gets
+    # inserted at that id again). Simulated here directly (no threads
+    # needed): seed 3 single-face clusters, confirm
     # one of them elsewhere first (so a real `person_id` exists, matching how
     # `merge` is exercised below), then race a second `replace_clusters` that
     # excludes the third face's photo entirely -- its old cluster id is
@@ -200,6 +201,80 @@ def test_merge_raises_naming_the_stale_id_and_leaves_the_valid_one_untouched(sto
     # The whole batch must fail together -- valid_cid must not have been
     # quietly merged while rz was silently skipped.
     assert store.person_for_cluster(valid_cid) is None
+
+
+def test_confirm_after_a_same_count_recluster_does_not_write_the_wrong_identity(store):
+    # This is the review finding's own worked example, reproduced exactly:
+    #
+    #   cluster->faces before: {1: [1], 2: [2], 3: [3]}
+    #   confirm(cluster_id=3, "Emma") -> HTTP 200
+    #   cluster->faces after : {1: [3], 2: [2], 3: [1]}
+    #   operator intended to name faces: [3]
+    #   faces actually named           : [1]
+    #   *** WRONG IDENTITY WRITTEN ***
+    #
+    # fix-task-2-report.md's "IMPORTANT" section reproduced this directly
+    # against fabdc12's fix (an inside-the-lock existence check alone) and
+    # confirmed it still happens: a recluster that keeps the *same* cluster
+    # count just permutes which content lands on which id, so the recycled
+    # id still exists -- the existence check is not enough to catch it.
+    #
+    # The `clusters.id INTEGER PRIMARY KEY AUTOINCREMENT` fix changes what
+    # the *recycled* id actually is: SQLite never reuses a rowid for the
+    # life of the table once AUTOINCREMENT is set, so a same-count recluster
+    # gets brand-new ids (here, 4/5/6) instead of falling back onto the
+    # freed 1/2/3. The stale id the operator captured (3) then resolves to
+    # nothing at all, and `confirm` (per fabdc12) raises `KeyError` instead
+    # of silently writing onto whatever now holds id 3.
+    ids = store.record_scan("d", "yunet", [
+        (_det(x=0), _vec([1, 0, 0]), "auraface"),
+        (_det(x=200), _vec([0, 1, 0]), "auraface"),
+        (_det(x=400), _vec([0, 0, 1]), "auraface"),
+    ])
+    face1, face2, face3 = ids
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(face1,), centroid=_vec([1, 0, 0])),
+        cluster.Cluster(face_ids=(face2,), centroid=_vec([0, 1, 0])),
+        cluster.Cluster(face_ids=(face3,), centroid=_vec([0, 0, 1])),
+    ])
+    cluster1, cluster2, cluster3 = store.cluster_ids()
+    assert (cluster1, cluster2, cluster3) == (1, 2, 3)  # first-ever inserts
+
+    # The operator, looking at the review queue, decides to confirm the
+    # cluster holding face3 -- id 3 -- as "Emma".
+    target_cluster_id = cluster3
+    assert store._conn.execute(
+        "SELECT 1 FROM faces WHERE cluster_id=? AND id=?", (target_cluster_id, face3)
+    ).fetchone() is not None
+
+    # The race: a whole-library recluster lands before the confirm call
+    # does, permuting content across the *same* three singleton clusters
+    # (face3 first this time, then face2, then face1) -- same count as
+    # before, so under the old plain INTEGER PRIMARY KEY this would recycle
+    # ids 1/2/3 right back, with id 3 now landing on face1 instead of face3.
+    store.replace_clusters("auraface", [
+        cluster.Cluster(face_ids=(face3,), centroid=_vec([0, 0, 1])),
+        cluster.Cluster(face_ids=(face2,), centroid=_vec([0, 1, 0])),
+        cluster.Cluster(face_ids=(face1,), centroid=_vec([1, 0, 0])),
+    ])
+    new_ids = store.cluster_ids()
+    # AUTOINCREMENT: brand-new ids, never falling back onto the freed 1/2/3.
+    assert target_cluster_id not in new_ids
+    assert new_ids == [4, 5, 6]
+
+    # The stale confirm call the operator's earlier click queued up: it
+    # still names id 3, which no longer resolves to anything.
+    with pytest.raises(KeyError, match=str(target_cluster_id)):
+        store.confirm(target_cluster_id, "Emma")
+
+    # Nothing was silently written onto whatever cluster now holds face1 --
+    # the wrong-identity write the review finding demonstrated must not
+    # have happened.
+    for cid in new_ids:
+        assert store.person_for_cluster(cid) is None
+    assert store._conn.execute(
+        "SELECT 1 FROM people WHERE name='Emma'"
+    ).fetchone() is None
 
 
 def test_split_rejects_a_face_id_not_in_the_cluster(store):
