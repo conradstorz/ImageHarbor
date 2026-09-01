@@ -128,6 +128,59 @@ def test_an_unreadable_photo_is_recorded_in_failed_files_not_the_breaker(library
     assert "faces" in row["last_error"].lower()
 
 
+def test_a_photo_that_fails_mid_decode_does_not_leak_its_file_handle(
+    library, monkeypatch
+):
+    """A decode that raises must still close the file it opened.
+
+    The success path is not where this can go wrong: Pillow's
+    ``ImageFile.load`` closes an exclusively-opened fp itself once the raster
+    is in memory, so a scan of a healthy library releases handles regardless
+    of how ``_scan_one`` is written -- which is why a happy-path version of
+    this test would pass against the leaking code and prove nothing.
+
+    The window is a file that *opens* and then fails: a valid header with a
+    truncated body. ``Image.open`` returns an object holding an open fp,
+    ``load`` raises, ``scan`` catches it and moves on, and the fp survives
+    until the garbage collector happens to run. Over a long ``watch --faces``
+    loop across a library with a tail of damaged files -- the population this
+    error path exists for -- that is an accumulating file-descriptor leak.
+
+    ``b"not an image"`` (used by the tests above) does not reach this: it
+    fails inside ``Image.open`` itself, so no image object is ever handed
+    back to leak.
+    """
+    dest, db, store = library
+    truncated = dest / "photo1.jpg"
+    intact = truncated.read_bytes()
+    truncated.write_bytes(intact[: len(intact) // 2])
+
+    opened = []
+    real_open = Image.open
+
+    def spy(fp, *args, **kwargs):
+        image = real_open(fp, *args, **kwargs)
+        opened.append(image)
+        return image
+
+    monkeypatch.setattr(runner.Image, "open", spy)
+
+    cat = Catalog(db)
+    result = runner.scan(cat, store, FakeDetector(), FakeEmbedder(),
+                         dest / ".crops", gate=runner.QualityGate(0.5, 10))
+    cat.close()
+
+    assert result.errors == 1, (
+        "the truncated file did not fail to decode -- this test is not "
+        "exercising the path it claims to"
+    )
+    assert opened, "Image.open was never called; the spy is not wired up"
+    for image in opened:
+        assert image.fp is None or image.fp.closed, (
+            f"{image} still holds an open file handle after scan() returned"
+        )
+
+
 def test_should_stop_halts_between_photos(library):
     dest, db, store = library
     cat = Catalog(db)

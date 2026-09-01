@@ -88,46 +88,51 @@ def _scan_one(
     store,
 ) -> tuple[int, int]:
     """Detect, gate, align, and embed one photo's faces. Returns (kept, rejected)."""
-    img = Image.open(path)
-    img.draft("RGB", DECODE_SIZE)
-    img.load()
+    # Context-managed, not a bare `Image.open`: on the success path Pillow
+    # closes an exclusive fp inside `load()` itself, but a file that opens
+    # and then fails to decode -- the truncated tail of a large library --
+    # would otherwise hold its handle until GC, once per damaged file, for
+    # the life of a `watch --faces` loop.
+    with Image.open(path) as img:
+        img.draft("RGB", DECODE_SIZE)
+        img.load()
 
-    detections = detector.detect(img)
+        detections = detector.detect(img)
 
-    records: list[tuple] = []
-    kept_detections = []
-    for det in detections:
-        if det.score < gate.min_score:
-            records.append((det, None, None, "low_score"))
-        elif min(det.w, det.h) < gate.min_box:
-            records.append((det, None, None, "too_small"))
+        records: list[tuple] = []
+        kept_detections = []
+        for det in detections:
+            if det.score < gate.min_score:
+                records.append((det, None, None, "low_score"))
+            elif min(det.w, det.h) < gate.min_box:
+                records.append((det, None, None, "too_small"))
+            else:
+                kept_detections.append(det)
+
+        crops = []
+        aligned_detections = []
+        for det in kept_detections:
+            try:
+                crops.append(align_crop(img, det.landmarks))
+            except DegenerateLandmarks:
+                records.append((det, None, None, "degenerate_landmarks"))
+            else:
+                aligned_detections.append(det)
+
+        # One `embed_batch` call per photo for every kept crop, not one per face.
+        if crops:
+            embeddings = embedder.embed_batch(crops)
         else:
-            kept_detections.append(det)
+            embeddings = np.zeros((0, embedder.dim), dtype=np.float32)
 
-    crops = []
-    aligned_detections = []
-    for det in kept_detections:
-        try:
-            crops.append(align_crop(img, det.landmarks))
-        except DegenerateLandmarks:
-            records.append((det, None, None, "degenerate_landmarks"))
-        else:
-            aligned_detections.append(det)
-
-    # One `embed_batch` call per photo for every kept crop, not one per face.
-    if crops:
-        embeddings = embedder.embed_batch(crops)
-    else:
-        embeddings = np.zeros((0, embedder.dim), dtype=np.float32)
-
-    photo_dir = crop_dir / digest[:2] / digest[2:4]
-    if crops:
-        photo_dir.mkdir(parents=True, exist_ok=True)
-    for i, (det, crop, embedding) in enumerate(
-        zip(aligned_detections, crops, embeddings)
-    ):
-        crop.save(photo_dir / f"{digest}-{i}.jpg", quality=85)
-        records.append((det, embedding, embedder.model_name, None))
+        photo_dir = crop_dir / digest[:2] / digest[2:4]
+        if crops:
+            photo_dir.mkdir(parents=True, exist_ok=True)
+        for i, (det, crop, embedding) in enumerate(
+            zip(aligned_detections, crops, embeddings)
+        ):
+            crop.save(photo_dir / f"{digest}-{i}.jpg", quality=85)
+            records.append((det, embedding, embedder.model_name, None))
 
     store.record_scan(digest, detector.model_name, records)
     return len(aligned_detections), len(records) - len(aligned_detections)
