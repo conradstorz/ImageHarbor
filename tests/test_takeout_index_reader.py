@@ -237,3 +237,52 @@ def test_member_path_shared_by_two_covered_archives_is_excluded(tmp_path):
     assert idx.covers("part-1.zip")
     assert idx.covers("part-2.zip")
     assert idx.sidecar_for("T/GP/a.jpg") is None
+
+
+def test_sidecar_path_shared_by_two_covered_archives_is_excluded(tmp_path):
+    # Mirrors `pairing.py`'s `PairingIndex.ambiguous_sidecars`: the index is
+    # keyed on bare member paths with no archive dimension, and the ingest
+    # layer's `self.owner` map (member path -> owning archive) is
+    # last-writer-wins, so a sidecar path duplicated across archives can
+    # silently hand a photo another archive's sidecar bytes. Two different
+    # media (one per archive) each pair to a sidecar sharing the SAME path --
+    # the reader must refuse both pairings, not just guess one.
+    db = make_index(
+        tmp_path / "i.sqlite",
+        archives=(_ARCHIVE_1_COVERED, _ARCHIVE_2_COVERED),
+        sidecars=[
+            (1, "part-1.zip", "T/GP/a.jpg.json", "a.jpg.json"),
+            (2, "part-2.zip", "T/GP/a.jpg.json", "a.jpg.json"),
+        ],
+        media=[
+            ("part-1.zip", "T/GP/a.jpg", "GP", "GP", "a.jpg", 1, "exact", "own"),
+            ("part-2.zip", "T/GP/b.jpg", "GP", "GP", "b.jpg", 2, "exact", "own"),
+        ])
+    idx = index_reader.IndexPairings.open(
+        db, {"part-1.zip": stats_for(), "part-2.zip": stats_for()})
+    assert idx.covers("part-1.zip")
+    assert idx.covers("part-2.zip")
+    assert idx.sidecar_for("T/GP/a.jpg") is None
+    assert idx.sidecar_for("T/GP/b.jpg") is None
+
+
+def test_sidecar_shared_by_multiple_media_in_one_archive_is_not_ambiguous(tmp_path):
+    # An original's sidecar legitimately backs several `-edited` derivatives
+    # within the SAME archive (the ordinary "related" case, 91% of the
+    # non-own pairings measured for this feature). That must not trip the
+    # sidecar-side ambiguity guard, which only refuses a sidecar path seen
+    # under more than one DISTINCT archive.
+    db = make_index(
+        tmp_path / "i.sqlite",
+        sidecars=[(1, "part-1.zip", "T/GP/a.jpg.json", "a.jpg.json")],
+        media=[
+            ("part-1.zip", "T/GP/a.jpg", "GP", "GP", "a.jpg", 1, "exact", "own"),
+            ("part-1.zip", "T/GP/a-edited.jpg", "GP", "GP", "a-edited.jpg", 1,
+             "edited", "related"),
+        ])
+    idx = index_reader.IndexPairings.open(db, {"part-1.zip": stats_for()})
+    a = idx.sidecar_for("T/GP/a.jpg")
+    edited = idx.sidecar_for("T/GP/a-edited.jpg")
+    assert a.sidecar == "T/GP/a.jpg.json"
+    assert edited.sidecar == "T/GP/a.jpg.json"
+    assert edited.confidence == "related"

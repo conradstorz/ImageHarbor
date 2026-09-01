@@ -150,14 +150,22 @@ class IndexPairings:
     ) -> dict[str, IndexedPairing]:
         rows: list[tuple[str, str | None, str, str]] = []
         counts: dict[str, int] = {}
-        for m_path, m_archive, s_path, rule, confidence in con.execute(
-            "SELECT m.path, m.archive, s.path, m.rule, m.confidence"
+        # Archives (not raw occurrences) a given sidecar path is seen under:
+        # one sidecar shared by several media rows in the SAME archive (an
+        # original's sidecar handed to many `-edited` derivatives, the
+        # ordinary "related" case) must not look ambiguous, so this tracks
+        # distinct archives per path rather than counting join rows.
+        sidecar_archives: dict[str, set[str]] = {}
+        for m_path, m_archive, s_path, s_archive, rule, confidence in con.execute(
+            "SELECT m.path, m.archive, s.path, s.archive, m.rule, m.confidence"
             " FROM media m LEFT JOIN sidecar s ON s.id = m.sidecar_id"
         ):
             if m_archive not in covered:
                 continue
             rows.append((m_path, s_path, rule, confidence))
             counts[m_path] = counts.get(m_path, 0) + 1
+            if s_path is not None and s_archive in covered:
+                sidecar_archives.setdefault(s_path, set()).add(s_archive)
         # A member path present in more than one COVERED archive is
         # indistinguishable here, for the same reason `pairing.py`'s
         # `ambiguous_media` refuses to pair one: this index is keyed on bare
@@ -166,9 +174,22 @@ class IndexPairings:
         # bytes with another archive's sidecar. Excluded entirely, so
         # `sidecar_for` returns None and the caller falls back to
         # `pairing.py` (which applies the identical refusal there).
+        #
+        # A SIDECAR path present in more than one covered archive gets the
+        # same refusal, mirroring `pairing.py`'s `ambiguous_sidecars`: the
+        # index is keyed on bare member paths with no archive dimension, and
+        # the ingest layer's `self.owner` map (member path -> owning archive)
+        # is last-writer-wins, so a sidecar path duplicated across archives
+        # can silently hand a photo another archive's sidecar bytes.
+        ambiguous_sidecars = {
+            path for path, archives in sidecar_archives.items()
+            if len(archives) > 1
+        }
         out: dict[str, IndexedPairing] = {}
         for m_path, s_path, rule, confidence in rows:
             if counts[m_path] > 1:
+                continue
+            if s_path is not None and s_path in ambiguous_sidecars:
                 continue
             out[m_path] = IndexedPairing(
                 sidecar=s_path, confidence=confidence, rule=rule)
