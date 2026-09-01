@@ -699,3 +699,36 @@ Base for this round: e08bc4b
 ## FIX ROUND COMPLETE -- all 7 findings fixed, all reviews Approved (0 Critical/Important
 open). See docs/superpowers/plans/2026-09-01-final-review-fixes.md and
 .superpowers/sdd/final-review-fixes.md for the round report.
+
+## FINAL WHOLE-BRANCH REVIEW (opus) — 2 Critical, 4 Important, 2 elevated Minors — ALL FIXED
+Both Criticals were CROSS-TASK INTERACTIONS that no per-task gate could have seen, and both
+were REPRODUCED rather than reasoned about:
+  C1: `watch` broke for every user who does NOT want faces. cli.py imported dashboard.server
+      unconditionally BEFORE the --no-dashboard check; that pulls people.py -> store.py's
+      module-scope `import numpy`, and numpy ships only in the faces extra. 1144 green tests
+      hid it because the dev venv and the Dockerfile both install the extra, and
+      test_extra.py simulated a missing extra by blocking ONLY onnxruntime.
+      Three tasks each did something reasonable: 13 noted the numpy import but reasoned only
+      about the `faces status` gate, 14 imported FaceStore into people.py, 16 imported people
+      into server.py. The defect existed in none of them and in all of them.
+  C2: a recluster landing mid-confirm WROTE THE OPERATOR'S NAME ONTO A DIFFERENT FACE SET.
+      confirm() released the store lock between its existence check and its write, and
+      clusters.id was a plain INTEGER PRIMARY KEY, so ids were RECYCLED after
+      replace_clusters' DELETE. Reviewer's reproduction: intended to name faces [3], actually
+      named faces [1]. The exact failure invariant 2 exists to prevent.
+      NOTE: the first fix (an inside-the-lock existence check, mirroring FaceStore.split's
+      precedent) did NOT close the reproduction -- a recycled id still passes an existence
+      check. It took AUTOINCREMENT on clusters.id to genuinely close it. Worth remembering:
+      the obvious fix for a TOCTOU is not enough when the identifier itself is reusable.
+Controller re-verified both: `watch --help` imports cleanly with numpy AND onnxruntime blocked
+at the meta-path; cluster ids no longer reuse (4,5,6 after a recluster of 1,2,3) and a stale
+id is refused.
+Also fixed: the crop-rank contract (two discriminating mutations passed 239 tests -- a
+regression would show the operator face A's crop while asking them to name face B); the
+recluster gate spinning forever on a zero-cluster library (a full rglob over 77,000 sidecars
+every interval); the untested detect_model threading (mutation passed 290 tests, and the
+consequence was a permanent full-library sidecar rewrite every cycle); the false
+"only confirm/merge write person_id" invariant (replace_clusters also writes it, to RESTORE
+an existing confirmation -- reworded rather than the behaviour changed); the untested
+model-dir precedence; and the dead dashboard faces toggle whose comment claimed behaviour
+that did not exist.
