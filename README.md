@@ -2,6 +2,16 @@
 
 ImageHarbor: Classify. Verify. Preserve.
 
+> **Where this fits.** ImageHarbor is the *daily* tool — it keeps a photo
+> library organized and identifies what is in it, continuously. Three companion
+> tools handle the *occasional* job of getting files out of Google's cloud and
+> working out what they are:
+> [Google-Takeout-Downloader](https://github.com/conradstorz/Google-Takeout-Downloader)
+> fetches an export, [Takeout Scout](https://github.com/conradstorz/Takeout-Scout)
+> explores it in a browser, and
+> [Takeout_Inventory](https://github.com/conradstorz/Takeout_Inventory) catalogs
+> it for machines. See [ROADMAP.md](ROADMAP.md).
+
 ImageHarbor is a deterministic, resumable CLI that organizes a photo library. It
 reads from a read-only source, never modifies originals, content-addresses every
 file by SHA-256, copies it into an organized tree, verifies the copy, and records
@@ -175,6 +185,8 @@ without the label would silently misattribute them.
 
 ## Learn more
 
+- [`ROADMAP.md`](ROADMAP.md) — where this sits among its companion projects,
+  what is next, and what has been settled.
 - [`CLAUDE.md`](CLAUDE.md) — architecture, module responsibilities, and the
   invariants that must not be broken.
 - [`docs/superpowers/specs/2026-08-11-facts-first-pipeline-design.md`](docs/superpowers/specs/2026-08-11-facts-first-pipeline-design.md) —
