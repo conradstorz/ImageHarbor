@@ -148,7 +148,7 @@ exists yet) rather than reclustering on every single poll.
 ### Reviewing and confirming names
 
 Nothing is written to a photo until a human confirms a cluster in the
-dashboard's People panel (`http://<docker-host>:8080/`) — clustering only
+dashboard's People panel (`http://<docker-host>:8087/`) — clustering only
 ever *proposes* a name from the overlap between a cluster and Google's own
 tags. Faces never rename or move a file and never appear in a filename
 either way.
