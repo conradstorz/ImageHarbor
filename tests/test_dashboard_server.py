@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import socket
 import tempfile
 import threading
@@ -88,17 +89,39 @@ def _raw_request(
     *,
     host: str | None = "localhost",
     body: bytes = b"",
-    headers: dict[str, str] | None = None,
+    headers: dict[str, str | None] | None = None,
+    extra_header_lines: list[str] | None = None,
 ) -> bytes:
+    """Build a raw HTTP/1.1 request.
+
+    A POST gets ``Content-Type: application/json`` by default (R2 Task 3 --
+    every real POST in this API sends JSON) -- pass ``headers={"Content-Type":
+    "text/plain"}`` to override it, or ``headers={"Content-Type": None}`` to
+    omit the header entirely. ``extra_header_lines`` appends raw header lines
+    verbatim, after the normal ones -- used by the duplicate-Host-header test,
+    which needs two ``Host:`` lines and a plain ``dict`` can't hold that.
+    """
     lines = [f"{method} {path} HTTP/1.1"]
     if host is not None:
         lines.append(f"Host: {host}")
-    hdrs = dict(headers or {})
-    if body and "Content-Length" not in hdrs:
-        hdrs["Content-Length"] = str(len(body))
-    for key, value in hdrs.items():
+    hdrs: dict[str, str | None] = dict(headers or {})
+    if method == "POST" and "Content-Type" not in hdrs:
+        hdrs["Content-Type"] = "application/json"
+    resolved = {k: v for k, v in hdrs.items() if v is not None}
+    if body and "Content-Length" not in resolved:
+        resolved["Content-Length"] = str(len(body))
+    for key, value in resolved.items():
         lines.append(f"{key}: {value}")
-    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+    for line in extra_header_lines or []:
+        lines.append(line)
+    # HTTP header bytes are ISO-8859-1 (Latin-1) on the wire -- that's what
+    # `http.client`/`http.server` actually encode/decode with -- NOT UTF-8.
+    # A header value within Latin-1's range (e.g. "café") round-trips
+    # correctly only when encoded that way here; encoding as UTF-8 would
+    # send two-byte sequences that the server's Latin-1 decode would then
+    # mangle into mojibake, which is a bug in this harness, not in the
+    # server under test.
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
     return head + body
 
 
@@ -112,12 +135,19 @@ class _ResponseSocketLike:
         return io.BytesIO(self._data)
 
 
-def _dispatch(handler_cls: type, method: str, path: str, **kwargs: Any):
+def _dispatch(
+    handler_cls: type,
+    method: str,
+    path: str,
+    *,
+    extra_header_lines: list[str] | None = None,
+    **kwargs: Any,
+):
     """Send one request through *handler_cls* with no socket, return the response.
 
     Returns (status, headers-dict, body-bytes).
     """
-    raw = _raw_request(method, path, **kwargs)
+    raw = _raw_request(method, path, extra_header_lines=extra_header_lines, **kwargs)
     sock = _FakeSocket(raw)
     handler_cls(sock, ("127.0.0.1", 54321), _DummyServer())
     resp = HTTPResponse(_ResponseSocketLike(bytes(sock.sent)))
@@ -157,7 +187,8 @@ def _request(
     hdrs = dict(headers or {})
     if token_header is not None:
         hdrs["X-Dashboard-Token"] = token_header
-    cat = Catalog(Path(tempfile.mkdtemp()) / "catalog.db")
+    tmp_dir = tempfile.mkdtemp()
+    cat = Catalog(Path(tmp_dir) / "catalog.db")
     try:
         ctrl = ControlPlane(cat, env_interval=300, env_enrich=True)
         handler_cls = dashboard_server.make_handler(
@@ -168,6 +199,7 @@ def _request(
         )
     finally:
         cat.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _dispatch_json(handler_cls: type, method: str, path: str, payload: Any = None, **kwargs: Any):
@@ -751,3 +783,150 @@ def test_serve_binds_wildcard_only_on_request(
         stop_event.set()
         if thread is not None:
             thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Token comparison must never raise on non-ASCII input (R2 Task 1)
+# ---------------------------------------------------------------------------
+#
+# `hmac.compare_digest` raises `TypeError` when given `str` arguments that
+# contain non-ASCII characters (documented caveat: "only ascii characters are
+# supported" for str/str comparisons) -- which would surface as a bare 500
+# with a traceback, not the clean 401 a wrong token deserves.
+
+
+def test_non_ascii_token_header_with_ascii_configured_token_is_401_not_500():
+    status, _, body = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="s3cret", token_header="café",
+    )
+    assert status == 401
+    assert b"Traceback" not in body
+
+
+def test_non_ascii_configured_token_with_matching_header_succeeds():
+    status, _, _ = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="café", token_header="café",
+    )
+    assert status == 200
+
+
+def test_non_ascii_configured_token_with_wrong_header_is_401():
+    status, _, body = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="café", token_header="wrong",
+    )
+    assert status == 401
+    assert b"Traceback" not in body
+
+
+# ---------------------------------------------------------------------------
+# Stalled body read -> clean 408 (R2 Task 2)
+# ---------------------------------------------------------------------------
+
+
+class _TimingOutRfile:
+    """Stand-in for a socket-backed rfile whose read stalls past the
+    handler's own `timeout` and raises, exactly like a real slowloris client
+    would once `settimeout` fires."""
+
+    def read(self, _length: int) -> bytes:
+        raise TimeoutError("simulated stalled client")
+
+
+def test_stalled_body_read_returns_408_not_a_traceback(handler_cls, caplog) -> None:
+    handler = handler_cls.__new__(handler_cls)
+    handler.headers = {"Content-Length": "16"}  # type: ignore[attr-defined]
+    handler.rfile = _TimingOutRfile()  # type: ignore[attr-defined]
+
+    value, status, message = handler._read_json_body()
+
+    assert value is None
+    assert status == 408
+    assert message == "request body timed out"
+    assert not any(r.levelname in ("ERROR", "CRITICAL") for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CSRF: POSTs require Content-Type: application/json (R2 Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_post_with_text_plain_content_type_is_415(handler_cls) -> None:
+    status, _, body = _dispatch(
+        handler_cls,
+        "POST",
+        "/api/pause",
+        body=b'{"paused": true}',
+        headers={"Content-Type": "text/plain"},
+    )
+    assert status == 415
+    assert b"Traceback" not in body
+
+
+def test_post_with_application_json_and_charset_is_accepted(handler_cls) -> None:
+    status, _, _ = _dispatch(
+        handler_cls,
+        "POST",
+        "/api/pause",
+        body=b'{"paused": true}',
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    assert status == 200
+
+
+def test_post_with_missing_content_type_is_415(handler_cls) -> None:
+    status, _, body = _dispatch(
+        handler_cls,
+        "POST",
+        "/api/pause",
+        body=b'{"paused": true}',
+        headers={"Content-Type": None},
+    )
+    assert status == 415
+    assert b"Traceback" not in body
+
+
+# ---------------------------------------------------------------------------
+# Host hygiene (R2 Task 4)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_host_headers_are_refused(handler_cls) -> None:
+    status, _, _ = _dispatch(
+        handler_cls, "GET", "/healthz",
+        extra_header_lines=["Host: evil.example"],
+    )
+    assert status == 403
+
+
+def test_duplicate_host_headers_are_refused_on_post(handler_cls) -> None:
+    status, _, _ = _dispatch(
+        handler_cls, "POST", "/api/pause",
+        body=b'{"paused": true}',
+        extra_header_lines=["Host: evil.example"],
+    )
+    assert status == 403
+
+
+def test_host_with_trailing_dot_is_allowed(handler_cls) -> None:
+    status, _, _ = _dispatch(handler_cls, "GET", "/healthz", host="localhost.")
+    assert status == 200
+
+
+def test_forbidden_host_message_names_the_flag_and_env_var(handler_cls) -> None:
+    status, _, body = _dispatch(handler_cls, "GET", "/healthz", host="evil.example")
+    assert status == 403
+    parsed = json.loads(body.decode("utf-8"))
+    assert "--dashboard-allowed-hosts" in parsed["error"]
+    assert "IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS" in parsed["error"]
+
+
+# ---------------------------------------------------------------------------
+# Handler timeout is pinned (R2 Task 5)
+# ---------------------------------------------------------------------------
+
+
+def test_handler_timeout_is_pinned_to_10_seconds(handler_cls) -> None:
+    assert handler_cls.timeout == 10

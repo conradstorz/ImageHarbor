@@ -39,7 +39,7 @@ needed to pull). `docker compose up -d` after a pull upgrades in place.
 To build and run a local version instead:
 
 ```
-docker compose build
+docker build -t ghcr.io/conradstorz/imageharbor:latest .
 docker compose up -d
 docker compose logs -f
 ```
@@ -51,8 +51,8 @@ the NAS. Originals are never modified.
 ## 4. Smoke test
 
 ```
-docker run --rm imageharbor:latest --help
-docker run --rm imageharbor:latest watch --help
+docker run --rm ghcr.io/conradstorz/imageharbor:latest --help
+docker run --rm ghcr.io/conradstorz/imageharbor:latest watch --help
 ```
 
 Then verify integrity of the organized library at any time:
@@ -101,7 +101,7 @@ model, in one table:
 | Layer | Default | On hpz440 |
 |---|---|---|
 | Bind address | `127.0.0.1` (loopback only) | `0.0.0.0` in-container; reachable only via the published port on the tailnet |
-| Mutating routes (`POST /api/*`) | open on loopback | require `X-Dashboard-Token` = `IMAGEHARBOR_DASHBOARD_TOKEN` (the page prompts once and remembers it per-browser) |
+| Mutating routes (`POST /api/*`) | open on loopback — before this release's `Content-Type` guard, that meant any website your own browser had open could still reach it; POSTs now require `application/json` (CORS-preflight-gated), closing that gap | require `X-Dashboard-Token` = `IMAGEHARBOR_DASHBOARD_TOKEN` (the page prompts once and remembers it per-browser) |
 | Host-header allowlist | loopback names only | must list every name/IP the dashboard is browsed as (`IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS`) — this is the DNS-rebinding defense |
 | Read-only routes (`/api/stats`, face crops) | no token | reachable by anyone who can reach the port and passes the Host check — treat the tailnet as the trust boundary |
 

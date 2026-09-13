@@ -82,7 +82,11 @@ library with no such file is the normal case and reports `0`, not an error.
 
 `imageharbor watch` serves a small operational dashboard on
 `http://<host>:8080/` by default (`--dashboard-port` to change the port,
-`--no-dashboard` to disable it). It reports library stats, evidence quality
+`--no-dashboard` to disable it). It binds to loopback (`127.0.0.1`) only by
+default — reach it from another host with `--dashboard-host 0.0.0.0` plus a
+`--dashboard-token` and `--dashboard-allowed-hosts` (see
+`docs/deploy-docker.md`'s "Security model" for the full exposure story). It
+reports library stats, evidence quality
 (the date/descriptor tier tables above, as live counts), work queues, pass
 history, and a projection of when the remaining backlog will clear — or an
 honest `stalled`/`unknown` when the evidence doesn't support a number (AI

@@ -613,6 +613,24 @@ def watch(
         h.strip() for h in dashboard_allowed_hosts.split(",") if h.strip()
     ]
 
+    # Exposed-without-token warning (R2 pre-merge finding): the loopback
+    # bind is the mitigation for an unset token (see --dashboard-token's own
+    # help text above) -- a non-loopback bind with no token means every
+    # mutating endpoint is open to anyone who can reach the port. One
+    # warning, not per-cycle noise, matching the --faces-unavailable idiom
+    # below.
+    if (
+        dashboard_host not in {"127.0.0.1", "::1", "localhost"}
+        and dashboard_token is None
+        and not no_dashboard
+    ):
+        click.echo(
+            f"Dashboard is bound to {dashboard_host} with no --dashboard-token: "
+            "every mutating endpoint is open to anyone who can reach the port. "
+            "Set IMAGEHARBOR_DASHBOARD_TOKEN.",
+            err=True,
+        )
+
     stop_event = threading.Event()
 
     def _handle(signum, _frame):

@@ -489,11 +489,17 @@ Module responsibilities:
   reason.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
   `catalog list/get`, `takeout ingest/status`, `sidecar backfill`, `faces
-  scan/cluster/calibrate/status/models download`). `watch` gains two
+  scan/cluster/calibrate/status/models download`). `watch` gains five
   dashboard flags alongside its existing `--sidecar`-style options:
-  `--dashboard-port` (`IMAGEHARBOR_DASHBOARD_PORT`, default `8080`) and
-  `--no-dashboard` (a bare flag; the dashboard is on by default), plus four
-  faces flags: `--faces/--no-faces` (`IMAGEHARBOR_FACES`, off by default —
+  `--dashboard-port` (`IMAGEHARBOR_DASHBOARD_PORT`, default `8080`),
+  `--no-dashboard` (a bare flag; the dashboard is on by default),
+  `--dashboard-host` (`IMAGEHARBOR_DASHBOARD_HOST`, default `127.0.0.1` —
+  loopback-only unless explicitly widened), `--dashboard-token`
+  (`IMAGEHARBOR_DASHBOARD_TOKEN`, unset by default — POSTs are open on the
+  loopback bind, and `watch` logs one warning if the dashboard is bound
+  off-loopback with no token set), and `--dashboard-allowed-hosts`
+  (`IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS`, comma-separated extra hostnames
+  beyond the always-allowed loopback names), plus four faces flags: `--faces/--no-faces` (`IMAGEHARBOR_FACES`, off by default —
   a new, heavier, opt-in extra must not start running face detection just
   because `watch` was invoked), `--face-model-dir`
   (`IMAGEHARBOR_FACE_MODEL_DIR`), `--face-threshold`
@@ -513,8 +519,21 @@ Module responsibilities:
   quality, work queues, pass history, a projection of remaining work, and (if
   a `FaceStore` was wired in) a People review queue, plus pause/resume, a
   poll-interval override, and AI-enrichment/faces toggles. See
-  `docs/superpowers/specs/2026-08-19-dashboard-design.md` for the full design.
-  Five modules, split the same way `sidecar_schema.py` is split from
+  `docs/superpowers/specs/2026-08-19-dashboard-design.md` for the full design
+  (superseded on its exposure posture — see the note at its top —
+  by `docs/deploy-docker.md`'s "Security model", which this paragraph
+  summarizes). `watch` binds the dashboard to loopback (`127.0.0.1`) by
+  default; reaching it from another host requires explicitly setting
+  `--dashboard-host`. `server.py` (`imageharbor/dashboard/server.py`) then
+  gates every request behind three checks: a Host-header allowlist (loopback
+  names always accepted; anything else must be listed in
+  `--dashboard-allowed-hosts`), a shared-secret token on every POST
+  (`X-Dashboard-Token`, compared against `--dashboard-token` with
+  `hmac.compare_digest` on UTF-8-encoded bytes — never raw `str`, which
+  raises on non-ASCII input), and a `Content-Type: application/json`
+  requirement on every POST (a CSRF defense — it forces a CORS preflight,
+  closing the tokenless-loopback text/plain hole a plain cross-origin POST
+  would otherwise exploit). Five modules, split the same way `sidecar_schema.py` is split from
   `sidecar.py`: `projections.py` (pure, no I/O — the logic most likely to be
   wrong), `stats.py` (reads the catalog — and, when given one, a `FaceStore`
   — into the `/api/stats` document), `control.py` (the pause flag and the
