@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import json
 import socket
+import tempfile
 import threading
 from http.client import HTTPResponse
 from pathlib import Path
@@ -85,10 +86,13 @@ def _raw_request(
     method: str,
     path: str,
     *,
+    host: str | None = "localhost",
     body: bytes = b"",
     headers: dict[str, str] | None = None,
 ) -> bytes:
-    lines = [f"{method} {path} HTTP/1.1", "Host: test"]
+    lines = [f"{method} {path} HTTP/1.1"]
+    if host is not None:
+        lines.append(f"Host: {host}")
     hdrs = dict(headers or {})
     if body and "Content-Length" not in hdrs:
         hdrs["Content-Length"] = str(len(body))
@@ -120,6 +124,37 @@ def _dispatch(handler_cls: type, method: str, path: str, **kwargs: Any):
     resp.begin()
     body = resp.read()
     return resp.status, dict(resp.getheaders()), body
+
+
+def _request(
+    method: str,
+    path: str,
+    *,
+    host: str | None = "localhost",
+    allowed_hosts: frozenset[str] = frozenset(),
+    body: bytes = b"",
+    headers: dict[str, str] | None = None,
+):
+    """Dispatch one request through a *fresh, throwaway* handler.
+
+    Used only by the Host-header allowlist tests below, which care about
+    the gate firing before any routing -- not about a seeded catalog -- so
+    each call gets its own disposable in-memory catalog/control rather than
+    reaching for the module's `handler_cls` fixture (which bakes in a fixed
+    `allowed_hosts=frozenset()` at fixture-construction time, before a test
+    body gets to choose one).
+    """
+    cat = Catalog(Path(tempfile.mkdtemp()) / "catalog.db")
+    try:
+        ctrl = ControlPlane(cat, env_interval=300, env_enrich=True)
+        handler_cls = dashboard_server.make_handler(
+            cat, ctrl, allowed_hosts=allowed_hosts
+        )
+        return _dispatch(
+            handler_cls, method, path, host=host, body=body, headers=headers
+        )
+    finally:
+        cat.close()
 
 
 def _dispatch_json(handler_cls: type, method: str, path: str, payload: Any = None, **kwargs: Any):
@@ -532,6 +567,45 @@ def test_index_returns_200_html(handler_cls) -> None:
     assert status == 200
     assert headers.get("Content-Type", "").startswith("text/html")
     assert b"<html" in body.lower() or b"<!doctype" in body.lower()
+
+
+# ---------------------------------------------------------------------------
+# Host-header allowlist (DNS-rebinding defense)
+# ---------------------------------------------------------------------------
+
+
+def test_a_request_with_a_foreign_host_header_is_refused():
+    # DNS-rebinding defense: evil.example resolves to this box, browser sends
+    # Host: evil.example -- the server must refuse to serve it.
+    status, headers, body = _request("GET", "/api/stats", host="evil.example")
+    assert status == 403
+
+
+def test_a_request_with_no_host_header_is_refused():
+    status, headers, body = _request("GET", "/api/stats", host=None)
+    assert status == 403
+
+
+def test_loopback_hosts_are_always_allowed():
+    for host in ("localhost", "localhost:8080", "127.0.0.1", "127.0.0.1:9999"):
+        status, headers, body = _request("GET", "/healthz", host=host)
+        assert status == 200, host
+
+
+def test_a_configured_allowed_host_is_accepted_with_any_port():
+    # handler built with allowed_hosts frozenset including "hpz440.tailnet"
+    status, headers, body = _request(
+        "GET", "/healthz", host="hpz440.tailnet:8087",
+        allowed_hosts=frozenset({"hpz440.tailnet"}),
+    )
+    assert status == 200
+
+
+def test_host_matching_is_case_insensitive_and_handles_ipv6_brackets():
+    status, _, _ = _request("GET", "/healthz", host="LOCALHOST:8080")
+    assert status == 200
+    status, _, _ = _request("GET", "/healthz", host="[::1]:8080")
+    assert status == 200
 
 
 # ---------------------------------------------------------------------------

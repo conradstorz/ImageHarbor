@@ -28,6 +28,7 @@ import json
 import logging
 import math
 import threading
+from collections.abc import Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -69,6 +70,31 @@ MAX_BODY_BYTES = 64 * 1024
 # ever being "defended against on read" instead of rejected outright.
 _SETTINGS_KEYS = ("interval", "enrich", "faces")
 
+# Hostnames the dashboard always answers for, regardless of what an operator
+# configures via --dashboard-allowed-hosts -- the loopback names a browser or
+# curl on this same box legitimately uses.
+_ALWAYS_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _host_allowed(header_value: str | None, allowed: frozenset[str]) -> bool:
+    """Whether a request's Host header names this server.
+
+    DNS-rebinding defense: a browser at an attacker's page can be pointed at
+    a hostname that resolves to this machine; the Host header still carries
+    the attacker's name. Absent Host is refused too -- every legitimate
+    client (browser, curl, the compose healthcheck) sends one. Matching is
+    on the hostname alone (port stripped, case-folded, IPv6 brackets
+    removed): the port is already fixed by the socket we are serving on.
+    """
+    if not header_value:
+        return False
+    host = header_value.strip().lower()
+    if host.startswith("["):          # [::1]:8080
+        host = host[1:].partition("]")[0]
+    else:
+        host = host.partition(":")[0]
+    return host in _ALWAYS_ALLOWED_HOSTS or host in allowed
+
 
 def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload).encode("utf-8")
@@ -107,6 +133,7 @@ def make_handler(
     breaker: CircuitBreaker | None = None,
     store: FaceStore | None = None,
     crop_dir: Path | None = None,
+    allowed_hosts: frozenset[str] = frozenset(),
 ) -> type[BaseHTTPRequestHandler]:
     """Build a ``BaseHTTPRequestHandler`` subclass closed over one dashboard.
 
@@ -124,10 +151,22 @@ def make_handler(
     The People routes must then degrade to a plain 404 rather than raising:
     the same "dashboard failure never stops organizing" rule, applied to "this
     run has no face pipeline" rather than to a query that raised.
+
+    ``allowed_hosts`` is additional to ``_ALWAYS_ALLOWED_HOSTS`` (see
+    :func:`_host_allowed`) -- an empty default keeps every caller that does
+    not configure ``--dashboard-allowed-hosts`` accepting exactly the
+    loopback names it always did.
     """
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ImageHarborDashboard/1"
+
+        # Closes the slowloris/unbounded-read DoS: a stalled client's
+        # `rfile.read` now raises `TimeoutError` after 10s instead of
+        # hanging the handler thread forever. The existing per-handler
+        # `except Exception` in do_GET/do_POST turns that into a closed
+        # connection, never a crash -- never-stop-the-watcher holds.
+        timeout = 10
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
             # Route access logging through the project's logger rather than
@@ -195,6 +234,13 @@ def make_handler(
 
         def do_GET(self) -> None:  # noqa: N802 (http.server's naming convention)
             try:
+                if not _host_allowed(self.headers.get("Host"), allowed_hosts):
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "host header not recognized; see "
+                                  "--dashboard-allowed-hosts"},
+                    )
+                    return
                 if self.path == "/":
                     self._handle_index()
                 elif self.path == "/api/stats":
@@ -213,6 +259,13 @@ def make_handler(
 
         def do_POST(self) -> None:  # noqa: N802
             try:
+                if not _host_allowed(self.headers.get("Host"), allowed_hosts):
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "host header not recognized; see "
+                                  "--dashboard-allowed-hosts"},
+                    )
+                    return
                 if self.path == "/api/pause":
                     self._handle_pause()
                 elif self.path == "/api/settings":
@@ -480,6 +533,7 @@ def serve(
     breaker: CircuitBreaker | None = None,
     store: FaceStore | None = None,
     crop_dir: Path | None = None,
+    allowed_hosts: Sequence[str] = (),
     stop_event: threading.Event,
 ) -> threading.Thread | None:
     """Start the dashboard on a daemon thread, sharing *stop_event* with the caller.
@@ -502,8 +556,16 @@ def serve(
     `docker stop` (which sets *stop_event*) still triggers a clean
     `server_close()`.
     """
+    normalized_hosts = frozenset(
+        h.strip().lower() for h in allowed_hosts if h.strip()
+    )
     handler_cls = make_handler(
-        catalog, control, breaker=breaker, store=store, crop_dir=crop_dir
+        catalog,
+        control,
+        breaker=breaker,
+        store=store,
+        crop_dir=crop_dir,
+        allowed_hosts=normalized_hosts,
     )
     try:
         httpd = _DashboardHTTPServer(("0.0.0.0", port), handler_cls)

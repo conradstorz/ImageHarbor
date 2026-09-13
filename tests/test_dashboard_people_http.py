@@ -62,7 +62,7 @@ class _DummyServer:
 def _raw_request(
     method: str, path: str, *, body: bytes = b"", headers: dict[str, str] | None = None
 ) -> bytes:
-    lines = [f"{method} {path} HTTP/1.1", "Host: test"]
+    lines = [f"{method} {path} HTTP/1.1", "Host: localhost"]
     hdrs = dict(headers or {})
     if body and "Content-Length" not in hdrs:
         hdrs["Content-Length"] = str(len(body))
