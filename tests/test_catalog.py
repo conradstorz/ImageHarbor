@@ -225,33 +225,33 @@ def test_source_seen_upsert_updates(catalog: Catalog) -> None:
 
 
 def test_taxonomy_seed_insert_get_children(catalog: Catalog) -> None:
-    assert catalog.taxonomy_is_empty() is True
-    catalog.taxonomy_insert("500", None, "events", "500-events")
-    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
-    assert catalog.taxonomy_is_empty() is False
-    row = catalog.taxonomy_get("540")
+    assert catalog.taxonomy_store.is_empty() is True
+    catalog.taxonomy_store.insert("500", None, "events", "500-events")
+    catalog.taxonomy_store.insert("540", "500", "holidays", "540-holidays")
+    assert catalog.taxonomy_store.is_empty() is False
+    row = catalog.taxonomy_store.get("540")
     assert row["label"] == "holidays"
     assert row["parent_code"] == "500"
-    kids = catalog.taxonomy_children("500")
+    kids = catalog.taxonomy_store.children("500")
     assert [k["code"] for k in kids] == ["540"]
-    tops = catalog.taxonomy_children(None)
+    tops = catalog.taxonomy_store.children(None)
     assert [t["code"] for t in tops] == ["500"]
 
 
 def test_taxonomy_set_alias(catalog: Catalog) -> None:
-    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
-    catalog.taxonomy_insert("550", "500", "festivities", "550-festivities")
-    catalog.taxonomy_set_alias("550", "540")
-    row = catalog.taxonomy_get("550")
+    catalog.taxonomy_store.insert("540", "500", "holidays", "540-holidays")
+    catalog.taxonomy_store.insert("550", "500", "festivities", "550-festivities")
+    catalog.taxonomy_store.set_alias("550", "540")
+    row = catalog.taxonomy_store.get("550")
     assert row["alias_of"] == "540"
     assert row["active"] == 0
 
 
 def test_taxonomy_set_aliases(catalog: Catalog) -> None:
     import json
-    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
-    catalog.taxonomy_set_aliases("540", ["festivities", "xmas"])
-    assert json.loads(catalog.taxonomy_get("540")["aliases"]) == ["festivities", "xmas"]
+    catalog.taxonomy_store.insert("540", "500", "holidays", "540-holidays")
+    catalog.taxonomy_store.set_aliases("540", ["festivities", "xmas"])
+    assert json.loads(catalog.taxonomy_store.get("540")["aliases"]) == ["festivities", "xmas"]
 
 
 # ---------------------------------------------------------------------------

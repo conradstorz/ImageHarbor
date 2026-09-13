@@ -14,6 +14,7 @@ from .util import now_iso as _now_iso
 
 if TYPE_CHECKING:
     from .takeout.store import TakeoutStore
+    from .taxonomy import TaxonomyStore
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +303,12 @@ class Catalog:
         from .takeout.store import TakeoutStore
 
         self.takeout: TakeoutStore = TakeoutStore(conn=self._conn, lock=self.lock)
+        # Local import: `taxonomy.py` imports `Catalog` at module level (for
+        # `Taxonomy.__init__`'s type hint), so a module-level import here
+        # would be circular.
+        from .taxonomy import TaxonomyStore
+
+        self.taxonomy_store: TaxonomyStore = TaxonomyStore(conn=self._conn, lock=self.lock)
         logger.debug("Catalog opened at %s", db_path)
 
     def _ensure_photo_columns(self) -> None:
@@ -912,67 +919,6 @@ class Catalog:
         with self.lock:
             cursor = self._conn.execute("SELECT key, value FROM settings")
             return {row["key"]: row["value"] for row in cursor}
-
-    # ------------------------------------------------------------------
-    # Taxonomy
-    # ------------------------------------------------------------------
-
-    def taxonomy_is_empty(self) -> bool:
-        with self.lock:
-            cur = self._conn.execute("SELECT 1 FROM taxonomy LIMIT 1")
-            return cur.fetchone() is None
-
-    def taxonomy_insert(
-        self,
-        code: str,
-        parent_code: str | None,
-        label: str,
-        folder_name: str,
-        aliases: list[str] | None = None,
-        alias_of: str | None = None,
-    ) -> None:
-        with self.lock:
-            self._conn.execute(
-                """
-                INSERT INTO taxonomy (code, parent_code, label, folder_name,
-                                      aliases, alias_of, active, created_at)
-                VALUES (?,?,?,?,?,?,1,?)
-                ON CONFLICT(code) DO NOTHING
-                """,
-                (code, parent_code, label, folder_name, _json(aliases or []), alias_of, _now_iso()),
-            )
-            self._conn.commit()
-
-    def taxonomy_get(self, code: str) -> sqlite3.Row | None:
-        with self.lock:
-            cur = self._conn.execute("SELECT * FROM taxonomy WHERE code=?", (code,))
-            return cur.fetchone()
-
-    def taxonomy_children(self, parent_code: str | None) -> list[sqlite3.Row]:
-        with self.lock:
-            cur = self._conn.execute(
-                "SELECT * FROM taxonomy WHERE parent_code IS ? ORDER BY code", (parent_code,)
-            )
-            return cur.fetchall()
-
-    def taxonomy_all(self) -> list[sqlite3.Row]:
-        with self.lock:
-            cur = self._conn.execute("SELECT * FROM taxonomy WHERE active=1 ORDER BY code")
-            return cur.fetchall()
-
-    def taxonomy_set_alias(self, from_code: str, to_code: str) -> None:
-        with self.lock:
-            self._conn.execute(
-                "UPDATE taxonomy SET alias_of=?, active=0 WHERE code=?", (to_code, from_code)
-            )
-            self._conn.commit()
-
-    def taxonomy_set_aliases(self, code: str, aliases: list[str]) -> None:
-        with self.lock:
-            self._conn.execute(
-                "UPDATE taxonomy SET aliases=? WHERE code=?", (_json(aliases), code)
-            )
-            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Learned concepts

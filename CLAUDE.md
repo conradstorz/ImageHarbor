@@ -270,7 +270,15 @@ Module responsibilities:
   primary_subject)` with a fixed top-level class and **no `sub_parent`**, so in
   practice the taxonomy is effectively **two levels** (fixed class →
   `primary_subject` sub-category); the `sub_parent`/`~N`-under-a-leaf machinery
-  still exists but its call sites are currently unused.
+  still exists but its call sites are currently unused. **R5:** the module also
+  now holds `class TaxonomyStore`, the `taxonomy` table's read/write methods
+  extracted from `Catalog` — co-located here rather than in a new module
+  because `Taxonomy` is its only real consumer, the same reasoning that keeps
+  `sidecar_schema.py` and `sidecar.py` split rather than merged in the other
+  direction. `Taxonomy.__init__` grabs `self._store = catalog.taxonomy_store`
+  once and uses it for every read/write; its own external signature is
+  unchanged (still takes the `catalog`). See `catalog.py`'s bullet above for
+  how `TaxonomyStore` is composed onto the shared connection/lock.
 - **`ai_classifier.py`** — perception only. `AIClassifier` ABC with two
   implementations chosen by the `--ai` flag: `StubClassifier` (default;
   deterministic, no network — derives a subject/tags from filename keywords, used
@@ -347,7 +355,17 @@ Module responsibilities:
   and three `sources` rows (`record_source`, `sources_for`); `photos.original_path`
   is retained as the *first* source seen, for backward compatibility. A `taxonomy`
   table persists the self-extending PCS registry (`code`, `parent_code`, `label`,
-  `folder_name`, `aliases`, `alias_of`, `active`), backing `taxonomy.py`. A
+  `folder_name`, `aliases`, `alias_of`, `active`), backing `taxonomy.py`. **R5:**
+  the read/write methods over this table no longer live on `Catalog` — they
+  were extracted (2026-09-13) into `TaxonomyStore` (co-located in
+  `imageharbor/taxonomy.py`, its only real consumer), composed onto the same
+  connection and lock as `self.taxonomy_store = TaxonomyStore(conn=self._conn,
+  lock=self.lock)` in `Catalog.__init__` (constructed via a local import to
+  avoid a cycle with `taxonomy.py`'s own `from .catalog import Catalog`). SQL
+  and docstrings moved verbatim; call sites are
+  `catalog.taxonomy_store.<method>(...)` (e.g.
+  `catalog.taxonomy_store.set_aliases(...)`) — there is no bare
+  `catalog.taxonomy_*` left anywhere in the codebase. A
   `learned_concepts` table (`subject`, `class_code`, `hits`, timestamps) is the
   self-learning store behind `concept_map.py`'s
   `learned_concept_get`/`learned_concept_remember`. A `failed_files` table
