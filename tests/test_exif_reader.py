@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
+from PIL.TiffImagePlugin import IFDRational
 
 from imageharbor.exif_reader import (
     _dms_to_decimal,
@@ -217,3 +218,143 @@ def test_read_exif_nonexistent_path_does_not_raise(tmp_path: Path) -> None:
 
     # Image.open raises FileNotFoundError, caught internally -> empty dict
     assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# read_exif — GPS sub-IFD walk (exif_reader.py:149-182)
+#
+# These write a real GPSInfo (tag 34853) sub-IFD through Pillow's Image.Exif
+# and re-read it via read_exif's actual Image.open()/_getexif() path, so
+# each test genuinely exercises the GPS block rather than the pure
+# `_dms_to_decimal` helper already covered above.
+# ---------------------------------------------------------------------------
+
+
+def test_gps_dms_rationals_become_signed_decimal_degrees(tmp_path: Path) -> None:
+    p = tmp_path / "gps_ne.jpg"
+    exif = Image.Exif()
+    exif[34853] = {
+        1: "N",
+        2: (Fraction(40, 1), Fraction(26, 1), Fraction(46, 1)),
+        3: "W",
+        4: (Fraction(79, 1), Fraction(58, 1), Fraction(56, 1)),
+    }
+    Image.new("RGB", (4, 4), "red").save(p, "JPEG", exif=exif.tobytes())
+
+    result = read_exif(p)
+
+    gps = result["GPS"]
+    assert gps["latitude_decimal"] == pytest.approx(40.4461111, abs=1e-6)
+    # West longitude flips sign even though the ref itself reads positive.
+    assert gps["longitude_decimal"] == pytest.approx(-79.9822222, abs=1e-6)
+
+
+def test_southern_and_western_hemispheres_are_negative(tmp_path: Path) -> None:
+    p = tmp_path / "gps_sw.jpg"
+    exif = Image.Exif()
+    exif[34853] = {
+        1: "S",
+        2: (Fraction(33, 1), Fraction(52, 1), Fraction(4, 1)),
+        3: "W",
+        4: (Fraction(151, 1), Fraction(12, 1), Fraction(36, 1)),
+    }
+    Image.new("RGB", (4, 4), "red").save(p, "JPEG", exif=exif.tobytes())
+
+    result = read_exif(p)
+
+    gps = result["GPS"]
+    assert gps["latitude_decimal"] < 0
+    assert gps["longitude_decimal"] < 0
+
+
+def test_a_malformed_longitude_does_not_drop_a_valid_latitude(tmp_path: Path) -> None:
+    # GPSLongitude has only 2 components instead of 3 (degrees, minutes) --
+    # _dms_to_decimal indexes dms[2] for seconds and raises IndexError, which
+    # is caught by the longitude coordinate's own `except Exception: pass`
+    # arm (exif_reader.py:173-180) without disturbing the latitude arm above
+    # it (:165-172).
+    p = tmp_path / "gps_malformed_lon.jpg"
+    exif = Image.Exif()
+    exif[34853] = {
+        1: "N",
+        2: (Fraction(40, 1), Fraction(26, 1), Fraction(46, 1)),
+        3: "W",
+        4: (Fraction(79, 1), Fraction(58, 1)),  # missing seconds component
+    }
+    Image.new("RGB", (4, 4), "red").save(p, "JPEG", exif=exif.tobytes())
+
+    result = read_exif(p)
+
+    gps = result["GPS"]
+    assert gps["latitude_decimal"] == pytest.approx(40.4461111, abs=1e-6)
+    assert "longitude_decimal" not in gps
+
+
+def test_a_malformed_latitude_does_not_drop_a_valid_longitude(tmp_path: Path) -> None:
+    # Mirror of the malformed-longitude case above, exercising the
+    # latitude coordinate's own `except Exception: pass` arm
+    # (exif_reader.py:165-172) instead of the longitude arm.
+    p = tmp_path / "gps_malformed_lat.jpg"
+    exif = Image.Exif()
+    exif[34853] = {
+        1: "N",
+        2: (Fraction(40, 1), Fraction(26, 1)),  # missing seconds component
+        3: "W",
+        4: (Fraction(79, 1), Fraction(58, 1), Fraction(56, 1)),
+    }
+    Image.new("RGB", (4, 4), "red").save(p, "JPEG", exif=exif.tobytes())
+
+    result = read_exif(p)
+
+    gps = result["GPS"]
+    assert "latitude_decimal" not in gps
+    assert gps["longitude_decimal"] == pytest.approx(-79.9822222, abs=1e-6)
+
+
+def test_zero_denominator_rationals_are_dropped_not_raised(tmp_path: Path) -> None:
+    # A zero-denominator rational (IFDRational allows constructing one; real
+    # cameras occasionally emit these) must not raise inside the GPS block --
+    # _rational_to_float treats it as 0.0 rather than dividing by zero, so
+    # the coordinate still resolves using its other components.
+    p = tmp_path / "gps_zero_denom.jpg"
+    exif = Image.Exif()
+    exif[34853] = {
+        1: "N",
+        2: (IFDRational(5, 0), Fraction(26, 1), Fraction(46, 1)),
+        3: "E",
+        4: (Fraction(79, 1), Fraction(58, 1), Fraction(56, 1)),
+    }
+    Image.new("RGB", (4, 4), "red").save(p, "JPEG", exif=exif.tobytes())
+
+    result = read_exif(p)
+
+    gps = result["GPS"]
+    # Degrees component collapsed to 0.0 instead of raising; minutes/seconds
+    # still contribute.
+    assert gps["latitude_decimal"] == pytest.approx(0.4461111, abs=1e-6)
+    assert gps["longitude_decimal"] == pytest.approx(79.9822222, abs=1e-6)
+
+
+def test_gps_ref_missing_defaults_do_not_invent_a_hemisphere(tmp_path: Path) -> None:
+    # No GPSLatitudeRef (tag 1) or GPSLongitudeRef (tag 3) at all. Pinning
+    # today's actual behavior: `gps.get("GPSLatitudeRef", "N")` /
+    # `gps.get("GPSLongitudeRef", "E")` silently default to the positive
+    # (Northern/Eastern) hemisphere rather than surfacing the ref as absent.
+    # NOTE (see task report): this is a debatable default -- a genuinely
+    # missing ref could just as easily belong to S/W -- but it is pinned as
+    # existing behavior, not "fixed", per the task brief.
+    p = tmp_path / "gps_no_ref.jpg"
+    exif = Image.Exif()
+    exif[34853] = {
+        2: (Fraction(40, 1), Fraction(26, 1), Fraction(46, 1)),
+        4: (Fraction(79, 1), Fraction(58, 1), Fraction(56, 1)),
+    }
+    Image.new("RGB", (4, 4), "red").save(p, "JPEG", exif=exif.tobytes())
+
+    result = read_exif(p)
+
+    gps = result["GPS"]
+    assert "GPSLatitudeRef" not in gps
+    assert "GPSLongitudeRef" not in gps
+    assert gps["latitude_decimal"] == pytest.approx(40.4461111, abs=1e-6)
+    assert gps["longitude_decimal"] == pytest.approx(79.9822222, abs=1e-6)
