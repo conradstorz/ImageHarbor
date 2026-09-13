@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from imageharbor.catalog import Catalog
-from imageharbor.faces.store import FaceStore
 
 
 def _make_jpeg(
@@ -59,6 +58,12 @@ def dirs(tmp_path: Path):
 
 @pytest.fixture()
 def store(tmp_path: Path):
+    # Imported here, not at module level (R4 review Minor #4): a missing
+    # numpy (faces' only hard runtime dependency) should only take down
+    # collection of the faces/dashboard modules that actually use this
+    # fixture, not collection of the entire suite via this shared conftest.
+    from imageharbor.faces.store import FaceStore
+
     db = tmp_path / "catalog.db"
     Catalog(db).close()
     s = FaceStore(db)

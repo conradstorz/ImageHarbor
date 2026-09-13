@@ -335,7 +335,7 @@ def test_zero_denominator_rationals_are_dropped_not_raised(tmp_path: Path) -> No
     assert gps["longitude_decimal"] == pytest.approx(79.9822222, abs=1e-6)
 
 
-def test_gps_ref_missing_defaults_do_not_invent_a_hemisphere(tmp_path: Path) -> None:
+def test_a_missing_gps_ref_silently_defaults_to_north_east(tmp_path: Path) -> None:
     # No GPSLatitudeRef (tag 1) or GPSLongitudeRef (tag 3) at all. Pinning
     # today's actual behavior: `gps.get("GPSLatitudeRef", "N")` /
     # `gps.get("GPSLongitudeRef", "E")` silently default to the positive

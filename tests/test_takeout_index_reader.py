@@ -10,6 +10,7 @@ import sqlite3
 import pytest
 
 from imageharbor.takeout import index_reader
+from tests.takeout_helpers import make_index
 
 # Fixed archive tuple used by the "covered archive" fixtures below: a name,
 # a size and mtime matching stats_for()'s defaults, a member count, and no
@@ -17,43 +18,6 @@ from imageharbor.takeout import index_reader
 _ARCHIVE_1_COVERED = ("part-1.zip", 100, 5, 2, None)
 _ARCHIVE_2_COVERED = ("part-2.zip", 100, 5, 1, None)
 _ARCHIVE_2_UNCOVERED = ("part-2.zip", 999, 5, 1, None)
-
-
-SCHEMA = """
-CREATE TABLE sidecar (
-  id INTEGER PRIMARY KEY, archive TEXT, path TEXT NOT NULL, name TEXT NOT NULL,
-  title TEXT, taken_at TEXT, lat REAL, lon REAL, device TEXT,
-  trashed INTEGER, archived INTEGER, from_partner INTEGER,
-  parse_error TEXT, role TEXT);
-CREATE TABLE media (
-  id INTEGER PRIMARY KEY, archive TEXT, path TEXT NOT NULL, area TEXT NOT NULL,
-  folder TEXT NOT NULL, name TEXT NOT NULL, ext TEXT, size INTEGER,
-  actual_type TEXT, sidecar_id INTEGER REFERENCES sidecar(id),
-  rule TEXT NOT NULL, confidence TEXT NOT NULL);
-CREATE TABLE archive (
-  name TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
-  members INTEGER NOT NULL, error TEXT);
-CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT);
-"""
-
-
-def make_index(path, *, version="1", archives=(("part-1.zip", 100, 5, 2, None),),
-               media=(), sidecars=()):
-    con = sqlite3.connect(path)
-    con.executescript(SCHEMA)
-    for row in archives:
-        con.execute("INSERT INTO archive VALUES (?,?,?,?,?)", row)
-    for row in sidecars:
-        con.execute("INSERT INTO sidecar (id, archive, path, name)"
-                    " VALUES (?,?,?,?)", row)
-    for row in media:
-        con.execute("INSERT INTO media (archive, path, area, folder, name,"
-                    " sidecar_id, rule, confidence) VALUES (?,?,?,?,?,?,?,?)", row)
-    if version is not None:
-        con.execute("INSERT INTO index_meta VALUES ('schema_version', ?)", (version,))
-    con.commit()
-    con.close()
-    return path
 
 
 def stats_for(size=100, mtime=5):

@@ -565,11 +565,7 @@ def test_exdev_fallback_with_a_read_only_source_still_copies(
     specifically so a read-only source (e.g. an RO-mounted NAS share) can
     never make fsync_file's "rb+" open fail: fsync must run while the
     destination is still writable, i.e. strictly BEFORE copystat applies
-    the source's read-only mode onto it. This also pins that the (now
-    relocated) fsync for a *successful* os.replace sits outside the
-    `except OSError` that interprets EXDEV -- so a hypothetical
-    fsync-raised OSError(EXDEV) can never be misread as a cross-device move
-    that needs the copy fallback.
+    the source's read-only mode onto it.
     """
     import os as _os
     import shutil as _shutil
@@ -936,6 +932,47 @@ def test_the_copy_is_fsynced_before_it_is_verified(
     fsync_events = [i for i, e in enumerate(events) if e[0] == "fsync"]
     verify_events = [i for i, e in enumerate(events) if e[0] == "verify"]
     assert fsync_events, "fsync_file was never called"
+    assert verify_events, "verify_file was never called"
+    assert fsync_events[0] < verify_events[0]
+
+
+def test_a_consumed_move_is_fsynced_before_it_is_verified(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """Same power-loss gap as test_the_copy_is_fsynced_before_it_is_verified,
+    pinned for the consume_source=True (os.replace move) path instead of the
+    plain copy path -- no forced EXDEV here, so this exercises the successful
+    move's own fsync (pipeline.py:367), not the EXDEV copy fallback's.
+    """
+    from imageharbor import pipeline as pipeline_mod
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    events: list[tuple[str, str]] = []
+    real_fsync = pipeline_mod.fsync_file
+    real_verify = pipeline_mod.verify_file
+
+    def _fsync(path):
+        events.append(("fsync", Path(path).name))
+        return real_fsync(path)
+
+    def _verify(path, digest):
+        events.append(("verify", Path(path).name))
+        return real_verify(path, digest)
+
+    monkeypatch.setattr(pipeline_mod, "fsync_file", _fsync)
+    monkeypatch.setattr(pipeline_mod, "verify_file", _verify)
+
+    result = Pipeline(
+        tmp_path, organized_dir, catalog, consume_source=True
+    ).process_file(staged)
+
+    assert result.status == "copied"
+    organized_name = result.organized_path.name
+    fsync_events = [i for i, e in enumerate(events) if e[0] == "fsync"]
+    verify_events = [i for i, e in enumerate(events) if e[0] == "verify"]
+    assert len(fsync_events) == 1, f"expected exactly one fsync, got {events}"
+    assert events[fsync_events[0]][1] == organized_name
     assert verify_events, "verify_file was never called"
     assert fsync_events[0] < verify_events[0]
 

@@ -66,8 +66,7 @@ import pytest
 from imageharbor.catalog import Catalog
 from imageharbor.takeout import index_reader, pairing
 from imageharbor.takeout.ingest import ingest_archives
-from tests.takeout_helpers import D, _jpeg, _sidecar, _zip
-from tests.test_takeout_index_reader import make_index
+from tests.takeout_helpers import D, _jpeg, _sidecar, _zip, make_index
 
 # `catalog` and `dirs` are shared pytest fixtures from tests/conftest.py;
 # pytest injects them by parameter name (see
