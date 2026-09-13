@@ -15,7 +15,6 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -24,14 +23,11 @@ import numpy as np
 from PIL import Image
 
 from ..sidecar import merge_sidecar
+from ..util import now_iso as _now_iso
 from . import attribute, calibrate, cluster
 from .align import DegenerateLandmarks, align_crop
 
 logger = logging.getLogger(__name__)
-
-
-def _now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
 
 # On a 12 MP JPEG, Image.draft(...) before Image.load() downscales in the DCT
 # domain and skips most of the decode -- decode, not inference, dominates this

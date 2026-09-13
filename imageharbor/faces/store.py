@@ -19,12 +19,12 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from ..util import now_iso as _now_iso
 from .attribute import Proposal
 from .cluster import Cluster, FaceVector
 from .decode import Detection
@@ -126,10 +126,6 @@ CREATE TABLE IF NOT EXISTS face_organized_paths (
   organized_path  TEXT NOT NULL
 );
 """
-
-
-def _now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
 
 
 class MalformedEmbeddingError(ValueError):

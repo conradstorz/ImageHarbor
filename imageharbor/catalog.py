@@ -6,9 +6,11 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from .util import json_default as _json_default
+from .util import now_iso as _now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -188,21 +190,6 @@ _ADDED_PHOTO_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
-
-
-def _json_default(o: Any) -> Any:
-    """Fallback for values ``json.dumps`` cannot serialize natively.
-
-    Real EXIF carries raw ``bytes`` (e.g. ExifVersion, SceneType, MakerNote)
-    and other exotic types; without this a single odd metadata value would
-    raise and fail the whole image. Bytes become a lossy text form; anything
-    else falls back to its string representation.
-    """
-    if isinstance(o, (bytes, bytearray)):
-        return bytes(o).decode("utf-8", "replace")
-    return str(o)
 
 
 def _json(value: Any) -> str:
