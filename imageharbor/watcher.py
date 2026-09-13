@@ -479,6 +479,8 @@ def run_once(
             enrich_failed=0,
             breaker_state=_breaker_state(),
             paused=_paused_now(),
+            enrich_ai_failed=0,
+            enrich_io_failed=0,
         )
 
     # -- enrichment phase ----------------------------------------------------
@@ -522,6 +524,19 @@ def run_once(
                 # (`EnrichStats.errors`, which already sums `ai_failed` +
                 # `io_failed`, plus the crash-in-flight count) -- see
                 # `EnrichStats`'s own fields in enrich.py.
+                # Split (deferred #13): `row_stats.ai_failed` is exactly the
+                # AI-perception failures (classifier.describe()/pick_class()
+                # calls); everything else in `row_errors` is local-work
+                # evidence -- `row_stats.io_failed` plus, when this pass
+                # crashed, the crash-in-flight increment folded into
+                # `row_errors` above (a raised exception outside
+                # classifier.describe() is local work by definition, never
+                # AI-perception evidence). `max(0, ...)` guards against the
+                # subtraction ever going negative; it shouldn't (row_errors
+                # is always >= len(ai_failed) by construction) but a stats
+                # row must never assert a negative failure count.
+                ai_failed_count = len(row_stats.ai_failed)
+                io_failed_count = max(0, row_errors - ai_failed_count)
                 catalog.run_finish(
                     enrich_run_id,
                     scanned=row_stats.total,
@@ -532,6 +547,8 @@ def run_once(
                     enrich_failed=row_errors,
                     breaker_state=_breaker_state(),
                     paused=_paused_now(),
+                    enrich_ai_failed=ai_failed_count,
+                    enrich_io_failed=io_failed_count,
                 )
 
             failed_buffer = _failed_buffer_from_digests(

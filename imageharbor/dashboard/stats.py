@@ -458,6 +458,7 @@ def _window_summary(runs: list[dict], now: datetime, window_seconds: float) -> d
     if not isinstance(now, datetime):
         return None
     passes = copied = duplicates = errors = enriched = enrich_failed = 0
+    enrich_ai_failed = enrich_io_failed = 0
     for run in runs:
         started = _parse_iso(run.get("started_at"))
         if started is None:
@@ -471,6 +472,10 @@ def _window_summary(runs: list[dict], now: datetime, window_seconds: float) -> d
         errors += int(run.get("errors") or 0)
         enriched += int(run.get("enriched") or 0)
         enrich_failed += int(run.get("enrich_failed") or 0)
+        # `.get(...)` (not indexing) because a pre-upgrade `runs` row has
+        # neither key at all -- same handling as every other field here.
+        enrich_ai_failed += int(run.get("enrich_ai_failed") or 0)
+        enrich_io_failed += int(run.get("enrich_io_failed") or 0)
     return {
         "passes": passes,
         "copied": copied,
@@ -478,6 +483,8 @@ def _window_summary(runs: list[dict], now: datetime, window_seconds: float) -> d
         "errors": errors,
         "enriched": enriched,
         "enrich_failed": enrich_failed,
+        "enrich_ai_failed": enrich_ai_failed,
+        "enrich_io_failed": enrich_io_failed,
     }
 
 

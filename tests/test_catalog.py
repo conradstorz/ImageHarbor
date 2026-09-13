@@ -915,6 +915,75 @@ def test_run_finish_populates_counters_and_clears_unfinished(catalog: Catalog) -
     assert row["paused"] == 0  # stored as an INTEGER, False -> 0
 
 
+def test_run_finish_records_the_ai_io_failure_split(catalog: Catalog) -> None:
+    """`enrich_ai_failed`/`enrich_io_failed` are additive counters alongside
+    the existing `enrich_failed` total -- the breaker itself always kept
+    this distinction; only the `runs` row lost it."""
+    run_id = catalog.run_start("enrich")
+    catalog.run_finish(
+        run_id, scanned=5, copied=0, duplicates=0, errors=0,
+        enriched=2, enrich_failed=3, breaker_state="CLOSED", paused=False,
+        enrich_ai_failed=2, enrich_io_failed=1,
+    )
+    row = catalog.recent_runs(1)[0]
+    assert row["enrich_failed"] == 3
+    assert row["enrich_ai_failed"] == 2
+    assert row["enrich_io_failed"] == 1
+
+
+def test_run_finish_defaults_ai_io_failed_to_zero(catalog: Catalog) -> None:
+    """Callers that don't pass the new keywords (every pre-existing call
+    site) must still get a valid row -- default 0/0."""
+    run_id = catalog.run_start("facts")
+    catalog.run_finish(
+        run_id, scanned=1, copied=1, duplicates=0, errors=0,
+        enriched=0, enrich_failed=0, breaker_state="CLOSED", paused=False,
+    )
+    row = catalog.recent_runs(1)[0]
+    assert row["enrich_ai_failed"] == 0
+    assert row["enrich_io_failed"] == 0
+
+
+def test_an_existing_catalog_gains_the_run_columns_in_place(tmp_path: Path) -> None:
+    """A `runs` table predating this change (no `enrich_ai_failed`/
+    `enrich_io_failed` columns) must upgrade additively on open, mirroring
+    `test_existing_catalog_gains_new_columns`'s coverage of
+    `_ensure_photo_columns` -- and reopening the already-upgraded catalog
+    must be a no-op (idempotent `_ensure_run_columns`)."""
+    import sqlite3
+
+    from imageharbor.catalog import Catalog
+
+    db = tmp_path / "old_runs.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, "
+        "started_at TEXT NOT NULL, ended_at TEXT, scanned INTEGER NOT NULL DEFAULT 0, "
+        "copied INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0, "
+        "errors INTEGER NOT NULL DEFAULT 0, enriched INTEGER NOT NULL DEFAULT 0, "
+        "enrich_failed INTEGER NOT NULL DEFAULT 0, breaker_state TEXT NOT NULL DEFAULT 'CLOSED', "
+        "paused INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "INSERT INTO runs (kind, started_at, ended_at, enrich_failed) "
+        "VALUES ('enrich', 'now', 'now', 7)"
+    )
+    conn.commit()
+    conn.close()
+
+    with Catalog(db) as cat:
+        row = cat.recent_runs(1)[0]
+        assert row["enrich_failed"] == 7
+        assert row["enrich_ai_failed"] == 0
+        assert row["enrich_io_failed"] == 0
+
+    # Reopening (columns already present) must not raise -- idempotence.
+    with Catalog(db) as cat:
+        row = cat.recent_runs(1)[0]
+        assert row["enrich_ai_failed"] == 0
+        assert row["enrich_io_failed"] == 0
+
+
 def test_recent_runs_is_newest_first_and_respects_limit(catalog: Catalog) -> None:
     ids = []
     for i in range(5):

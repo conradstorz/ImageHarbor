@@ -225,6 +225,7 @@ def test_empty_catalog_returns_a_complete_document_of_zeros(
     assert doc["history"]["last_24h"] == {
         "passes": 0, "copied": 0, "duplicates": 0, "errors": 0,
         "enriched": 0, "enrich_failed": 0,
+        "enrich_ai_failed": 0, "enrich_io_failed": 0,
     }
     assert doc["history"]["last_30d"] == doc["history"]["last_24h"]
 
@@ -237,6 +238,58 @@ def test_empty_catalog_returns_a_complete_document_of_zeros(
     assert doc["overrides"]["enrich"] == {
         "value": True, "env_value": True, "overridden": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# History window summary: AI/IO failure split (deferred #13)
+# ---------------------------------------------------------------------------
+
+
+def test_window_summary_accumulates_ai_and_io_failed_separately() -> None:
+    """`_window_summary` sums `enrich_ai_failed`/`enrich_io_failed` across the
+    runs in the window, alongside the pre-existing `enrich_failed` total."""
+    now = datetime.now(timezone.utc)
+    runs = [
+        {
+            "started_at": (now - timedelta(minutes=5)).isoformat(),
+            "copied": 0, "duplicates": 0, "errors": 0, "enriched": 1,
+            "enrich_failed": 3, "enrich_ai_failed": 2, "enrich_io_failed": 1,
+        },
+        {
+            "started_at": (now - timedelta(minutes=10)).isoformat(),
+            "copied": 0, "duplicates": 0, "errors": 0, "enriched": 4,
+            "enrich_failed": 1, "enrich_ai_failed": 1, "enrich_io_failed": 0,
+        },
+    ]
+
+    summary = stats._window_summary(runs, now, 3600.0)
+
+    assert summary is not None
+    assert summary["enrich_failed"] == 4
+    assert summary["enrich_ai_failed"] == 3
+    assert summary["enrich_io_failed"] == 1
+
+
+def test_window_summary_treats_pre_upgrade_rows_missing_the_columns_as_zero() -> None:
+    """A `runs` row written before this change has no `enrich_ai_failed`/
+    `enrich_io_failed` keys at all -- `_window_summary` must read those as 0,
+    the same `run.get(...) or 0` handling every other field already gets."""
+    now = datetime.now(timezone.utc)
+    runs = [
+        {
+            "started_at": (now - timedelta(minutes=5)).isoformat(),
+            "copied": 0, "duplicates": 0, "errors": 0, "enriched": 1,
+            "enrich_failed": 3,
+            # enrich_ai_failed / enrich_io_failed intentionally absent
+        },
+    ]
+
+    summary = stats._window_summary(runs, now, 3600.0)
+
+    assert summary is not None
+    assert summary["enrich_failed"] == 3
+    assert summary["enrich_ai_failed"] == 0
+    assert summary["enrich_io_failed"] == 0
 
 
 # ---------------------------------------------------------------------------
