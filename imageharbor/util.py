@@ -9,12 +9,33 @@ without creating a cycle. Consumers re-export under their old private names
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
 def now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def fsync_file(path: Path) -> None:
+    """Flush *path*'s written bytes to stable storage.
+
+    verify-after-copy reads back through the OS page cache, so without this
+    the catalog could durably assert "copied, verified" for data that never
+    reached the platter (power loss, not process crash). Directory-entry
+    durability is deliberately out of scope: os.fsync on a directory fd is
+    unsupported on Windows, and the file's content is the gap that matters.
+
+    Opened ``"rb+"`` (read-write), not ``"rb"``: on Windows, ``os.fsync``
+    (``_commit``) raises ``OSError: [Errno 9] Bad file descriptor`` against a
+    handle opened read-only. ``"rb+"`` requires the file to already exist and
+    never truncates it, so no bytes are at risk -- it only widens the handle
+    enough for the flush to be valid on every platform this runs on.
+    """
+    with open(path, "rb+") as fh:
+        os.fsync(fh.fileno())
 
 
 def json_default(o: Any) -> Any:

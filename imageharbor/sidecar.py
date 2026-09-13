@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .sidecar_schema import merge as merge_documents
+from .util import fsync_file as _fsync_file
 from .util import json_default as _json_default
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,7 @@ def merge_sidecar(organized_path: Path, updates: dict[str, Any]) -> Path:
             json.dumps(merged, indent=2, ensure_ascii=False, default=_json_default),
             encoding="utf-8",
         )
+        _fsync_file(tmp)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)

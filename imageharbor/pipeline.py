@@ -28,6 +28,7 @@ from .exif_reader import read_exif
 from .hashing import compute_sha256_b64url, verify_file
 from .relocate import apply_relocation, resolve_organized_path, target_path
 from .sidecar import merge_sidecar, sidecar_path_for
+from .util import fsync_file
 
 if TYPE_CHECKING:
     from .date_resolver import ResolvedDate
@@ -341,6 +342,12 @@ class Pipeline:
                     consumed_by_copy = True
             else:
                 shutil.copy2(str(source_path), str(organized_path))
+
+            # Bytes were written to the destination on every path through
+            # this branch (copy2, os.replace, or the EXDEV copy2 fallback) --
+            # flush them to stable storage before verify reads them back,
+            # so a durable "verified" claim can't outrun a power loss.
+            fsync_file(organized_path)
 
             # Step 7: verify before anything is recorded. This reads the file
             # at its DESTINATION either way, so the move path is verified
