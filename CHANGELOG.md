@@ -7,7 +7,7 @@ the single source of version truth (`setuptools-scm`); per-release notes are
 generated on each GitHub Release. This file curates the human summary for
 notable releases only — not every patch.
 
-## [1.0.0] — 2026-09-12
+## [1.0.0] — 2026-09-13
 
 First official release. The tool has been in daily production use since
 2026-08; this release establishes the engineering floor around it:
