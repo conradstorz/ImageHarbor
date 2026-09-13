@@ -204,6 +204,114 @@ def test_re_preserving_the_same_archive_writes_nothing_new(dirs, monkeypatch) ->
 # --- failure isolation ---------------------------------------------------------
 
 
+# --- containment (zip-slip defense-in-depth) -----------------------------------
+
+
+def test_a_backslash_member_path_stays_inside_the_room(tmp_path: Path) -> None:
+    # _safe_relpath drops "." and ".." SLASH components, but a component
+    # containing backslashes ("..\\..\\..\\pwned.txt") survived whole and,
+    # on Windows, pathlib expands it into separators -- writing outside the
+    # room the docstring promises to contain. This is defense-in-depth, not
+    # a live exploit: CPython's own zipfile read path normalizes "\" -> "/"
+    # on Windows before a name ever reaches this module, so a real archive
+    # cannot trigger it today. It guards a future archive reader, a
+    # hand-rolled central-directory recovery, or a MemberInfo built from a
+    # non-zipfile source.
+    rel = provenance._safe_relpath("Takeout/..\\..\\..\\pwned.txt")
+    room = tmp_path / "room"
+    assert (room / rel).resolve().is_relative_to(room.resolve())
+
+
+def test_safe_component_replaces_backslashes() -> None:
+    assert "\\" not in provenance._safe_component("..\\..\\evil")
+
+
+def test_a_hostile_member_path_is_neutralized_and_stays_in_the_room(
+    dirs, tmp_path: Path, monkeypatch, caplog,
+) -> None:
+    # Mirrors Task 5's staging test: the malicious name is injected directly
+    # into a hand-built MemberInfo (not round-tripped through a real zip
+    # entry, since CPython's zipfile normalizes "\" -> "/" on read on
+    # Windows and would mask the very bug this guards against) and zf.open
+    # is patched to serve real bytes for it -- isolating exactly what
+    # preserve()/_stored_path does with a hostile member.path. With the
+    # sanitizer fixed, the hostile name is neutralized rather than rejected:
+    # it is preserved safely under the room (never lost), just not at the
+    # path it tried to claim, alongside an ordinary sibling member.
+    archives, organized = dirs
+    zip_path = _zip(archives / "t.zip", {
+        "Takeout/archive_browser.html": b"<html>viewer</html>",
+        "payload.txt": b"gotcha",
+    })
+    identity = _identity(zip_path)
+    malicious_path = "Takeout/..\\..\\..\\pwned.txt"
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        real_open = zf.open
+        monkeypatch.setattr(
+            zf, "open",
+            lambda name, mode="r": real_open(
+                "payload.txt" if name == malicious_path else name, mode,
+            ),
+        )
+        legit = [m for m in _members(zf) if m.path == "Takeout/archive_browser.html"]
+        hostile = archive_mod.MemberInfo(
+            path=malicious_path, size=6, crc32=0, kind=archive_mod.KIND_METADATA,
+        )
+        with caplog.at_level(logging.WARNING):
+            written = provenance.preserve(
+                organized, identity, zf, legit + [hostile], orphaned=set(),
+            )
+
+    room = organized / provenance.ROOM_NAME / identity.archive_id
+    assert (room / "Takeout" / "archive_browser.html").read_bytes() == b"<html>viewer</html>"
+    hostile_dest = room / provenance._safe_relpath(malicious_path)
+    assert hostile_dest.resolve().is_relative_to(room.resolve())
+    assert hostile_dest.read_bytes() == b"gotcha"
+    assert written == 2  # both members preserved; neither escaped nor was lost
+    assert not (tmp_path / "pwned.txt").exists()
+
+
+def test_a_stored_path_escape_is_isolated_and_does_not_abort_the_archive(
+    dirs, monkeypatch, caplog,
+) -> None:
+    # Defense-in-depth for the containment guard itself: if a future
+    # sanitization gap ever let `_stored_path` compute a path outside the
+    # room, `_stored_path` raises ValueError (see the guard added at the end
+    # of `_stored_path`) rather than returning it -- this proves `preserve()`
+    # catches that ValueError, logs it, and keeps going, exactly like an
+    # unreadable or unwritable member, instead of letting one hostile name
+    # abort preservation of the rest of the archive.
+    archives, organized = dirs
+    zip_path = _zip(archives / "t.zip", {
+        "Takeout/archive_browser.html": b"<html>viewer</html>",
+        "Takeout/evil.json": b'{"still": "gotcha"}',
+    })
+    identity = _identity(zip_path)
+
+    real_stored_path = provenance._stored_path
+
+    def _fake_stored_path(room, member, *, orphaned):
+        if member.path.endswith("evil.json"):
+            raise ValueError("simulated sanitization gap")
+        return real_stored_path(room, member, orphaned=orphaned)
+
+    monkeypatch.setattr(provenance, "_stored_path", _fake_stored_path)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        with caplog.at_level(logging.WARNING):
+            written = provenance.preserve(organized, identity, zf, _members(zf), orphaned=set())
+
+    room = organized / provenance.ROOM_NAME / identity.archive_id
+    assert (room / "Takeout" / "archive_browser.html").read_bytes() == b"<html>viewer</html>"
+    assert not (room / "Takeout" / "evil.json").exists()
+    assert written == 1
+    assert any(
+        "evil.json" in record.message or "outside its room" in record.message
+        for record in caplog.records
+    )
+
+
 def test_a_write_failure_is_logged_and_does_not_raise(dirs, monkeypatch, caplog) -> None:
     archives, organized = dirs
     zip_path = _zip(archives / "t.zip", {

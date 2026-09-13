@@ -54,8 +54,12 @@ _MANIFEST_NAME = "manifest.json"
 
 # Mirrors archive._safe_name: only genuinely filesystem-illegal characters are
 # replaced. Applied per path COMPONENT (not the whole member path) so a
-# preserved member keeps its real directory structure on disk.
-_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+# preserved member keeps its real directory structure on disk. Backslash is
+# included not for cosmetic reasons but because it is the zip-slip vector:
+# pathlib on Windows treats "\" as a path separator, so a component of e.g.
+# "..\\..\\..\\pwned.txt" would expand into separators once joined onto the
+# room, walking OUT of it.
+_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 
 
 def _safe_component(name: str) -> str:
@@ -88,12 +92,23 @@ def manifest_path(organized_dir: Path, archive_id: str) -> Path:
 def _stored_path(room: Path, member: "archive.MemberInfo", *, orphaned: bool) -> Path:
     basename = _safe_component(member.path.rpartition("/")[2])
     if orphaned:
-        return room / _ORPHANED_DIR / basename
-    if member.kind == archive.KIND_ALBUM:
+        candidate = room / _ORPHANED_DIR / basename
+    elif member.kind == archive.KIND_ALBUM:
         folder = member.path.rpartition("/")[0].rpartition("/")[2]
         folder_safe = _safe_component(folder) if folder else "_"
-        return room / _ALBUMS_DIR / folder_safe / basename
-    return room / _safe_relpath(member.path)
+        candidate = room / _ALBUMS_DIR / folder_safe / basename
+    else:
+        candidate = room / _safe_relpath(member.path)
+
+    # Defense-in-depth: sanitization above should already guarantee
+    # containment, but a member path is never allowed to write outside the
+    # room it was handed, so enforce it explicitly rather than trust every
+    # branch above to have gotten it right forever.
+    if not candidate.resolve().is_relative_to(room.resolve()):
+        raise ValueError(
+            f"refusing to preserve member outside its room: {member.path!r}"
+        )
+    return candidate
 
 
 def _write_bytes(dest: Path, data: bytes) -> None:
@@ -174,7 +189,14 @@ def preserve(
             continue  # already preserved, byte-identical -- nothing to do
 
         is_orphaned = member.path in orphaned_set
-        dest = _stored_path(room, member, orphaned=is_orphaned)
+        try:
+            dest = _stored_path(room, member, orphaned=is_orphaned)
+        except ValueError as exc:
+            logger.warning(
+                "Refusing to preserve %s from %s outside its room; skipping: %s",
+                member.path, identity.path.name, exc,
+            )
+            continue
         try:
             _write_bytes(dest, data)
         except Exception as exc:
