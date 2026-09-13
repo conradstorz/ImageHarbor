@@ -8,7 +8,17 @@ dynamic = ["version"]
 description = "Deterministic, resumable photo organization system"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "AGPL-3.0-or-later" }
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Conrad Storz", email = "conradstorz@gmail.com" }]
+keywords = ["photos", "photo-organization", "exif", "sha256", "google-takeout", "deduplication"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics",
+]
 dependencies = [
     "Pillow>=10.0.0",
     "click>=8.0.0",
@@ -41,6 +51,10 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
 ]
+
+[project.urls]
+Homepage = "https://github.com/conradstorz/ImageHarbor"
+Changelog = "https://github.com/conradstorz/ImageHarbor/blob/main/CHANGELOG.md"
 
 [project.scripts]
 imageharbor = "imageharbor.cli:main"
