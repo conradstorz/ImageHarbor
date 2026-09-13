@@ -51,3 +51,25 @@ jobs:
           push: false
           build-args: |
             IMAGEHARBOR_VERSION=0.0.0
+
+  faces-onnx:
+    # Advisory (not in branch protection): exercises the real ONNX boundary
+    # (detect.py/embed.py, 0% covered by the default suite) with cached,
+    # checksum-pinned weights. A registry/download flake must not gate merges.
+    runs-on: ubuntu-latest
+    env:
+      IMAGEHARBOR_FACE_MODEL_DIR: ${{ github.workspace }}/.imageharbor-models
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked --extra dev --extra faces
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.IMAGEHARBOR_FACE_MODEL_DIR }}
+          key: face-models-${{ hashFiles('imageharbor/faces/models.py') }}
+      - run: uv run imageharbor faces models download --model-dir "$IMAGEHARBOR_FACE_MODEL_DIR"
+      - run: uv run pytest tests/faces/test_detect.py tests/faces/test_embed.py tests/faces/test_preprocess.py -v
