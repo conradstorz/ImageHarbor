@@ -556,6 +556,62 @@ def test_consume_source_falls_back_to_copy_across_filesystems(
     assert not staged.exists()
 
 
+def test_exdev_fallback_with_a_read_only_source_still_copies(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """Regression pin for R3 review Minor #4.
+
+    The EXDEV fallback's copyfile -> fsync -> copystat sequence exists
+    specifically so a read-only source (e.g. an RO-mounted NAS share) can
+    never make fsync_file's "rb+" open fail: fsync must run while the
+    destination is still writable, i.e. strictly BEFORE copystat applies
+    the source's read-only mode onto it. This also pins that the (now
+    relocated) fsync for a *successful* os.replace sits outside the
+    `except OSError` that interprets EXDEV -- so a hypothetical
+    fsync-raised OSError(EXDEV) can never be misread as a cross-device move
+    that needs the copy fallback.
+    """
+    import os as _os
+    import shutil as _shutil
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+    staged.chmod(0o444)
+
+    def _exdev(src, dst):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(_os, "replace", _exdev)
+
+    real_copystat = _shutil.copystat
+
+    def _copystat_then_restore_source_write_bit(src, dst, *args, **kwargs):
+        # Real copystat, so the destination genuinely ends up read-only,
+        # exactly like production. Windows (unlike POSIX) ties file
+        # deletion to the read-only attribute itself, so the source's write
+        # bit is restored immediately afterward purely so the pipeline's
+        # own post-verification unlink can succeed on this platform --
+        # POSIX never cared about a file's own permission bits for unlink
+        # in the first place.
+        real_copystat(src, dst, *args, **kwargs)
+        _os.chmod(src, 0o644)
+
+    monkeypatch.setattr(_shutil, "copystat", _copystat_then_restore_source_write_bit)
+
+    try:
+        result = Pipeline(
+            tmp_path, organized_dir, catalog, consume_source=True
+        ).process_file(staged)
+
+        assert result.status == "copied"
+        assert result.organized_path.exists()
+        assert verify_pcs_file(result.organized_path)
+        assert not staged.exists()  # removed only after verification
+        assert catalog.get_by_sha256(result.sha256_b64url) is not None
+    finally:
+        if staged.exists():
+            staged.chmod(0o644)
+
+
 def test_a_non_exdev_oserror_is_not_swallowed_as_a_cross_device_move(
     tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
 ) -> None:

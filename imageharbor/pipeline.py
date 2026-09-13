@@ -322,14 +322,6 @@ class Pipeline:
             if self.consume_source:
                 try:
                     os.replace(str(source_path), str(organized_path))
-                    # The staged file is our own extraction (caller-owned,
-                    # disposable), never a read-only source, so it is always
-                    # writable -- fsync it here, right after the move, so
-                    # verify below can't read back through the page cache
-                    # for bytes that never reached the platter. A failure
-                    # here has a non-EXDEV errno and is re-raised below
-                    # rather than silently treated as "fall back to copy".
-                    fsync_file(organized_path)
                 except OSError as exc:
                     if exc.errno != errno.EXDEV:
                         raise
@@ -358,6 +350,21 @@ class Pipeline:
                     fsync_file(organized_path)
                     shutil.copystat(str(source_path), str(organized_path))
                     consumed_by_copy = True
+                if not consumed_by_copy:
+                    # The staged file is our own extraction (caller-owned,
+                    # disposable), never a read-only source, so it is always
+                    # writable -- fsync it here, right after the move, so
+                    # verify below can't read back through the page cache
+                    # for bytes that never reached the platter. Deliberately
+                    # OUTSIDE the try/except above (R3 review Minor #4): a
+                    # (hypothetical) fsync-raised OSError(EXDEV) must never
+                    # be caught by the `except OSError` guarding os.replace
+                    # and misread as a cross-device move -- the move already
+                    # succeeded. The copy fallback above already fsynced the
+                    # bytes it wrote (before copystat, for the read-only-
+                    # source reason described there), so this is exactly one
+                    # fsync per written path, never two.
+                    fsync_file(organized_path)
             else:
                 # See the EXDEV-fallback comment above: copyfile (writable
                 # destination) -> fsync -> copystat (source mode/mtime),
