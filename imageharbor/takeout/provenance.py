@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..hashing import compute_sha256_b64url_bytes
+from ..util import fsync_file
 from . import archive
 
 logger = logging.getLogger(__name__)
@@ -121,8 +122,12 @@ def _write_bytes(dest: Path, data: bytes) -> None:
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(dest)
+    try:
+        tmp.write_bytes(data)
+        fsync_file(tmp)
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _load_manifest(path: Path) -> dict:

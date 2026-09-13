@@ -135,7 +135,9 @@ CREATE TABLE IF NOT EXISTS runs (
     duplicates    INTEGER NOT NULL DEFAULT 0,
     errors        INTEGER NOT NULL DEFAULT 0,
     enriched      INTEGER NOT NULL DEFAULT 0,
-    enrich_failed INTEGER NOT NULL DEFAULT 0,
+    enrich_failed INTEGER NOT NULL DEFAULT 0,  -- total; see enrich_ai_failed/enrich_io_failed below
+    enrich_ai_failed INTEGER NOT NULL DEFAULT 0,  -- subset of enrich_failed: AI-perception failures
+    enrich_io_failed INTEGER NOT NULL DEFAULT 0,  -- subset of enrich_failed: local/I-O failures
     breaker_state TEXT    NOT NULL DEFAULT 'CLOSED',
     paused        INTEGER NOT NULL DEFAULT 0  -- pass ended because of a pause
 );
@@ -187,6 +189,15 @@ _ADDED_PHOTO_COLUMNS: tuple[tuple[str, str], ...] = (
     ("descriptor_source", "TEXT NOT NULL DEFAULT 'none'"),
     ("scene", "TEXT NOT NULL DEFAULT ''"),
     ("enriched_at", "TEXT"),
+)
+
+# Columns added to `runs` after the original schema shipped (deferred #13:
+# split `enrich_failed` into AI-perception vs I/O failure counts). Applied
+# additively on open, mirroring `_ADDED_PHOTO_COLUMNS`/`_ensure_photo_columns`
+# so an existing catalog upgrades in place without bumping SCHEMA_VERSION.
+_ADDED_RUN_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("enrich_ai_failed", "INTEGER NOT NULL DEFAULT 0"),
+    ("enrich_io_failed", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -270,6 +281,7 @@ class Catalog:
             self._conn.execute("PRAGMA busy_timeout=5000;")
             self._conn.executescript(_SCHEMA)
             self._ensure_photo_columns()
+            self._ensure_run_columns()
             self._conn.commit()
             self._guard_legacy_catalog()
         except BaseException:
@@ -293,6 +305,16 @@ class Catalog:
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE photos ADD COLUMN {name} {ddl}")
                 logger.debug("Catalog upgraded: added photos.%s", name)
+
+    def _ensure_run_columns(self) -> None:
+        """Add post-1.0 columns to `runs` if this DB predates them."""
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")
+        }
+        for name, ddl in _ADDED_RUN_COLUMNS:
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {ddl}")
+                logger.debug("Catalog upgraded: added runs.%s", name)
 
     def _guard_legacy_catalog(self) -> None:
         """Refuse to open a pre-redesign catalog in place; stamp a fresh one.
@@ -1052,18 +1074,22 @@ class Catalog:
         enrich_failed: int,
         breaker_state: str,
         paused: bool,
+        enrich_ai_failed: int = 0,
+        enrich_io_failed: int = 0,
     ) -> None:
         with self.lock:
             self._conn.execute(
                 """
                 UPDATE runs
                 SET ended_at=?, scanned=?, copied=?, duplicates=?, errors=?,
-                    enriched=?, enrich_failed=?, breaker_state=?, paused=?
+                    enriched=?, enrich_failed=?, breaker_state=?, paused=?,
+                    enrich_ai_failed=?, enrich_io_failed=?
                 WHERE id=?
                 """,
                 (
                     _now_iso(), scanned, copied, duplicates, errors,
                     enriched, enrich_failed, breaker_state, int(paused),
+                    enrich_ai_failed, enrich_io_failed,
                     run_id,
                 ),
             )

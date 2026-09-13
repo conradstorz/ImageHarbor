@@ -46,12 +46,19 @@ def ensure(info: ModelInfo, model_dir: Path) -> Path:
     if not target.exists():
         logger.info("downloading face model %s from %s", info.name, info.url)
         tmp = target.with_suffix(target.suffix + ".part")
-        urllib.request.urlretrieve(info.url, tmp)  # noqa: S310 - pinned URL
-        tmp.replace(target)
+        try:
+            urllib.request.urlretrieve(info.url, tmp)  # noqa: S310 - pinned URL
+            tmp.replace(target)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     actual = _sha256(target)
     if actual != info.sha256:
+        # Delete the bad artifact: leaving it wedges every future run behind
+        # the `not target.exists()` gate with the same failure and no exit.
+        target.unlink(missing_ok=True)
         raise ChecksumMismatch(
-            f"{info.filename}: expected {info.sha256}, got {actual}"
+            f"{info.filename}: expected {info.sha256}, got {actual}; the "
+            "artifact was removed -- re-run to re-download"
         )
     return target

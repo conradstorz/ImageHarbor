@@ -135,28 +135,69 @@ def enrich_library(
                     break
             continue
 
-        if breaker is not None:
-            breaker.record_success()
-
         # Everything below is LOCAL work -- taxonomy, catalog, filesystem --
-        # not a backend call, so it must never feed the breaker, and any
-        # failure here is I/O evidence, not AI evidence, so it goes to
-        # stats.io_failed (never ai_failed / quarantine). It is also
-        # isolated per row: the queue is ordered by id, and a row that raises
-        # here is marked neither enriched nor failed, so an escaping
-        # exception would crash on the same row every subsequent pass and
-        # permanently block every row behind it (mirrors
-        # Pipeline._process_one, which wraps its whole per-file body for the
-        # same reason). An escape would also bypass stats.io_failed entirely,
-        # silently dropping this row from the pass's failure accounting.
+        # not a backend call, so a failure anywhere in this block must never
+        # feed the breaker. It is handled as I/O evidence (stats.io_failed,
+        # never ai_failed / quarantine) by the single outer try/except that
+        # wraps the whole block. This isolation is per row: the queue is
+        # ordered by id, and a row that raises here is marked neither
+        # enriched nor failed, so an escaping exception would crash on the
+        # same row every subsequent pass and permanently block every row
+        # behind it (mirrors Pipeline._process_one, which wraps its whole
+        # per-file body for the same reason). An escape would also bypass
+        # stats.io_failed entirely, silently dropping this row from the
+        # pass's failure accounting. class_for() and remember() do real
+        # SQLite I/O and must stay inside this same outer try for exactly
+        # that reason.
+        #
+        # The pick_class fallback just below is the one exception within
+        # this block: it is a real backend chat call, exactly like describe()
+        # above, so it keeps its own NESTED try/except that handles a
+        # failure there as AI evidence instead -- ai_failed, feeds the
+        # breaker, aborts the pass on trip -- rather than letting the outer
+        # except's io_failed handling swallow it. The nested `continue`/
+        # `break` inside the outer try are fine; they still act on the for
+        # loop. adjudicate() is different and is NOT special-cased here:
+        # taxonomy.resolve_or_create catches it internally and degrades to
+        # minting a new code.
         try:
-            # Organization: our code picks the class; the AI is only a fallback.
             cls = concept_map.class_for(
                 content.primary_subject, content.objects, content.scene, catalog
             )
             if cls is None:
-                cls = classifier.pick_class(content, classes)
+                # The text-only fallback is a BACKEND call on a real classifier
+                # (OpenAIClassifier.pick_class -> chat.completions) -- its
+                # failure is AI evidence, handled exactly like a describe()
+                # failure.
+                try:
+                    cls = classifier.pick_class(content, classes)
+                except Exception as exc:
+                    logger.warning(
+                        "Class fallback failed for %s: %s", actual.name, exc
+                    )
+                    stats.errors += 1
+                    stats.ai_failed.append(digest)
+                    if breaker is not None:
+                        breaker.record_failure()
+                        if breaker.is_open():
+                            logger.error(
+                                "AI backend appears down — aborting enrichment "
+                                "after repeated failures in the class fallback"
+                            )
+                            stats.aborted = True
+                            break
+                    continue
                 concept_map.remember(catalog, content.primary_subject, cls)
+
+            # Recorded here -- once every backend call this row needed (describe,
+            # and pick_class when the concept map missed) has actually succeeded
+            # -- rather than right after describe(). Recording success right
+            # after describe() would reset the breaker's consecutive-failure
+            # counter on every row even when that row's pick_class call then
+            # fails, making a run of pick_class-only failures unable to ever
+            # reach trip_threshold.
+            if breaker is not None:
+                breaker.record_success()
 
             pcs_code = taxonomy.resolve_or_create(
                 cls, content.primary_subject, adjudicator=classifier.adjudicate
@@ -244,23 +285,30 @@ def enrich_library(
                 )
 
             if write_sidecars:
+                updates: dict = {
+                    "classification": {
+                        "pcs_code": pcs_code,
+                        "folder_path": taxonomy.folder_path(pcs_code),
+                        "primary_subject": content.primary_subject,
+                        "scene": content.scene,
+                        "caption": content.caption,
+                        "objects": content.objects,
+                        "tags": content.tags,
+                        "ocr_text": content.ocr_text,
+                        "model_version": content.model_version,
+                    }
+                }
+                if final_path is not actual:
+                    # The rename fired: record the descriptor the filename
+                    # now carries, so sidecar, filename, and catalog agree.
+                    # Deferred-known-issues #9.
+                    updates["descriptor"] = {
+                        "value": descriptor,
+                        "tier": tiers.DESC_AI_SUBJECT,
+                        "source": tiers.DESC_SOURCE_NAMES[tiers.DESC_AI_SUBJECT],
+                    }
                 try:
-                    merge_sidecar(
-                        final_path,
-                        {
-                            "classification": {
-                                "pcs_code": pcs_code,
-                                "folder_path": taxonomy.folder_path(pcs_code),
-                                "primary_subject": content.primary_subject,
-                                "scene": content.scene,
-                                "caption": content.caption,
-                                "objects": content.objects,
-                                "tags": content.tags,
-                                "ocr_text": content.ocr_text,
-                                "model_version": content.model_version,
-                            }
-                        },
-                    )
+                    merge_sidecar(final_path, updates)
                 except Exception:
                     logger.warning(
                         "Failed to update sidecar for %s", final_path, exc_info=True

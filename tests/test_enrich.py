@@ -1,6 +1,6 @@
 """Tests for the AI enrichment pass and its non-degradation guarantee."""
 
-from imageharbor import tiers
+from imageharbor import concept_map, tiers
 from imageharbor.ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from imageharbor.catalog import Catalog
 from imageharbor.enrich import enrich_library
@@ -324,4 +324,193 @@ def test_pause_check_true_from_the_start_enriches_nothing(tmp_path):
     assert stats.total == 0
     assert stats.enriched == 0
     assert cat.get_by_sha256(result.sha256_b64url)["enriched_at"] is None
+    cat.close()
+
+
+# ---------------------------------------------------------------------------
+# A renamed file's sidecar agrees with its own filename (deferred #9, R3 Task 5)
+# ---------------------------------------------------------------------------
+
+
+def test_a_renamed_files_sidecar_agrees_with_its_own_filename(tmp_path):
+    """Deferred issue #9: enrich merged only `classification`, so the sidecar
+    kept the facts-pass descriptor and contradicted the filename it sits
+    beside -- self-contradictory in exactly the case the tier system exists
+    to make legible.
+    """
+    import json
+    from pathlib import Path
+
+    from imageharbor.sidecar import sidecar_path_for
+
+    cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
+
+    stats = enrich_library(cat, dest, FixedClassifier(), write_sidecars=True)
+    assert stats.renamed == 1
+
+    renamed = Path(cat.get_by_sha256(result.sha256_b64url)["organized_path"])
+    doc = json.loads(sidecar_path_for(renamed).read_text(encoding="utf-8"))
+
+    assert doc["descriptor"]["tier"] == tiers.DESC_AI_SUBJECT
+    assert doc["descriptor"]["value"] in renamed.name
+    # The facts-pass block is history, not lost (never-lose rule).
+    assert any(
+        h.get("tier") == tiers.DESC_NONE for h in doc["descriptor"].get("history", [])
+    )
+    cat.close()
+
+
+def test_re_enriching_leaves_the_descriptor_sidecar_byte_identical(tmp_path):
+    """Idempotence: re-enriching an already-renamed row must not grow the
+    sidecar's descriptor history -- the merge must dedupe the superseded
+    block by value, or a repeated pass would leak history forever.
+    """
+    from pathlib import Path
+
+    from imageharbor.sidecar import sidecar_path_for
+
+    cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
+    enrich_library(cat, dest, FixedClassifier(), write_sidecars=True)
+
+    renamed = Path(cat.get_by_sha256(result.sha256_b64url)["organized_path"])
+    before = sidecar_path_for(renamed).read_bytes()
+
+    stats = enrich_library(cat, dest, FixedClassifier(), write_sidecars=True, reclassify=True)
+    assert stats.total == 1
+
+    after_path = Path(cat.get_by_sha256(result.sha256_b64url)["organized_path"])
+    assert after_path == renamed  # no further rename fired
+    after = sidecar_path_for(after_path).read_bytes()
+
+    assert after == before
+    cat.close()
+
+
+# ---------------------------------------------------------------------------
+# pick_class fallback failures are AI evidence (R3 Task 1)
+# ---------------------------------------------------------------------------
+
+
+class DescribesButCannotPick(StubClassifier):
+    """describe() succeeds (perception is fine); pick_class() dies.
+
+    Models a real OpenAIClassifier whose backend goes down between the
+    describe() chat call and the pick_class() chat call for a concept-map
+    miss -- pick_class is a network call too, so its failure is the same
+    kind of AI evidence describe()'s failure is.
+    """
+
+    def pick_class(self, content, classes):
+        raise RuntimeError("backend died mid-pass")
+
+
+def test_a_pick_class_failure_is_ai_evidence_and_feeds_the_breaker(tmp_path):
+    from imageharbor.circuit_breaker import CircuitBreaker
+
+    # Nonsense stems so concept_map.class_for misses for every row (StubClassifier
+    # derives primary_subject from the filename, and none of these words are in
+    # STATIC_SEED or the learned-concepts store).
+    src = _make(tmp_path, "zzxxqq1.jpg", b"one")
+    (src / "zzxxqq2.jpg").write_bytes(b"two")
+    (src / "zzxxqq3.jpg").write_bytes(b"three")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    breaker = CircuitBreaker(trip_threshold=3, backoff_base=1.0, backoff_cap=1.0)
+    stats = enrich_library(cat, dest, DescribesButCannotPick(), breaker=breaker)
+
+    assert stats.ai_failed  # not io_failed
+    assert stats.io_failed == []
+    assert stats.aborted is True  # breaker opened and the pass stopped
+    assert breaker.is_open()
+    cat.close()
+
+
+def test_a_concept_map_hit_never_calls_pick_class(tmp_path):
+    """A learned-concepts hit must enrich fine even with a broken pick_class.
+
+    Proves the pick_class fallback is the only new breaker-feeding path --
+    a subject the concept map already knows never reaches pick_class at all.
+    """
+    cat, dest, result = _facts(tmp_path, "beachy.jpg")
+    cat.learned_concept_remember("beachy", "600")
+
+    stats = enrich_library(cat, dest, DescribesButCannotPick())
+
+    assert stats.enriched == 1
+    assert stats.ai_failed == []
+    assert stats.errors == 0
+    cat.close()
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: class_for()/remember() are LOCAL SQLite I/O, not backend calls
+# -- a raise there must stay inside the per-row outer try/except (io_failed,
+# breaker untouched, pass continues to later rows), never escape
+# enrich_library entirely.
+# ---------------------------------------------------------------------------
+
+
+def test_a_class_for_failure_is_io_evidence_and_the_pass_continues(tmp_path, monkeypatch):
+    from imageharbor.circuit_breaker import BreakerState, CircuitBreaker
+
+    src = _make(tmp_path, "IMG_1.jpg", b"one")
+    (src / "IMG_2.jpg").write_bytes(b"two")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("catalog I/O exploded in class_for")
+
+    monkeypatch.setattr(concept_map, "class_for", boom)
+
+    # trip_threshold=1 means a single fed failure would open the breaker --
+    # this proves class_for's failure never reaches record_failure().
+    breaker = CircuitBreaker(trip_threshold=1, backoff_base=1.0, backoff_cap=1.0)
+    stats = enrich_library(cat, dest, FixedClassifier(), breaker=breaker)
+
+    # Both rows were reached -- the exception in row 1 did not abort the pass.
+    assert stats.total == 2
+    assert len(stats.io_failed) == 2
+    assert stats.ai_failed == []
+    assert stats.enriched == 0
+    assert stats.aborted is False
+    assert breaker.state == BreakerState.CLOSED
+    cat.close()
+
+
+def test_a_remember_failure_is_io_evidence_and_the_pass_continues(tmp_path, monkeypatch):
+    from imageharbor.circuit_breaker import CircuitBreaker
+
+    # Nonsense stems so concept_map.class_for misses for every row (as in
+    # test_a_pick_class_failure_is_ai_evidence_and_feeds_the_breaker above),
+    # which drives every row through the pick_class fallback. StubClassifier's
+    # pick_class inherits the ABC default (900) and never raises, so it
+    # succeeds and remember() is reached.
+    src = _make(tmp_path, "zzxxqq1.jpg", b"one")
+    (src / "zzxxqq2.jpg").write_bytes(b"two")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("catalog I/O exploded in remember")
+
+    monkeypatch.setattr(concept_map, "remember", boom)
+
+    breaker = CircuitBreaker(trip_threshold=1, backoff_base=1.0, backoff_cap=1.0)
+    stats = enrich_library(cat, dest, StubClassifier(), breaker=breaker)
+
+    assert stats.total == 2
+    assert len(stats.io_failed) == 2
+    assert stats.ai_failed == []
+    assert stats.enriched == 0
+    assert stats.aborted is False
+    # remember() (enrich.py:190) runs before record_success() (:199-200), so
+    # on this path the breaker is never touched at all -- neither success nor
+    # failure is recorded; the load-bearing assertion is only that it never
+    # opened.
+    assert not breaker.is_open()
     cat.close()

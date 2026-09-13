@@ -664,6 +664,33 @@ def test_run_once_writes_an_enrich_run_row_when_enrichment_runs(
     assert enrich_row["paused"] == 0
 
 
+def test_run_once_enrich_row_splits_ai_and_io_failures(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """`enrich_ai_failed` reflects `EnrichStats.ai_failed`, `enrich_io_failed`
+    the remainder, and `enrich_failed` stays their sum -- see deferred #13."""
+    from imageharbor import watcher as watcher_module
+
+    src = _src_with(tmp_path, 2)
+    pipeline = Pipeline(src, organized_dir, catalog)
+    # breaker=None -> no trip/abort, so both files run through a classifier
+    # whose describe() always raises: every failure here is AI-perception
+    # evidence, none of it I/O.
+    facts, enrich_stats = watcher_module.run_once(
+        src, organized_dir, catalog, classifier=_AlwaysFails(), pipeline=pipeline,
+        breaker=None,
+    )
+
+    assert enrich_stats is not None
+    assert len(enrich_stats.ai_failed) == 2
+    assert len(enrich_stats.io_failed) == 0
+    rows = {row["kind"]: row for row in catalog.recent_runs(limit=5)}
+    enrich_row = rows["enrich"]
+    assert enrich_row["enrich_ai_failed"] == 2
+    assert enrich_row["enrich_io_failed"] == 0
+    assert enrich_row["enrich_failed"] == enrich_row["enrich_ai_failed"] + enrich_row["enrich_io_failed"]
+
+
 def test_run_once_writes_no_enrich_row_when_the_breaker_is_open(
     tmp_path: Path, organized_dir: Path, catalog: Catalog
 ) -> None:
@@ -848,6 +875,11 @@ def test_enrich_pass_that_raises_still_closes_its_row(
     assert rows["enrich"]["errors"] == 0
     assert rows["enrich"]["enrich_failed"] == 1
     assert rows["enrich"]["enriched"] == 0
+    # The crash-in-flight increment is local-work evidence (a raised
+    # exception outside classifier.describe()), never AI-perception
+    # evidence, so it counts as I/O here.
+    assert rows["enrich"]["enrich_ai_failed"] == 0
+    assert rows["enrich"]["enrich_io_failed"] == 1
 
 
 def test_watch_server_survives_a_crashed_pass_and_keeps_reporting(

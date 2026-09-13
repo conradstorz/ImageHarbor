@@ -28,6 +28,7 @@ from .exif_reader import read_exif
 from .hashing import compute_sha256_b64url, verify_file
 from .relocate import apply_relocation, resolve_organized_path, target_path
 from .sidecar import merge_sidecar, sidecar_path_for
+from .util import fsync_file
 
 if TYPE_CHECKING:
     from .date_resolver import ResolvedDate
@@ -321,6 +322,14 @@ class Pipeline:
             if self.consume_source:
                 try:
                     os.replace(str(source_path), str(organized_path))
+                    # The staged file is our own extraction (caller-owned,
+                    # disposable), never a read-only source, so it is always
+                    # writable -- fsync it here, right after the move, so
+                    # verify below can't read back through the page cache
+                    # for bytes that never reached the platter. A failure
+                    # here has a non-EXDEV errno and is re-raised below
+                    # rather than silently treated as "fall back to copy".
+                    fsync_file(organized_path)
                 except OSError as exc:
                     if exc.errno != errno.EXDEV:
                         raise
@@ -337,10 +346,26 @@ class Pipeline:
                     # other OSError (e.g. a permissions fault on the
                     # destination) is a real fault and must surface rather
                     # than masquerade as a cross-device move.
-                    shutil.copy2(str(source_path), str(organized_path))
+                    #
+                    # copyfile creates the destination with default (writable)
+                    # permissions, so fsync_file's "rb+" handle can open it even
+                    # when the source is read-only (e.g. an RO-mounted NAS
+                    # share); copystat then applies the source's mode/mtime --
+                    # the same metadata shutil.copy2 would have copied -- AFTER
+                    # the bytes are durable, so a read-only source can never
+                    # make fsync_file fail with a permissions error.
+                    shutil.copyfile(str(source_path), str(organized_path))
+                    fsync_file(organized_path)
+                    shutil.copystat(str(source_path), str(organized_path))
                     consumed_by_copy = True
             else:
-                shutil.copy2(str(source_path), str(organized_path))
+                # See the EXDEV-fallback comment above: copyfile (writable
+                # destination) -> fsync -> copystat (source mode/mtime),
+                # so a read-only source (production: an RO-mounted NAS
+                # share) never makes fsync_file's "rb+" open fail.
+                shutil.copyfile(str(source_path), str(organized_path))
+                fsync_file(organized_path)
+                shutil.copystat(str(source_path), str(organized_path))
 
             # Step 7: verify before anything is recorded. This reads the file
             # at its DESTINATION either way, so the move path is verified

@@ -342,11 +342,11 @@ def test_pipeline_resume_skips_copy_when_dest_verifies(
     # the images are unknown, but the verified organized files already exist.
     fresh_catalog = Catalog(tmp_path / "fresh.db")
 
-    # copy2 must NOT be called for a destination that already exists and verifies.
+    # copyfile must NOT be called for a destination that already exists and verifies.
     def _no_copy(*_a, **_k):
-        raise AssertionError("shutil.copy2 must not be called on a verified resume")
+        raise AssertionError("shutil.copyfile must not be called on a verified resume")
 
-    monkeypatch.setattr("imageharbor.pipeline.shutil.copy2", _no_copy)
+    monkeypatch.setattr("imageharbor.pipeline.shutil.copyfile", _no_copy)
 
     try:
         stats = Pipeline(source_dir, organized_dir, fresh_catalog).run()
@@ -873,3 +873,103 @@ def test_pause_check_consulted_before_each_photo_not_after(
     assert stats.total == 0
     assert list(organized_dir.rglob("*.jpg")) == []
     assert catalog.count() == 0
+
+
+def test_the_copy_is_fsynced_before_it_is_verified(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """Power-loss gap: verify_file reads the page cache, so without an fsync
+    the catalog can durably record 'verified' for bytes that never reached
+    disk. Pin the order: fsync happens, and happens before verify, for the
+    file whose bytes were actually written.
+    """
+    from imageharbor import pipeline as pipeline_mod
+
+    staged = _make_jpeg(tmp_path / "beach.jpg")
+
+    events: list[tuple[str, str]] = []
+    real_fsync = pipeline_mod.fsync_file
+    real_verify = pipeline_mod.verify_file
+
+    def _fsync(path):
+        events.append(("fsync", Path(path).name))
+        return real_fsync(path)
+
+    def _verify(path, digest):
+        events.append(("verify", Path(path).name))
+        return real_verify(path, digest)
+
+    monkeypatch.setattr(pipeline_mod, "fsync_file", _fsync)
+    monkeypatch.setattr(pipeline_mod, "verify_file", _verify)
+
+    result = Pipeline(tmp_path, organized_dir, catalog).process_file(staged)
+
+    assert result.status == "copied"
+    fsync_events = [i for i, e in enumerate(events) if e[0] == "fsync"]
+    verify_events = [i for i, e in enumerate(events) if e[0] == "verify"]
+    assert fsync_events, "fsync_file was never called"
+    assert verify_events, "verify_file was never called"
+    assert fsync_events[0] < verify_events[0]
+
+
+def test_the_already_verified_fast_path_performs_no_fsync(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch
+) -> None:
+    """pipeline.py:310's fast path writes nothing, so it must not fsync either."""
+    from imageharbor import pipeline as pipeline_mod
+
+    src = tmp_path / "src"
+    src.mkdir()
+    photo = _make_jpeg(src / "beach.jpg")
+
+    # First run creates and verifies the destination for real.
+    Pipeline(src, organized_dir, catalog).process_file(photo)
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        pipeline_mod, "fsync_file", lambda p: events.append(Path(p).name)
+    )
+
+    # Re-running with a fresh catalog exercises the "already present and
+    # verified" branch rather than the duplicate-detection branch.
+    fresh_catalog = Catalog(tmp_path / "catalog2.db")
+    try:
+        result = Pipeline(src, organized_dir, fresh_catalog).process_file(photo)
+    finally:
+        fresh_catalog.close()
+
+    assert result.status == "copied"
+    assert events == []
+
+
+def test_a_read_only_source_file_still_copies_verifies_and_catalogs(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """Regression: fsync_file opens "rb+", and shutil.copy2 preserves the
+    source's mode bits -- so a read-only source (production: an RO-mounted
+    NAS share, mode 0o444) used to yield a read-only destination that
+    fsync_file could not open, raising PermissionError and degrading the
+    file to status="error". The fix fsyncs while the destination is still
+    default-permission/writable and only then copies the source's mode via
+    shutil.copystat, so a read-only source must still copy cleanly.
+    """
+    import os
+
+    src = tmp_path / "src"
+    src.mkdir()
+    photo = _make_jpeg(src / "beach.jpg")
+    os.chmod(photo, 0o444)
+
+    try:
+        result = Pipeline(src, organized_dir, catalog).process_file(photo)
+
+        assert result.status == "copied"
+        organized = list(organized_dir.rglob("*.jpg"))
+        assert len(organized) == 1
+        assert verify_pcs_file(organized[0])
+    finally:
+        # Restore write bits so tmp_path teardown (rmtree) doesn't choke on
+        # a read-only file, especially on Windows.
+        os.chmod(photo, 0o666)
+        for organized_file in organized_dir.rglob("*.jpg"):
+            os.chmod(organized_file, 0o666)

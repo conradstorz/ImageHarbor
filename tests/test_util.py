@@ -3,9 +3,27 @@ copy-pasted across catalog.py, sidecar.py, and faces/ with a "keep the two
 in sync" comment -- the class of hand-maintained invariant this codebase
 otherwise refuses to have."""
 
+import os
 from datetime import datetime
 
-from imageharbor.util import json_default, now_iso
+import pytest
+
+from imageharbor.util import fsync_file, json_default, now_iso
+
+
+def test_fsync_file_syncs_and_propagates_oserror(tmp_path, monkeypatch):
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"data")
+    called = {}
+    monkeypatch.setattr(os, "fsync", lambda fd: called.setdefault("fd", fd))
+    fsync_file(f)
+    assert "fd" in called
+
+    monkeypatch.setattr(
+        os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("disk gone"))
+    )
+    with pytest.raises(OSError):
+        fsync_file(f)
 
 
 def test_now_iso_is_utc_aware_isoformat():
