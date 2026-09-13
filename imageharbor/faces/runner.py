@@ -22,10 +22,13 @@ import click
 import numpy as np
 from PIL import Image
 
+from ..catalog import Catalog
 from ..sidecar import merge_sidecar
 from ..util import now_iso as _now_iso
 from . import attribute, calibrate, cluster
 from .align import DegenerateLandmarks, align_crop
+from .interfaces import DetectorLike, EmbedderLike
+from .store import FaceStore, ScannedFace
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +56,7 @@ class ScanResult:
 
 
 def _work_queue(
-    catalog, store, detect_model: str
+    catalog: Catalog, store: FaceStore, detect_model: str
 ) -> Iterator[tuple[str, str]]:
     """Yield `(digest, organized_path)` for organized photos not yet scanned.
 
@@ -76,12 +79,12 @@ def _work_queue(
 
 def _scan_one(
     path: Path,
-    detector,
-    embedder,
+    detector: DetectorLike,
+    embedder: EmbedderLike,
     gate: QualityGate,
     crop_dir: Path,
     digest: str,
-    store,
+    store: FaceStore,
 ) -> tuple[int, int]:
     """Detect, gate, align, and embed one photo's faces. Returns (kept, rejected)."""
     # Context-managed, not a bare `Image.open`: on the success path Pillow
@@ -95,13 +98,13 @@ def _scan_one(
 
         detections = detector.detect(img)
 
-        records: list[tuple] = []
+        records: list[ScannedFace] = []
         kept_detections = []
         for det in detections:
             if det.score < gate.min_score:
-                records.append((det, None, None, "low_score"))
+                records.append(ScannedFace(det, None, None, "low_score"))
             elif min(det.w, det.h) < gate.min_box:
-                records.append((det, None, None, "too_small"))
+                records.append(ScannedFace(det, None, None, "too_small"))
             else:
                 kept_detections.append(det)
 
@@ -111,7 +114,7 @@ def _scan_one(
             try:
                 crops.append(align_crop(img, det.landmarks))
             except DegenerateLandmarks:
-                records.append((det, None, None, "degenerate_landmarks"))
+                records.append(ScannedFace(det, None, None, "degenerate_landmarks"))
             else:
                 aligned_detections.append(det)
 
@@ -128,17 +131,17 @@ def _scan_one(
             zip(aligned_detections, crops, embeddings, strict=True)
         ):
             crop.save(photo_dir / f"{digest}-{i}.jpg", quality=85)
-            records.append((det, embedding, embedder.model_name, None))
+            records.append(ScannedFace(det, embedding, embedder.model_name, None))
 
     store.record_scan(digest, detector.model_name, records)
     return len(aligned_detections), len(records) - len(aligned_detections)
 
 
 def scan(
-    catalog,
-    store,
-    detector,
-    embedder,
+    catalog: Catalog,
+    store: FaceStore,
+    detector: DetectorLike,
+    embedder: EmbedderLike,
     crop_dir: Path,
     *,
     gate: QualityGate,
@@ -179,7 +182,7 @@ def scan(
 
 
 def build_clusters(
-    store,
+    store: FaceStore,
     photo_names: Mapping[str, Sequence[str]],
     *,
     embed_model: str,
@@ -221,7 +224,7 @@ def build_clusters(
 
 
 def measure_threshold(
-    store,
+    store: FaceStore,
     photo_names: Mapping[str, Sequence[str]],
     *,
     embed_model: str,
@@ -244,7 +247,7 @@ def measure_threshold(
     return calibrate.calibrate(anchors, target_precision=target_precision)
 
 
-def propagate_sidecars(store, dest: Path, detect_model: str) -> int:
+def propagate_sidecars(store: FaceStore, dest: Path, detect_model: str) -> int:
     """Write every confirmed cluster's name into its photos' sidecars.
 
     Idempotent: `iter_pending_sidecars` only yields a digest whose

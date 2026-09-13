@@ -11,7 +11,7 @@ from PIL import Image
 from imageharbor.catalog import Catalog
 from imageharbor.faces import runner
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore
+from imageharbor.faces.store import FaceStore, ScannedFace
 
 
 def _det(x=10.0):
@@ -36,7 +36,7 @@ def store(tmp_path):
 
 def test_similar_faces_cluster_and_get_a_proposal(store):
     for i in range(3):
-        store.record_scan(f"d{i}", "yunet", [(_det(), _v([1, 0.01 * i, 0]), "auraface")])
+        store.record_scan(f"d{i}", "yunet", [ScannedFace(_det(), _v([1, 0.01 * i, 0]), "auraface")])
     names = {"d0": ["Emma"], "d1": ["Emma"]}
 
     made = runner.build_clusters(store, names, embed_model="auraface",
@@ -50,7 +50,7 @@ def test_similar_faces_cluster_and_get_a_proposal(store):
 
 
 def test_a_proposal_never_sets_a_person(store):
-    store.record_scan("d0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     runner.build_clusters(store, {"d0": ["Emma"]}, embed_model="auraface",
                           threshold=0.5, min_score=0.5, min_support=1)
     cid = store.cluster_ids()[0]
@@ -62,7 +62,7 @@ def test_measure_threshold_uses_single_face_single_name_photos(store):
     for i in range(12):
         base = np.array([1.0, 0.0, 0.0]) if i < 6 else np.array([0.0, 1.0, 0.0])
         v = base + rng.normal(0, 0.02, 3)
-        store.record_scan(f"d{i}", "yunet", [(_det(), _v(v), "auraface")])
+        store.record_scan(f"d{i}", "yunet", [ScannedFace(_det(), _v(v), "auraface")])
     names = {f"d{i}": ["Emma" if i < 6 else "Judy"] for i in range(12)}
 
     result = runner.measure_threshold(store, names, embed_model="auraface",
@@ -72,7 +72,7 @@ def test_measure_threshold_uses_single_face_single_name_photos(store):
 
 
 def test_measure_threshold_needs_at_least_two_names(store):
-    store.record_scan("d0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     with pytest.raises(click.ClickException):
         runner.measure_threshold(store, {"d0": ["Emma"]}, embed_model="auraface",
                                  target_precision=0.99)
@@ -86,7 +86,7 @@ def test_propagation_writes_a_confirmed_name_into_the_sidecar(store, tmp_path):
     sidecar = photo.with_suffix(".json")
     sidecar.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
 
-    store.record_scan("d0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.set_organized_path("d0", str(photo))
     runner.build_clusters(store, {}, embed_model="auraface",
                           threshold=0.5, min_score=0.6, min_support=1)
@@ -107,7 +107,7 @@ def test_propagation_is_idempotent(store, tmp_path):
     Image.new("RGB", (50, 50)).save(photo)
     photo.with_suffix(".json").write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
 
-    store.record_scan("d0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.set_organized_path("d0", str(photo))
     runner.build_clusters(store, {}, embed_model="auraface",
                           threshold=0.5, min_score=0.6, min_support=1)
@@ -133,7 +133,7 @@ def test_propagation_advances_confirmed_at_without_growing_history(store, tmp_pa
     Image.new("RGB", (50, 50)).save(photo)
     photo.with_suffix(".json").write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
 
-    store.record_scan("d0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.set_organized_path("d0", str(photo))
     runner.build_clusters(store, {}, embed_model="auraface",
                           threshold=0.5, min_score=0.6, min_support=1)
@@ -176,9 +176,9 @@ def test_build_clusters_sorts_face_vectors_before_clustering(store, monkeypatch)
         r = math.radians(deg)
         return _v([math.cos(r), math.sin(r)])
 
-    store.record_scan("d0", "yunet", [(_det(), _vec2(0), "auraface")])
-    store.record_scan("d1", "yunet", [(_det(), _vec2(th), "auraface")])
-    store.record_scan("d2", "yunet", [(_det(), _vec2(2 * th), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _vec2(0), "auraface")])
+    store.record_scan("d1", "yunet", [ScannedFace(_det(), _vec2(th), "auraface")])
+    store.record_scan("d2", "yunet", [ScannedFace(_det(), _vec2(2 * th), "auraface")])
 
     real_iter = store.iter_face_vectors
     monkeypatch.setattr(

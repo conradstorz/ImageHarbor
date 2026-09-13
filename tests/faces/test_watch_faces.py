@@ -27,7 +27,7 @@ from imageharbor.dashboard.control import ControlPlane
 from imageharbor.faces import runner
 from imageharbor.faces.cluster import Cluster
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore
+from imageharbor.faces.store import FaceStore, ScannedFace
 from imageharbor.watcher import FacesConfig, watch
 
 # These tests exercise the branch the *real* import state opens -- they do not
@@ -362,11 +362,11 @@ def test_watch_does_not_recluster_below_threshold_with_clusters_already_present(
 ) -> None:
     # Seed one confirmed-shape cluster (so cluster_ids() is non-empty) plus a
     # single unclustered face, well under a generous recluster_threshold.
-    ids = face_store.record_scan("d0", "yunet", [(_det(), _vec([1, 0, 0, 0]), "auraface")])
+    ids = face_store.record_scan("d0", "yunet", [ScannedFace(_det(), _vec([1, 0, 0, 0]), "auraface")])
     face_store.replace_clusters(
         "auraface", [Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0, 0]))]
     )
-    face_store.record_scan("d1", "yunet", [(_det(), _vec([0, 1, 0, 0]), "auraface")])
+    face_store.record_scan("d1", "yunet", [ScannedFace(_det(), _vec([0, 1, 0, 0]), "auraface")])
     assert face_store.unclustered_face_count("auraface") == 1
 
     calls: list[int] = []
@@ -403,11 +403,11 @@ def test_watch_reclusters_when_unclustered_exceeds_threshold(
     face_store: FaceStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ids = face_store.record_scan("d0", "yunet", [(_det(), _vec([1, 0, 0, 0]), "auraface")])
+    ids = face_store.record_scan("d0", "yunet", [ScannedFace(_det(), _vec([1, 0, 0, 0]), "auraface")])
     face_store.replace_clusters(
         "auraface", [Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0, 0]))]
     )
-    face_store.record_scan("d1", "yunet", [(_det(), _vec([0, 1, 0, 0]), "auraface")])
+    face_store.record_scan("d1", "yunet", [ScannedFace(_det(), _vec([0, 1, 0, 0]), "auraface")])
     assert face_store.unclustered_face_count("auraface") == 1
 
     calls: list[int] = []
@@ -450,7 +450,7 @@ def test_watch_reclusters_when_no_clusters_exist_yet(
     # the gate (see test_watch_does_not_recluster_forever_with_nothing_to_
     # cluster below) -- it only fires when there is also something to build
     # clusters from.
-    face_store.record_scan("d0", "yunet", [(_det(), _vec([1, 0, 0, 0]), "auraface")])
+    face_store.record_scan("d0", "yunet", [ScannedFace(_det(), _vec([1, 0, 0, 0]), "auraface")])
     assert face_store.cluster_ids("auraface") == []
     assert face_store.unclustered_face_count("auraface") == 1
 
@@ -562,7 +562,7 @@ def test_watch_warns_once_when_clustering_due_but_no_threshold_configured(
     # clusters_exist_yet above: recluster_due (and so this warning) must
     # never fire on an empty/nothing-to-cluster library, so the warning path
     # needs a real unclustered face to reach at all.
-    face_store.record_scan("d0", "yunet", [(_det(), _vec([1, 0, 0, 0]), "auraface")])
+    face_store.record_scan("d0", "yunet", [ScannedFace(_det(), _vec([1, 0, 0, 0]), "auraface")])
 
     calls: list[int] = []
     monkeypatch.setattr(
@@ -690,7 +690,7 @@ def test_second_watch_cycle_does_not_rewrite_an_already_propagated_sidecar(
     )
 
     ids = face_store.record_scan(
-        "digest0", "yunet", [(_det(), _vec([1, 0, 0, 0]), "auraface")]
+        "digest0", "yunet", [ScannedFace(_det(), _vec([1, 0, 0, 0]), "auraface")]
     )
     face_store.replace_clusters(
         "auraface", [Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0, 0]))]

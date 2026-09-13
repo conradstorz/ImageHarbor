@@ -26,7 +26,7 @@ from click.testing import CliRunner
 from imageharbor.catalog import Catalog
 from imageharbor.cli import _faces_model_dir, main
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore
+from imageharbor.faces.store import FaceStore, ScannedFace
 
 # These tests exercise the branch the *real* import state opens -- they do not
 # monkeypatch `HAS_ONNX`, they need it to be genuinely True -- so they need the
@@ -237,7 +237,7 @@ def test_cluster_builds_clusters_and_reports_proposal_counts(tmp_path):
 
     store = FaceStore(catalog_path)
     for i in range(3):
-        store.record_scan(f"d{i}", "yunet", [(_det(), _v([1, 0.01 * i, 0]), "auraface")])
+        store.record_scan(f"d{i}", "yunet", [ScannedFace(_det(), _v([1, 0.01 * i, 0]), "auraface")])
     store.close()
 
     _write_sidecar(dest, "d0", "Emma")
@@ -257,7 +257,7 @@ def test_cluster_refuses_a_second_run_without_recluster(tmp_path):
     dest.mkdir()
     catalog_path = _seed_store(dest)
     store = FaceStore(catalog_path)
-    store.record_scan("d0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.close()
 
     cli = CliRunner()
@@ -275,7 +275,7 @@ def test_cluster_reclusters_when_the_flag_is_passed(tmp_path):
     dest.mkdir()
     catalog_path = _seed_store(dest)
     store = FaceStore(catalog_path)
-    store.record_scan("d0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.close()
 
     cli = CliRunner()
@@ -298,7 +298,7 @@ def test_calibrate_reports_a_measured_threshold(tmp_path):
     for i in range(12):
         base = np.array([1.0, 0.0, 0.0]) if i < 6 else np.array([0.0, 1.0, 0.0])
         vec = base + rng.normal(0, 0.02, 3)
-        store.record_scan(f"d{i}", "yunet", [(_det(), _v(vec), "auraface")])
+        store.record_scan(f"d{i}", "yunet", [ScannedFace(_det(), _v(vec), "auraface")])
         _write_sidecar(dest, f"d{i}", "Emma" if i < 6 else "Judy")
     store.close()
 
@@ -316,7 +316,7 @@ def test_calibrate_reports_needs_two_names(tmp_path):
     dest.mkdir()
     catalog_path = _seed_store(dest)
     store = FaceStore(catalog_path)
-    store.record_scan("d0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.close()
     _write_sidecar(dest, "d0", "Emma")
 

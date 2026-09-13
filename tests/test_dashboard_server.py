@@ -33,7 +33,7 @@ from imageharbor.dashboard import server as dashboard_server
 from imageharbor.dashboard.control import ControlPlane
 from imageharbor.faces import cluster
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore
+from imageharbor.faces.store import FaceStore, ScannedFace
 
 # ---------------------------------------------------------------------------
 # Fake-socket harness
@@ -190,8 +190,8 @@ def _seed_faces(store: FaceStore) -> dict:
 
     faces=2, scanned=2, clusters=1, people=1, unreviewed=0, singletons=0.
     """
-    ids = store.record_scan("d0", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
-    ids += store.record_scan("d1", "yunet", [(_det(), _vec([0, 1, 0]), "auraface")])
+    ids = store.record_scan("d0", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
+    ids += store.record_scan("d1", "yunet", [ScannedFace(_det(), _vec([0, 1, 0]), "auraface")])
     store.replace_clusters(
         "auraface", [cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0]))]
     )

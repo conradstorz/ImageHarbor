@@ -8,7 +8,7 @@ from imageharbor.dashboard import people
 from imageharbor.faces import cluster
 from imageharbor.faces.attribute import Proposal
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore
+from imageharbor.faces.store import FaceStore, ScannedFace
 
 
 def _det():
@@ -34,7 +34,7 @@ def store(tmp_path):
 def _one_cluster(store, faces=2, digest_prefix="d"):
     ids = []
     for i in range(faces):
-        ids += store.record_scan(f"{digest_prefix}{i}", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+        ids += store.record_scan(f"{digest_prefix}{i}", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids), centroid=_v([1, 0, 0]))
     ])
@@ -117,7 +117,7 @@ def test_merge_lets_a_racing_recluster_s_keyerror_propagate(store, monkeypatch):
 def test_case_variants_are_surfaced_as_suggestions_not_applied(store):
     cid_a = _one_cluster(store)
     people.confirm(store, cid_a, "pete storz")
-    ids = store.record_scan("z", "yunet", [(_det(), _v([0, 1, 0]), "auraface")])
+    ids = store.record_scan("z", "yunet", [ScannedFace(_det(), _v([0, 1, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids), centroid=_v([0, 1, 0]))
     ])
@@ -147,7 +147,7 @@ def test_review_queue_orders_by_face_count_descending(store):
     def _faces(prefix, n):
         ids = []
         for i in range(n):
-            ids += store.record_scan(f"{prefix}{i}", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+            ids += store.record_scan(f"{prefix}{i}", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
         return ids
 
     small_ids = _faces("a", 2)
@@ -208,8 +208,8 @@ def test_people_roster_reports_an_empty_cluster_id_list_for_a_person_with_none(s
 def test_merging_a_case_variant_group_moves_clusters_via_roster_ids(store):
     # Both clusters must come from the same replace_clusters call -- see the
     # note in test_review_queue_orders_by_face_count_descending.
-    ids_a = store.record_scan("a0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
-    ids_b = store.record_scan("b0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids_a = store.record_scan("a0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids_a), centroid=_v([1, 0, 0])),
         cluster.Cluster(face_ids=tuple(ids_b), centroid=_v([1, 0, 0])),
@@ -281,8 +281,8 @@ def test_reject_rejects_a_name_with_no_matching_proposal(store):
 def test_merge_points_clusters_at_one_person(store):
     # Both clusters must come from the same `replace_clusters` call -- see
     # the note in test_review_queue_orders_by_face_count_descending.
-    ids_a = store.record_scan("a0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
-    ids_b = store.record_scan("b0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids_a = store.record_scan("a0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids_a), centroid=_v([1, 0, 0])),
         cluster.Cluster(face_ids=tuple(ids_b), centroid=_v([1, 0, 0])),
@@ -347,8 +347,8 @@ def test_split_rejects_empty_face_ids(store):
 def _two_clusters(store):
     """Two coexisting, unconfirmed clusters -- both from one `replace_clusters`
     call, per the note in test_review_queue_orders_by_face_count_descending."""
-    ids_a = store.record_scan("a0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
-    ids_b = store.record_scan("b0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids_a = store.record_scan("a0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids_a), centroid=_v([1, 0, 0])),
         cluster.Cluster(face_ids=tuple(ids_b), centroid=_v([1, 0, 0])),
@@ -425,7 +425,7 @@ def test_split_face_count_matches_real_membership_on_both_clusters(store):
 
 def test_crop_bytes_reads_a_real_crop(store, tmp_path):
     digest = "abcdef0123456789"
-    ids = store.record_scan(digest, "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids = store.record_scan(digest, "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     face_id = ids[0]
 
     photo_dir = tmp_path / digest[:2] / digest[2:4]
@@ -437,7 +437,7 @@ def test_crop_bytes_reads_a_real_crop(store, tmp_path):
 
 def test_crop_bytes_returns_none_for_a_rejected_face(store, tmp_path):
     ids = store.record_scan(
-        "rejdigest", "yunet", [(_det(), None, None, "too_small")]
+        "rejdigest", "yunet", [ScannedFace(_det(), None, None, "too_small")]
     )
     assert people.crop_bytes(tmp_path, ids[0], store=store) is None
 
@@ -448,6 +448,6 @@ def test_crop_bytes_returns_none_for_an_unknown_face_id_with_a_store(store, tmp_
 
 def test_crop_bytes_returns_none_when_the_file_is_missing_but_the_face_exists(store, tmp_path):
     digest = "ffeeddccbbaa0011"
-    ids = store.record_scan(digest, "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids = store.record_scan(digest, "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     # No file written under tmp_path -- the DB row exists, the cache doesn't.
     assert people.crop_bytes(tmp_path, ids[0], store=store) is None
