@@ -135,11 +135,36 @@ image's JSON sidecar, not in the path or filename.
 | `imageharbor takeout survey --archives DIR` | Measure an archive set and report what ingestion would do with it. Read-only and standalone: no catalog, no destination, no AI backend, no network. |
 | `imageharbor watch --source SRC --dest DEST` | Continuously run the facts and enrichment passes (and the faces pass, with `--faces`) on an interval. |
 | `imageharbor verify DEST` | Re-verify every organized file's digest against its filename. |
+| `imageharbor catalog list --catalog DEST/catalog.db` | Query the catalog. |
+| `imageharbor catalog get --catalog DEST/catalog.db <digest>` | Look up a photo by its SHA-256 Base64url digest. |
 | `imageharbor sidecar backfill --dest DEST` | Rebuild/merge sidecars for a library organized before sidecars were the default. Cannot recover Google Takeout metadata for already-organized files — that requires re-ingesting the original archives. |
 | `imageharbor faces scan --dest DEST` | Detect and embed faces in organized photos; `faces calibrate`/`faces cluster`/`faces status` group and review them (needs the optional `faces` extra). |
 | `imageharbor faces roster --dest DEST` | Import a preserved Picasa contact roster's names as autocomplete vocabulary, if the export had one — never attached to a cluster or photo. |
+| `imageharbor faces models download` | Download and verify the default detector and embedder weights. |
 
 Run `imageharbor --help` (or `<command> --help`) for the full flag list.
+
+## Install
+
+Requires Python >= 3.10 and [uv](https://docs.astral.sh/uv/).
+
+```bash
+git clone https://github.com/conradstorz/ImageHarbor
+cd ImageHarbor
+uv sync --extra dev                      # core + test tooling
+uv sync --extra dev --extra openai --extra faces   # + AI classifier + face recognition
+uv run imageharbor --help
+```
+
+## Running the tests
+
+```bash
+uv run pytest            # full suite, no network, no AI backend needed
+uv run ruff check .      # lint
+uv run mypy imageharbor  # types
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the CI gate and release process.
 
 ## Google Takeout ingestion
 

@@ -1,7 +1,6 @@
 """Tests for the continuous polling watcher."""
 from __future__ import annotations
 
-import logging
 import math
 import threading
 from pathlib import Path
@@ -12,8 +11,6 @@ from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.pipeline import Pipeline
 from imageharbor.watcher import (
-    CONSECUTIVE_ABORT_WARNING_THRESHOLD,
-    WatchStats,
     _MAX_SLEEP_SECONDS,
     _safe_sleep,
     run_pass,
@@ -249,9 +246,9 @@ def test_watch_probe_uses_backoff_not_interval_after_midpass_trip(
 
 def test_facts_phase_runs_even_when_the_breaker_is_open(tmp_path, monkeypatch):
     """A dead AI backend must not stop the library being organized."""
+    from imageharbor import watcher
     from imageharbor.catalog import Catalog
     from imageharbor.circuit_breaker import CircuitBreaker
-    from imageharbor import watcher
 
     src = tmp_path / "src"
     src.mkdir()
@@ -280,9 +277,9 @@ def test_facts_phase_runs_even_when_the_breaker_is_open(tmp_path, monkeypatch):
 
 
 def test_enrich_phase_runs_after_the_facts_phase(tmp_path, monkeypatch):
-    from imageharbor.catalog import Catalog
-    from imageharbor.ai_classifier import StubClassifier
     from imageharbor import watcher
+    from imageharbor.ai_classifier import StubClassifier
+    from imageharbor.catalog import Catalog
 
     src = tmp_path / "src"
     src.mkdir()
@@ -644,8 +641,8 @@ def test_run_once_writes_a_facts_run_row_with_counts(
 def test_run_once_writes_an_enrich_run_row_when_enrichment_runs(
     tmp_path: Path, organized_dir: Path, catalog: Catalog
 ) -> None:
-    from imageharbor.ai_classifier import StubClassifier
     from imageharbor import watcher as watcher_module
+    from imageharbor.ai_classifier import StubClassifier
 
     src = _src_with(tmp_path, 1)
     pipeline = Pipeline(src, organized_dir, catalog)
@@ -672,8 +669,8 @@ def test_run_once_writes_no_enrich_row_when_the_breaker_is_open(
 ) -> None:
     """A phase that is SKIPPED (breaker OPEN) must not produce a row at all --
     a row means a pass actually happened."""
-    from imageharbor.circuit_breaker import CircuitBreaker
     from imageharbor import watcher as watcher_module
+    from imageharbor.circuit_breaker import CircuitBreaker
 
     src = _src_with(tmp_path, 1)
     pipeline = Pipeline(src, organized_dir, catalog)
@@ -698,8 +695,8 @@ def test_run_finish_records_the_breaker_state_at_pass_end(
     never touches it); the enrich row is closed AFTER, so it must reflect
     the breaker's state as of the END of that phase, not its state when the
     phase started."""
-    from imageharbor.circuit_breaker import CircuitBreaker
     from imageharbor import watcher as watcher_module
+    from imageharbor.circuit_breaker import CircuitBreaker
 
     src = _src_with(tmp_path, 1)
     pipeline = Pipeline(src, organized_dir, catalog)
@@ -749,8 +746,8 @@ def test_pause_mid_facts_pass_records_paused_flag(
 def test_pause_mid_enrich_pass_records_paused_flag(
     tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from imageharbor.ai_classifier import StubClassifier
     from imageharbor import watcher as watcher_module
+    from imageharbor.ai_classifier import StubClassifier
 
     src = _src_with(tmp_path, 2)
     pipeline = Pipeline(src, organized_dir, catalog)
@@ -823,8 +820,8 @@ def test_facts_pass_that_raises_still_closes_its_row(
 def test_enrich_pass_that_raises_still_closes_its_row(
     tmp_path: Path, organized_dir: Path, catalog: Catalog, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from imageharbor.ai_classifier import StubClassifier
     from imageharbor import watcher as watcher_module
+    from imageharbor.ai_classifier import StubClassifier
 
     src = _src_with(tmp_path, 1)
     pipeline = Pipeline(src, organized_dir, catalog)

@@ -16,4 +16,14 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
+try:
+    __version__ = _dist_version("imageharbor")
+except PackageNotFoundError:  # source tree with no installed dist
+    # Deliberately not PEP 440 and deliberately not digit-leading: a digit-leading
+    # literal here would trip test_no_hardcoded_version_literals_remain, and this
+    # branch is unreachable under the documented `uv run` workflow (the dist is
+    # always installed). Do not "fix" this to look like a real version.
+    __version__ = "unknown+uninstalled"

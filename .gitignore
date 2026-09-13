@@ -44,3 +44,7 @@ catalog.db
 # up automatically; ignored here only as a guard against a leftover after a
 # crashed run)
 .corpus-tmp/
+
+# Agent workflow state (task reports under .superpowers/sdd/ stay tracked --
+# CLAUDE.md cites them; the mutable progress ledger does not belong in git)
+.superpowers/sdd/progress.md

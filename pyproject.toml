@@ -1,14 +1,24 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "imageharbor"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Deterministic, resumable photo organization system"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "AGPL-3.0-or-later" }
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Conrad Storz", email = "conradstorz@gmail.com" }]
+keywords = ["photos", "photo-organization", "exif", "sha256", "google-takeout", "deduplication"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics",
+]
 dependencies = [
     "Pillow>=10.0.0",
     "click>=8.0.0",
@@ -18,7 +28,12 @@ dependencies = [
 openai = ["openai>=1.0.0"]
 faces = [
     "onnxruntime>=1.17,<2",
-    "numpy>=1.24",
+    # Upper-bounded at <2.3: numpy 2.3+ ships __init__.pyi using the PEP 695
+    # `type` statement unconditionally (no sys.version_info guard), which
+    # mypy rejects as a syntax error under our pinned `python_version =
+    # "3.10"` (see [tool.mypy] below) -- it aborts the whole run before any
+    # of our own code is even checked. 2.2.x's stubs predate that change.
+    "numpy>=1.24,<2.3",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -30,11 +45,25 @@ dev = [
     # dashboard files). onnxruntime deliberately stays out: tests that need a
     # real session `importorskip` it, so the suite runs green without the
     # 200 MB runtime. Guarded by tests/test_packaging.py.
-    "numpy>=1.24",
+    # Same <2.3 upper bound as the faces extra above, and for the same
+    # mypy/PEP-695-stub reason -- kept in sync deliberately.
+    "numpy>=1.24,<2.3",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
+
+[project.urls]
+Homepage = "https://github.com/conradstorz/ImageHarbor"
+Changelog = "https://github.com/conradstorz/ImageHarbor/blob/main/CHANGELOG.md"
 
 [project.scripts]
 imageharbor = "imageharbor.cli:main"
+
+[tool.setuptools_scm]
+# A build with no .git and no SETUPTOOLS_SCM_PRETEND_VERSION_FOR_IMAGEHARBOR
+# (tests/test_packaging.py's git-less wheel; a bare source snapshot) gets a
+# recognizable non-version rather than an error.
+fallback_version = "0.0.0"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -64,3 +93,31 @@ markers = [
     "corpus: runs against a real Google Takeout export on disk. Opt-in, never in CI.",
 ]
 addopts = "--strict-markers -m \"not corpus\""
+filterwarnings = [
+    # A leaked sqlite connection is a latent bug, not a log line. Catalog
+    # has close()/context-manager support; every opener must use it.
+    "error::ResourceWarning",
+]
+
+# Lint only in R1 -- no `ruff format`, no line-length rules: a wholesale
+# reformat of 15k LOC is deliberate churn we are not buying in the same
+# release that introduces CI. Rules: pyflakes + pycodestyle errors + import
+# order + bugbear.
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+# Non-strict on purpose: the codebase is 99% return-annotated, so this
+# baseline is cheap to keep green; ratchet toward strict in later releases.
+[tool.mypy]
+files = ["imageharbor"]
+python_version = "3.10"
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["onnxruntime.*", "openai.*"]
+ignore_missing_imports = true

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -64,7 +65,7 @@ class TaxonomyNode:
     active: bool = True
 
 
-def _node(row) -> TaxonomyNode:
+def _node(row: sqlite3.Row) -> TaxonomyNode:
     return TaxonomyNode(
         code=row["code"],
         parent_code=row["parent_code"],
@@ -253,21 +254,3 @@ class Taxonomy:
             return
         self._cat.taxonomy_set_aliases(to_code, target.aliases + [src.label])
         self._cat.taxonomy_set_alias(from_code, to_code)
-
-    def snapshot_text(self) -> str:
-        """Compact `code label` view grouped by hierarchy for the AI prompt."""
-        rows = self._cat.taxonomy_all()
-        by_parent: dict[str | None, list] = {}
-        for r in rows:
-            by_parent.setdefault(r["parent_code"], []).append(r)
-
-        lines: list[str] = []
-
-        def emit(code: str, label: str, depth: int) -> None:
-            lines.append(f"{'  ' * depth}{code} {label}")
-            for child in by_parent.get(code, []):
-                emit(child["code"], child["label"], depth + 1)
-
-        for top in by_parent.get(None, []):
-            emit(top["code"], top["label"], 0)
-        return "\n".join(lines)

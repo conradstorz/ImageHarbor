@@ -19,18 +19,36 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from ..util import now_iso as _now_iso
 from .attribute import Proposal
 from .cluster import Cluster, FaceVector
 from .decode import Detection
 from .names import normalize
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ScannedFace:
+    """One detected face as the scan hands it to the store.
+
+    Replaces the positional (detection, embedding, embed_model,
+    reject_reason) tuple -- a 4-slot protocol nobody could read at a call
+    site. A rejected face has embedding=None and a reject_reason; a kept
+    face has an embedding, its embed_model, and reject_reason=None.
+    """
+
+    detection: Detection
+    embedding: np.ndarray | None
+    embed_model: str | None
+    reject_reason: str | None = None
+
 
 # The five tables from the design spec's "Catalog schema" section, plus one
 # addition: `face_organized_paths`. The spec is silent on where
@@ -128,10 +146,6 @@ CREATE TABLE IF NOT EXISTS face_organized_paths (
 """
 
 
-def _now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
-
-
 class MalformedEmbeddingError(ValueError):
     """A stored embedding blob's byte length doesn't match its recorded dim."""
 
@@ -175,10 +189,7 @@ class FaceStore:
         self,
         digest: str,
         detect_model: str,
-        faces: Sequence[
-            tuple[Detection, np.ndarray | None, str | None]
-            | tuple[Detection, np.ndarray | None, str | None, str | None]
-        ],
+        faces: Sequence[ScannedFace],
     ) -> list[int]:
         """Record one photo's detected faces. Idempotent on (digest, detect_model).
 
@@ -197,11 +208,10 @@ class FaceStore:
             now = _now_iso()
             ids: list[int] = []
             for entry in faces:
-                if len(entry) == 3:
-                    det, embedding, embed_model = entry
-                    rejected_reason = None
-                else:
-                    det, embedding, embed_model, rejected_reason = entry
+                det = entry.detection
+                embedding = entry.embedding
+                embed_model = entry.embed_model
+                rejected_reason = entry.reject_reason
 
                 embedding_blob: bytes | None = None
                 embedding_dim: int | None = None

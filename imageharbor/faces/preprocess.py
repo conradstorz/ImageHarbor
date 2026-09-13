@@ -44,7 +44,7 @@ def build_blob(images: Sequence[Image.Image], info: ModelInfo) -> np.ndarray:
     for image in images:
         rgb = image if image.mode == "RGB" else image.convert("RGB")
         if rgb.size != (width, height):
-            rgb = rgb.resize((width, height), Image.BILINEAR)
+            rgb = rgb.resize((width, height), Image.Resampling.BILINEAR)
         array = np.asarray(rgb, dtype=np.float32)
         if info.channel_order == "BGR":
             # Pillow always decodes to RGB, so a BGR model needs the channel

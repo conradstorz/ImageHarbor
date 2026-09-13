@@ -25,7 +25,7 @@ from imageharbor.dashboard import server as dashboard_server
 from imageharbor.dashboard.control import ControlPlane
 from imageharbor.faces import cluster
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore
+from imageharbor.faces.store import FaceStore, ScannedFace
 
 # ---------------------------------------------------------------------------
 # Fake-socket harness (same shape as tests/test_dashboard_server.py)
@@ -164,7 +164,7 @@ def handler_cls(catalog: Catalog, control: ControlPlane, face_store: FaceStore, 
 def _one_cluster(store: FaceStore, faces: int = 2) -> int:
     ids: list[int] = []
     for i in range(faces):
-        ids += store.record_scan(f"d{i}", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+        ids += store.record_scan(f"d{i}", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     store.replace_clusters(
         "auraface", [cluster.Cluster(face_ids=tuple(ids), centroid=_v([1, 0, 0]))]
     )
@@ -216,7 +216,7 @@ def test_face_crop_returns_the_jpeg_bytes(
     handler_cls, face_store: FaceStore, crop_dir: Path
 ) -> None:
     digest = "abcdef0123456789"
-    ids = face_store.record_scan(digest, "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids = face_store.record_scan(digest, "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     photo_dir = crop_dir / digest[:2] / digest[2:4]
     photo_dir.mkdir(parents=True)
     (photo_dir / f"{digest}-0.jpg").write_bytes(b"\xff\xd8\xff\xe0fake")
@@ -290,8 +290,8 @@ def test_post_people_reject_unmatched_name_returns_400(
 def test_post_people_merge_points_clusters_at_one_person(
     handler_cls, face_store: FaceStore
 ) -> None:
-    ids_a = face_store.record_scan("a0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
-    ids_b = face_store.record_scan("b0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids_a = face_store.record_scan("a0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
+    ids_b = face_store.record_scan("b0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     face_store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids_a), centroid=_v([1, 0, 0])),
         cluster.Cluster(face_ids=tuple(ids_b), centroid=_v([1, 0, 0])),
@@ -325,8 +325,8 @@ def test_post_people_split_creates_a_new_cluster(handler_cls, face_store: FaceSt
 def test_post_people_split_face_from_another_cluster_returns_400(
     handler_cls, face_store: FaceStore
 ) -> None:
-    ids_a = face_store.record_scan("a0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
-    ids_b = face_store.record_scan("b0", "yunet", [(_det(), _v([1, 0, 0]), "auraface")])
+    ids_a = face_store.record_scan("a0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
+    ids_b = face_store.record_scan("b0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
     face_store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids_a), centroid=_v([1, 0, 0])),
         cluster.Cluster(face_ids=tuple(ids_b), centroid=_v([1, 0, 0])),

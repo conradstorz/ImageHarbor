@@ -173,8 +173,6 @@ def test_resolve_follows_alias_of_merged_target(tax: Taxonomy) -> None:
     node = tax.get(code)
     assert node is not None
     assert node.parent_code == "550"  # canonical target, NOT the merged 540
-    # The new node is reachable/active in the snapshot view.
-    assert code in tax.snapshot_text()
 
 
 def test_merge_redirects_future_resolution(tax: Taxonomy) -> None:
@@ -203,9 +201,3 @@ def test_normalize_lossy_singularization_collision() -> None:
     # "wins" -> "win" (strip "s") both normalize to the same token. Pinned here
     # so any future change to _normalize is a conscious one.
     assert Taxonomy._normalize("wines") == Taxonomy._normalize("wins")
-
-
-def test_snapshot_text_lists_categories(tax: Taxonomy) -> None:
-    s = tax.snapshot_text()
-    assert "100" in s and "people" in s
-    assert "330" in s and "beach" in s

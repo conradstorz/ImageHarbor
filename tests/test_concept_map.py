@@ -1,8 +1,11 @@
 from __future__ import annotations
+
 from pathlib import Path
+
 import pytest
-from imageharbor.catalog import Catalog
+
 from imageharbor import concept_map
+from imageharbor.catalog import Catalog
 
 
 @pytest.fixture()

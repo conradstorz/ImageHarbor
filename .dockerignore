@@ -8,3 +8,6 @@ tests
 docs
 __pycache__
 *.pyc
+*.zip
+*.tgz
+uv.lock.bak

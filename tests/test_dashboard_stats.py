@@ -41,7 +41,7 @@ from imageharbor.dashboard import stats
 from imageharbor.dashboard.control import ControlPlane
 from imageharbor.faces import cluster
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore
+from imageharbor.faces.store import FaceStore, ScannedFace
 from imageharbor.pipeline import Pipeline
 
 # ---------------------------------------------------------------------------
@@ -109,9 +109,9 @@ def _seed_faces(store: FaceStore) -> dict[str, int]:
     a stats query that swapped e.g. `clusters` and `people`, or counted
     singletons wrong, would still pass a degenerate fixture by coincidence.
     """
-    ids0 = store.record_scan("digest0", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
-    ids1 = store.record_scan("digest1", "yunet", [(_det(), _vec([0, 1, 0]), "auraface")])
-    ids2 = store.record_scan("digest2", "yunet", [(_det(), _vec([0, 0, 1]), "auraface")])
+    ids0 = store.record_scan("digest0", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
+    ids1 = store.record_scan("digest1", "yunet", [ScannedFace(_det(), _vec([0, 1, 0]), "auraface")])
+    ids2 = store.record_scan("digest2", "yunet", [ScannedFace(_det(), _vec([0, 0, 1]), "auraface")])
 
     store.replace_clusters(
         "auraface",

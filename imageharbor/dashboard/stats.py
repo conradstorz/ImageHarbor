@@ -218,6 +218,7 @@ def _now_section(
 
     phase = current_run["kind"] if current_run is not None else None
 
+    breaker_info: dict[str, Any]
     if breaker is None:
         # Distinct from a real state: no breaker was wired in at all (e.g.
         # the facts-only CLI path, which never touches AI or the breaker).

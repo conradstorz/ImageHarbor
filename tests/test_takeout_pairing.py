@@ -11,10 +11,10 @@ from __future__ import annotations
 import pytest
 
 from imageharbor.takeout.pairing import (
+    _MIN_TRUNCATION_PREFIX,
     NO_MATCH,
     OWN,
     RELATED,
-    _MIN_TRUNCATION_PREFIX,
     build_index,
     sidecar_for,
 )

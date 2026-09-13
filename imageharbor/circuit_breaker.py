@@ -52,9 +52,6 @@ class CircuitBreaker:
     def is_open(self) -> bool:
         return self._state is BreakerState.OPEN
 
-    def is_half_open(self) -> bool:
-        return self._state is BreakerState.HALF_OPEN
-
     def record_success(self) -> None:
         if self._state is BreakerState.HALF_OPEN:
             self._state = BreakerState.CLOSED

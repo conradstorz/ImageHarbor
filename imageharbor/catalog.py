@@ -6,9 +6,11 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from .util import json_default as _json_default
+from .util import now_iso as _now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -188,23 +190,6 @@ _ADDED_PHOTO_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
-
-
-def _json_default(o: Any) -> Any:
-    """Fallback for values ``json.dumps`` cannot serialize natively.
-
-    Real EXIF carries raw ``bytes`` (e.g. ExifVersion, SceneType, MakerNote)
-    and other exotic types; without this a single odd metadata value would
-    raise and fail the whole image. Bytes become a lossy text form; anything
-    else falls back to its string representation.
-    """
-    if isinstance(o, (bytes, bytearray)):
-        return bytes(o).decode("utf-8", "replace")
-    return str(o)
-
-
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=_json_default)
 
@@ -271,21 +256,32 @@ class Catalog:
         # any in-process failure (see `watcher.run_once`'s docstring).
         self._own_run_ids: set[int] = set()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        # A single connection is now shared between the watcher and the
-        # dashboard, guarded by self.lock (see the class docstring) -- so
-        # every write and every settings read is fully serialized in-process
-        # and never actually contends at the SQLite level. This pragma is
-        # kept anyway as a pin against a future second connection (e.g. the
-        # "smaller change now, real second connection later" path noted
-        # above), which WOULD contend at the SQLite level and rely on this
-        # wait rather than the in-process lock.
-        self._conn.execute("PRAGMA busy_timeout=5000;")
-        self._conn.executescript(_SCHEMA)
-        self._ensure_photo_columns()
-        self._conn.commit()
-        self._guard_legacy_catalog()
+        try:
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            # A single connection is now shared between the watcher and the
+            # dashboard, guarded by self.lock (see the class docstring) -- so
+            # every write and every settings read is fully serialized in-process
+            # and never actually contends at the SQLite level. This pragma is
+            # kept anyway as a pin against a future second connection (e.g. the
+            # "smaller change now, real second connection later" path noted
+            # above), which WOULD contend at the SQLite level and rely on this
+            # wait rather than the in-process lock.
+            self._conn.execute("PRAGMA busy_timeout=5000;")
+            self._conn.executescript(_SCHEMA)
+            self._ensure_photo_columns()
+            self._conn.commit()
+            self._guard_legacy_catalog()
+        except BaseException:
+            # `_guard_legacy_catalog` (or any earlier setup step) can raise
+            # before this object finishes constructing -- e.g. a pre-redesign
+            # catalog raises `LegacyCatalogError` here. When `__init__` raises,
+            # no `Catalog` instance survives for a caller to `close()`, so the
+            # connection opened above would otherwise leak until GC finalizes
+            # it (a `ResourceWarning: unclosed database`, not a log line).
+            # Close it ourselves before propagating.
+            self._conn.close()
+            raise
         logger.debug("Catalog opened at %s", db_path)
 
     def _ensure_photo_columns(self) -> None:
@@ -1039,6 +1035,8 @@ class Catalog:
             )
             self._conn.commit()
             run_id = cursor.lastrowid
+            if run_id is None:
+                raise RuntimeError("run_start returned no id")
             self._own_run_ids.add(run_id)
             return run_id
 

@@ -7,7 +7,12 @@ from datetime import datetime
 from pathlib import Path
 
 import imageharbor.sidecar as sidecar_module
-from imageharbor.sidecar import _quarantine, merge_sidecar, read_sidecar, sidecar_path_for
+from imageharbor.sidecar import (
+    _quarantine,
+    merge_sidecar,
+    read_sidecar,
+    sidecar_path_for,
+)
 
 
 def _img(tmp_path: Path) -> Path:

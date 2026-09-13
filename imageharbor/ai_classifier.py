@@ -133,7 +133,7 @@ class OpenAIClassifier(AIClassifier):
         timeout: float = 60.0,
     ) -> None:
         try:
-            import openai as _openai  # type: ignore[import]
+            import openai as _openai
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
                 "The 'openai' package is required for OpenAIClassifier. "

@@ -2,8 +2,8 @@
 
 from imageharbor.pcs import (
     PCS_CATEGORIES,
-    VALID_CODES,
     PCS_VERSION,
+    VALID_CODES,
     get_category,
     resolve_code,
 )

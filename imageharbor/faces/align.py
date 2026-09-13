@@ -141,4 +141,6 @@ def align_crop(
         inverse[1, 0], inverse[1, 1], inverse[1, 2],
     )
     rgb = image if image.mode == "RGB" else image.convert("RGB")
-    return rgb.transform(size, Image.AFFINE, data, resample=Image.BILINEAR)
+    return rgb.transform(
+        size, Image.Transform.AFFINE, data, resample=Image.Resampling.BILINEAR
+    )

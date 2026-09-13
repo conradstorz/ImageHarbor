@@ -172,7 +172,7 @@ def test_a_corrupted_member_raises_rather_than_yielding_bad_bytes(tmp_path: Path
 
     with zipfile.ZipFile(z, "r") as zf:
         member = next(archive.iter_members(zf))
-        with pytest.raises(Exception):
+        with pytest.raises(zipfile.BadZipFile):
             archive.extract_to(zf, member, tmp_path / "staging")
 
 

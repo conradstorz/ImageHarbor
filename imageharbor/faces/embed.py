@@ -21,8 +21,13 @@ class Embedder:
         import onnxruntime as ort
 
         self._info = models.EMBEDDERS[name]
+        if self._info.embedding_dim is None:
+            raise ValueError(
+                f"embedder model {name!r} has no embedding_dim configured "
+                "-- this is a models.py registry bug, not a runtime condition"
+            )
         self.model_name = name
-        self.dim = self._info.embedding_dim
+        self.dim: int = self._info.embedding_dim
         path = ensure(self._info, Path(model_dir))
         self._session = ort.InferenceSession(
             str(path), providers=["CPUExecutionProvider"]

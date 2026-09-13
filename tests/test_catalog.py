@@ -617,6 +617,7 @@ def test_existing_catalog_gains_new_columns(tmp_path):
     which covers the case this DB would otherwise also trigger).
     """
     import sqlite3
+
     from imageharbor.catalog import Catalog
 
     db = tmp_path / "old.db"

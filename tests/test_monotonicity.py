@@ -16,7 +16,6 @@ from imageharbor.tiers import (
     DESC_NONE,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures (copied from tests/test_pipeline.py -- not previously defined here)
 # ---------------------------------------------------------------------------

@@ -6,15 +6,29 @@ RUN useradd --create-home --uid 1000 harbor
 
 WORKDIR /app
 
-# Install the package with the OpenAI-compatible classifier extra and the
-# 'faces' extra (onnxruntime + numpy). 'faces' adds ~261 MB of model weights
-# on the FIRST `faces scan`/`watch` run (see FaceStore's model download,
-# imageharbor/faces/download.py) -- not at build time, so this layer itself
-# stays small. docker-compose.yml's `imageharbor-models` volume is what
-# stops that 261 MB download from repeating on every container recreate.
-COPY pyproject.toml README.md ./
+# Build from the lockfile so the container ships exactly the dependency set
+# the suite was tested against -- `pip install ".[...]"` resolved fresh
+# against loose floors on every build. uv is copied from its official image
+# (pinned); --frozen refuses a stale lock instead of silently re-resolving.
+# 'faces' adds ~261 MB of model weights on the FIRST `faces scan`/`watch`
+# run (see imageharbor/faces/download.py) -- not at build time, so this
+# layer stays small; docker-compose.yml's `imageharbor-models` volume stops
+# that download from repeating on every container recreate.
+COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /usr/local/bin/uv
+
+# The build context has no .git, so setuptools-scm cannot derive a version;
+# the release workflow passes the tag here. A local `docker build` without
+# the arg gets 0.0.0 -- visibly a non-release.
+ARG IMAGEHARBOR_VERSION=0.0.0
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_IMAGEHARBOR=${IMAGEHARBOR_VERSION} \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+
+# LICENSE ships in the image: this is an AGPL network service; the conveyed
+# artifact must carry the licence text (README.md "Licence" section).
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY imageharbor ./imageharbor
-RUN pip install --no-cache-dir ".[openai,faces]"
+RUN uv sync --frozen --no-dev --no-editable --extra openai --extra faces
+ENV PATH="/opt/venv/bin:${PATH}"
 
 # Default mount points (see docker-compose.yml).
 ENV IMAGEHARBOR_SOURCE=/data/source \

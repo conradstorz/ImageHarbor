@@ -184,7 +184,7 @@ def _format_age(seconds: float) -> str:
 
 def project(
     runs: Sequence[Any] | None,
-    backlog: int,
+    backlog: Any,
     *,
     breaker_open: bool,
     paused: bool,

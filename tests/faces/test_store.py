@@ -9,7 +9,7 @@ from imageharbor.catalog import Catalog
 from imageharbor.faces import cluster
 from imageharbor.faces.attribute import Proposal
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore
+from imageharbor.faces.store import FaceStore, ScannedFace
 
 
 @pytest.fixture
@@ -35,13 +35,13 @@ def _vec(v):
 
 def test_recording_a_scan_makes_it_scanned(store):
     assert not store.is_scanned("digestA", "yunet")
-    store.record_scan("digestA", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    store.record_scan("digestA", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
     assert store.is_scanned("digestA", "yunet")
 
 
 def test_rescanning_the_same_photo_is_a_no_op(store):
-    ids_a = store.record_scan("digestA", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
-    ids_b = store.record_scan("digestA", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids_a = store.record_scan("digestA", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("digestA", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
     assert ids_a == ids_b
     assert store.stats()["faces"] == 1
 
@@ -52,6 +52,17 @@ def test_a_photo_with_no_faces_is_still_recorded_as_scanned(store):
     assert store.stats()["faces"] == 0
 
 
+def test_record_scan_takes_scanned_face_records(store):
+    det = _det()
+    ids = store.record_scan(
+        "d" * 43,
+        "yunet-test",
+        [ScannedFace(detection=det, embedding=None, embed_model=None,
+                     reject_reason="low_score")],
+    )
+    assert len(ids) == 1
+
+
 def test_scan_is_keyed_on_the_detector(store):
     store.record_scan("digestA", "yunet", [])
     assert store.is_scanned("digestA", "yunet")
@@ -59,7 +70,7 @@ def test_scan_is_keyed_on_the_detector(store):
 
 
 def test_face_vectors_round_trip(store):
-    store.record_scan("d", "yunet", [(_det(), _vec([0.6, 0.8, 0.0]), "auraface")])
+    store.record_scan("d", "yunet", [ScannedFace(_det(), _vec([0.6, 0.8, 0.0]), "auraface")])
     vectors = list(store.iter_face_vectors("auraface"))
     assert len(vectors) == 1
     assert np.allclose(vectors[0].embedding, _vec([0.6, 0.8, 0.0]), atol=1e-6)
@@ -67,12 +78,12 @@ def test_face_vectors_round_trip(store):
 
 
 def test_face_vectors_are_filtered_by_model(store):
-    store.record_scan("d", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    store.record_scan("d", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
     assert list(store.iter_face_vectors("sface")) == []
 
 
 def test_confirm_is_the_only_thing_that_sets_person_id(store):
-    ids = store.record_scan("d", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids = store.record_scan("d", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0]), seed_name=None)
     ])
@@ -85,7 +96,7 @@ def test_confirm_is_the_only_thing_that_sets_person_id(store):
 
 
 def test_rejecting_a_proposal_records_it_rather_than_deleting(store):
-    ids = store.record_scan("d", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids = store.record_scan("d", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0]), seed_name=None)
     ])
@@ -97,8 +108,8 @@ def test_rejecting_a_proposal_records_it_rather_than_deleting(store):
 
 def test_merge_points_several_clusters_at_one_person(store):
     ids = store.record_scan("d", "yunet", [
-        (_det(x=0), _vec([1, 0, 0]), "auraface"),
-        (_det(x=200), _vec([0, 1, 0]), "auraface"),
+        ScannedFace(_det(x=0), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([0, 1, 0]), "auraface"),
     ])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0])),
@@ -125,9 +136,9 @@ def test_confirm_raises_for_a_cluster_id_recycled_away_by_a_racing_recluster(sto
     # excludes the third face's photo entirely -- its old cluster id is
     # provably gone by the time the stale `confirm(..)` call lands.
     ids = store.record_scan("d", "yunet", [
-        (_det(x=0), _vec([1, 0, 0]), "auraface"),
-        (_det(x=200), _vec([0, 1, 0]), "auraface"),
-        (_det(x=400), _vec([0, 0, 1]), "auraface"),
+        ScannedFace(_det(x=0), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([0, 1, 0]), "auraface"),
+        ScannedFace(_det(x=400), _vec([0, 0, 1]), "auraface"),
     ])
     fx, fy, fz = ids
     store.replace_clusters("auraface", [
@@ -166,9 +177,9 @@ def test_merge_raises_naming_the_stale_id_and_leaves_the_valid_one_untouched(sto
     # rows while a real id in the same call matches and gets mutated, with
     # nothing telling the caller only half the batch actually happened.
     ids = store.record_scan("d", "yunet", [
-        (_det(x=0), _vec([1, 0, 0]), "auraface"),
-        (_det(x=200), _vec([0, 1, 0]), "auraface"),
-        (_det(x=400), _vec([0, 0, 1]), "auraface"),
+        ScannedFace(_det(x=0), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([0, 1, 0]), "auraface"),
+        ScannedFace(_det(x=400), _vec([0, 0, 1]), "auraface"),
     ])
     fx, fy, fz = ids
     store.replace_clusters("auraface", [
@@ -227,9 +238,9 @@ def test_confirm_after_a_same_count_recluster_does_not_write_the_wrong_identity(
     # nothing at all, and `confirm` (per fabdc12) raises `KeyError` instead
     # of silently writing onto whatever now holds id 3.
     ids = store.record_scan("d", "yunet", [
-        (_det(x=0), _vec([1, 0, 0]), "auraface"),
-        (_det(x=200), _vec([0, 1, 0]), "auraface"),
-        (_det(x=400), _vec([0, 0, 1]), "auraface"),
+        ScannedFace(_det(x=0), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([0, 1, 0]), "auraface"),
+        ScannedFace(_det(x=400), _vec([0, 0, 1]), "auraface"),
     ])
     face1, face2, face3 = ids
     store.replace_clusters("auraface", [
@@ -282,8 +293,8 @@ def test_split_rejects_a_face_id_not_in_the_cluster(store):
     # so it must refuse even when a caller bypasses dashboard.people's
     # wrapper-level validation.
     ids = store.record_scan("d", "yunet", [
-        (_det(x=0), _vec([1, 0, 0]), "auraface"),
-        (_det(x=200), _vec([0, 1, 0]), "auraface"),
+        ScannedFace(_det(x=0), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([0, 1, 0]), "auraface"),
     ])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0])),
@@ -307,8 +318,8 @@ def test_split_rejects_a_face_id_not_in_the_cluster(store):
 
 def test_split_with_duplicate_face_ids_does_not_inflate_the_new_face_count(store):
     ids = store.record_scan("d", "yunet", [
-        (_det(x=0), _vec([1, 0, 0]), "auraface"),
-        (_det(x=200), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=0), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([1, 0, 0]), "auraface"),
     ])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0])),
@@ -329,7 +340,7 @@ def test_split_with_duplicate_face_ids_does_not_inflate_the_new_face_count(store
 
 
 def test_replacing_clusters_preserves_confirmed_people(store):
-    ids = store.record_scan("d", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids = store.record_scan("d", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0]))
     ])
@@ -349,8 +360,8 @@ def test_recluster_merging_two_confirmed_people_leaves_the_cluster_unconfirmed(s
     # into a single new cluster containing both their faces. Picking either
     # person would manufacture a confirmation nobody made -- see Finding 1.
     ids = store.record_scan("d", "yunet", [
-        (_det(x=0), _vec([1, 0, 0]), "auraface"),
-        (_det(x=200), _vec([0, 1, 0]), "auraface"),
+        ScannedFace(_det(x=0), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([0, 1, 0]), "auraface"),
     ])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=(ids[0],), centroid=_vec([1, 0, 0])),
@@ -379,8 +390,8 @@ def test_recluster_splitting_one_confirmed_cluster_both_fragments_inherit_person
     # fragments must keep it -- this must keep working, not just Finding 1's
     # merge case.
     ids = store.record_scan("d", "yunet", [
-        (_det(x=0), _vec([1, 0, 0]), "auraface"),
-        (_det(x=200), _vec([0.99, 0.01, 0]), "auraface"),
+        ScannedFace(_det(x=0), _vec([1, 0, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([0.99, 0.01, 0]), "auraface"),
     ])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0])),
@@ -400,7 +411,7 @@ def test_recluster_splitting_one_confirmed_cluster_both_fragments_inherit_person
 
 
 def test_pending_sidecars_lists_a_photo_after_confirmation(store):
-    ids = store.record_scan("d", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    ids = store.record_scan("d", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids), centroid=_vec([1, 0, 0]))
     ])
@@ -418,8 +429,8 @@ def test_cluster_ids_is_unscoped_by_default(store):
     # `dashboard/people.py`'s `_cluster_exists` relies on this: it validates
     # an operator-supplied cluster id against the primary key, regardless of
     # which embed_model produced it.
-    ids_a = store.record_scan("a", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
-    ids_b = store.record_scan("b", "yunet", [(_det(x=200), _vec([0, 1, 0]), "sface")])
+    ids_a = store.record_scan("a", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b", "yunet", [ScannedFace(_det(x=200), _vec([0, 1, 0]), "sface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids_a), centroid=_vec([1, 0, 0]))
     ])
@@ -437,8 +448,8 @@ def test_cluster_ids_scoped_by_embed_model_excludes_other_models(store):
     # recluster gate calling the unscoped form let a cluster left behind by
     # a since-abandoned embed_model mask "no clusters yet" for the model
     # actually in use.
-    ids_a = store.record_scan("a", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
-    ids_b = store.record_scan("b", "yunet", [(_det(x=200), _vec([0, 1, 0]), "sface")])
+    ids_a = store.record_scan("a", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
+    ids_b = store.record_scan("b", "yunet", [ScannedFace(_det(x=200), _vec([0, 1, 0]), "sface")])
     store.replace_clusters("auraface", [
         cluster.Cluster(face_ids=tuple(ids_a), centroid=_vec([1, 0, 0]))
     ])
@@ -459,10 +470,10 @@ def test_cluster_ids_scoped_by_embed_model_excludes_other_models(store):
 
 
 def test_anchors_are_single_face_single_name_photos(store):
-    store.record_scan("one", "yunet", [(_det(), _vec([1, 0, 0]), "auraface")])
+    store.record_scan("one", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
     store.record_scan("two", "yunet", [
-        (_det(x=0), _vec([0, 1, 0]), "auraface"),
-        (_det(x=200), _vec([0, 0, 1]), "auraface"),
+        ScannedFace(_det(x=0), _vec([0, 1, 0]), "auraface"),
+        ScannedFace(_det(x=200), _vec([0, 0, 1]), "auraface"),
     ])
     anchors = store.anchors("auraface", {"one": ["Emma"], "two": ["Judy"]})
     assert [n for n, _ in anchors] == ["Emma"]  # "two" has two faces, so it is not an anchor

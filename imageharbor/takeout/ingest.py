@@ -311,7 +311,11 @@ class _Ingestor:
         # the per-archive coverage counting just below, and the run summary,
         # both key off it to decide whether an index was used at all.
         explicit = self.index_path is not None
-        candidate = self.index_path if explicit else self.archives_dir / "takeout-index.sqlite"
+        candidate: Path = (
+            self.index_path
+            if self.index_path is not None
+            else self.archives_dir / "takeout-index.sqlite"
+        )
         # `candidate.is_file()` itself can raise: `Path.is_file()` only
         # swallows ENOENT/ENOTDIR/EBADF/ELOOP, so a PermissionError (EACCES)
         # or a stale network handle re-raises. That check must live INSIDE
@@ -399,9 +403,9 @@ class _Ingestor:
                     # below once the index exists. Member paths come from the
                     # catalog, so no zip is opened and nothing is decompressed.
                     rows = self.catalog.takeout_members_all(identity.archive_id)
-                    for member in rows:
-                        all_members.append(member["member_path"])
-                        self.owner[member["member_path"]] = path
+                    for db_member in rows:
+                        all_members.append(db_member["member_path"])
+                        self.owner[db_member["member_path"]] = path
                     completed.append((identity, rows))
                     continue
 
@@ -801,7 +805,7 @@ class _Ingestor:
     def _label(self, archive_path: Path, member_path: str) -> str:
         return f"{archive_path}!{member_path}"
 
-    def _mark_failed(self, identity: archive.ArchiveIdentity, row, error: str) -> None:
+    def _mark_failed(self, identity: archive.ArchiveIdentity, row: sqlite3.Row, error: str) -> None:
         """Record a member as failed WITHOUT discarding what it already knew.
 
         `takeout_member_set` is a blind full-row UPDATE, so a failure branch
@@ -833,7 +837,7 @@ class _Ingestor:
         self,
         zf: zipfile.ZipFile,
         identity: archive.ArchiveIdentity,
-        row,
+        row: sqlite3.Row,
     ) -> None:
         member_path = row["member_path"]
         member = archive.MemberInfo(
@@ -1016,7 +1020,7 @@ class _Ingestor:
                 "and catalogued", organized_path.name, exc_info=True,
             )
 
-    def _defer_video(self, identity: archive.ArchiveIdentity, row) -> None:
+    def _defer_video(self, identity: archive.ArchiveIdentity, row: sqlite3.Row) -> None:
         """Record a video with its capture date. No bytes are copied.
 
         Wrapped in the same isolation the image path gets. The work here is
