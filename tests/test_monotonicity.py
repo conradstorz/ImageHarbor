@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from imageharbor.ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from imageharbor.catalog import Catalog
 from imageharbor.enrich import enrich_library
@@ -15,24 +13,6 @@ from imageharbor.tiers import (
     DESC_HUMAN_FILENAME,
     DESC_NONE,
 )
-
-# ---------------------------------------------------------------------------
-# Fixtures (copied from tests/test_pipeline.py -- not previously defined here)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def organized_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "organized"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
 
 
 class Fixed(StubClassifier):

@@ -8,10 +8,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from imageharbor.catalog import Catalog
 from imageharbor.faces import runner
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore, ScannedFace
+from imageharbor.faces.store import ScannedFace
 
 
 def _det(x=10.0):
@@ -23,15 +22,6 @@ def _det(x=10.0):
 def _v(vals):
     a = np.asarray(vals, dtype=np.float32)
     return a / np.linalg.norm(a)
-
-
-@pytest.fixture
-def store(tmp_path):
-    db = tmp_path / "catalog.db"
-    Catalog(db).close()
-    s = FaceStore(db)
-    yield s
-    s.close()
 
 
 def test_similar_faces_cluster_and_get_a_proposal(store):

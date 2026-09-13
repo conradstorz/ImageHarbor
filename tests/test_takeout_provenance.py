@@ -13,8 +13,6 @@ import logging
 import zipfile
 from pathlib import Path
 
-import pytest
-
 from imageharbor.takeout import archive as archive_mod
 from imageharbor.takeout import provenance
 
@@ -33,15 +31,6 @@ def _identity(zip_path: Path, archive_id: str = "arc-1") -> archive_mod.ArchiveI
     return archive_mod.ArchiveIdentity(
         archive_id=archive_id, path=zip_path, size=stat.st_size, mtime_ns=stat.st_mtime_ns,
     )
-
-
-@pytest.fixture()
-def dirs(tmp_path: Path):
-    archives = tmp_path / "archives"
-    archives.mkdir()
-    organized = tmp_path / "organized"
-    organized.mkdir()
-    return archives, organized
 
 
 def _members(zf: zipfile.ZipFile) -> list[archive_mod.MemberInfo]:

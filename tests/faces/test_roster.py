@@ -9,11 +9,7 @@ docstring.
 
 from __future__ import annotations
 
-import pytest
-
-from imageharbor.catalog import Catalog
 from imageharbor.faces import roster
-from imageharbor.faces.store import FaceStore
 
 SAMPLE = b"""<?xml version="1.0"?>
 <contacts>
@@ -23,15 +19,6 @@ SAMPLE = b"""<?xml version="1.0"?>
   <contact id="d4" name="Conrad Storz"/>
 </contacts>
 """
-
-
-@pytest.fixture
-def store(tmp_path):
-    db = tmp_path / "catalog.db"
-    Catalog(db).close()
-    s = FaceStore(db)
-    yield s
-    s.close()
 
 
 def _seed_roster(dest, sample: bytes = SAMPLE) -> None:

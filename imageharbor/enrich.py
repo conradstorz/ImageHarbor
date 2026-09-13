@@ -187,17 +187,31 @@ def enrich_library(
                             stats.aborted = True
                             break
                     continue
-                concept_map.remember(catalog, content.primary_subject, cls)
 
-            # Recorded here -- once every backend call this row needed (describe,
-            # and pick_class when the concept map missed) has actually succeeded
-            # -- rather than right after describe(). Recording success right
-            # after describe() would reset the breaker's consecutive-failure
-            # counter on every row even when that row's pick_class call then
-            # fails, making a run of pick_class-only failures unable to ever
-            # reach trip_threshold.
-            if breaker is not None:
-                breaker.record_success()
+                # Recorded here -- once every backend call this row needed
+                # (describe, and now pick_class) has actually succeeded --
+                # and deliberately BEFORE concept_map.remember() just below
+                # (R3 review Minor #5): record_success() keys purely to
+                # backend evidence, so a later remember() failure (local
+                # SQLite I/O, handled as io_failed by the outer except
+                # below) can never suppress recording backend success that
+                # already happened.
+                if breaker is not None:
+                    breaker.record_success()
+                concept_map.remember(catalog, content.primary_subject, cls)
+            else:
+                # The concept map already knew this subject -- no backend
+                # call beyond describe() was needed for this row -- so
+                # success is recorded here instead, on the identical
+                # evidence rule: purely backend, before any further local
+                # work. (Recording success right after describe() instead
+                # of here would reset the breaker's consecutive-failure
+                # counter on every row even when that row's pick_class call
+                # then fails, making a run of pick_class-only failures
+                # unable to ever reach trip_threshold -- which is why this
+                # isn't hoisted up to right after describe() either.)
+                if breaker is not None:
+                    breaker.record_success()
 
             pcs_code = taxonomy.resolve_or_create(
                 cls, content.primary_subject, adjudicator=classifier.adjudicate

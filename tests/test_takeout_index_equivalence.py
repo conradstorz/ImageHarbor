@@ -66,20 +66,11 @@ import pytest
 from imageharbor.catalog import Catalog
 from imageharbor.takeout import index_reader, pairing
 from imageharbor.takeout.ingest import ingest_archives
-from tests.test_takeout_index_reader import make_index
+from tests.takeout_helpers import D, _jpeg, _sidecar, _zip, make_index
 
-# `catalog` and `dirs` are pytest fixtures defined in test_takeout_ingest.py;
-# importing them by name is what makes pytest able to inject them into this
-# module's own tests (see test_a_mismatched_index_changes_nothing below) --
-# not dead re-exports, despite looking unused to a static import checker.
-from tests.test_takeout_ingest import (  # noqa: F401
-    D,
-    _jpeg,
-    _sidecar,
-    _zip,
-    catalog,
-    dirs,
-)
+# `catalog` and `dirs` are shared pytest fixtures from tests/conftest.py;
+# pytest injects them by parameter name (see
+# test_a_mismatched_index_changes_nothing below) -- no import needed.
 
 # --------------------------------------------------------------------------
 # Load Takeout_Inventory's real writer if it is importable in this
@@ -351,7 +342,7 @@ def test_the_two_pairing_paths_never_name_different_sidecars(tmp_path):
     assert skipped_index_only == 1, "the index-only divergence branch never fired"
 
 
-def test_a_mismatched_index_changes_nothing(tmp_path, dirs, catalog: Catalog):  # noqa: F811 -- pytest fixture params, not a redefinition of the module-level import above
+def test_a_mismatched_index_changes_nothing(tmp_path, dirs, catalog: Catalog):
     """What makes 'optional' safe rather than merely intended.
 
     An index that is present but covers NOTHING (every archive's on-disk

@@ -508,9 +508,58 @@ def test_a_remember_failure_is_io_evidence_and_the_pass_continues(tmp_path, monk
     assert stats.ai_failed == []
     assert stats.enriched == 0
     assert stats.aborted is False
-    # remember() (enrich.py:190) runs before record_success() (:199-200), so
-    # on this path the breaker is never touched at all -- neither success nor
-    # failure is recorded; the load-bearing assertion is only that it never
-    # opened.
+    # record_success() now runs BEFORE remember() (moved there for R3 review
+    # Minor #5), so on this path the breaker DOES see a success recorded for
+    # this row before remember() blows up -- a success can never trip a
+    # breaker, only reset its consecutive-failure counter, so the
+    # load-bearing assertion is still just that it never opened. remember()'s
+    # subsequent failure is still io_failed evidence, isolated to this row.
     assert not breaker.is_open()
+    cat.close()
+
+
+def test_record_success_fires_before_remember(tmp_path, monkeypatch):
+    """Ordering pin (R3 review Minor #5).
+
+    record_success() keys purely to backend evidence -- describe() and
+    pick_class() both having succeeded -- and must run BEFORE the local
+    concept_map.remember() catalog write, so a later remember() failure
+    (see test_a_remember_failure_is_io_evidence_and_the_pass_continues
+    above) can never suppress recording backend success that already
+    happened.
+    """
+    from imageharbor.circuit_breaker import CircuitBreaker
+
+    # Nonsense stem so concept_map.class_for misses, driving the row through
+    # the pick_class fallback -- StubClassifier's pick_class inherits the
+    # ABC default (900) and never raises, and remember() succeeds too, so
+    # both spied calls actually fire and their relative order is observable.
+    src = _make(tmp_path, "zzxxqq1.jpg", b"one")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    events: list[str] = []
+
+    real_remember = concept_map.remember
+
+    def spy_remember(*args, **kwargs):
+        events.append("remember")
+        return real_remember(*args, **kwargs)
+
+    monkeypatch.setattr(concept_map, "remember", spy_remember)
+
+    breaker = CircuitBreaker(trip_threshold=5, backoff_base=1.0, backoff_cap=1.0)
+    real_record_success = breaker.record_success
+
+    def spy_record_success(*args, **kwargs):
+        events.append("record_success")
+        return real_record_success(*args, **kwargs)
+
+    monkeypatch.setattr(breaker, "record_success", spy_record_success)
+
+    stats = enrich_library(cat, dest, StubClassifier(), breaker=breaker)
+
+    assert stats.enriched == 1
+    assert events == ["record_success", "remember"]
     cat.close()

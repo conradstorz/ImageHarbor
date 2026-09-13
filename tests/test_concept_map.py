@@ -1,18 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
 from imageharbor import concept_map
 from imageharbor.catalog import Catalog
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path):
-    cat = Catalog(tmp_path / "c.db")
-    yield cat
-    cat.close()
 
 
 def test_static_seed_from_pcs_subnames() -> None:

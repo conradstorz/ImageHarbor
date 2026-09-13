@@ -11,8 +11,6 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-import pytest
-
 from imageharbor.catalog import Catalog
 from imageharbor.circuit_breaker import CircuitBreaker
 from imageharbor.hashing import compute_sha256_b64url, verify_file
@@ -23,20 +21,6 @@ from imageharbor.watcher import run_once, watch
 def _make_jpeg(path: Path, content: bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9") -> Path:
     path.write_bytes(content)
     return path
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path):
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
-
-
-@pytest.fixture()
-def organized_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "organized"
-    d.mkdir()
-    return d
 
 
 class _FailsForContent:

@@ -60,13 +60,6 @@ def _jpeg(marker: bytes) -> bytes:
 
 
 @pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
-
-
-@pytest.fixture()
 def control(catalog: Catalog) -> ControlPlane:
     return ControlPlane(catalog, env_interval=300, env_enrich=True)
 
@@ -132,13 +125,6 @@ def _seed_faces(store: FaceStore) -> dict[str, int]:
         "unreviewed": 1,
         "singletons": 1,
     }
-
-
-@pytest.fixture()
-def organized_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "organized"
-    d.mkdir()
-    return d
 
 
 def _run_pipeline_with_three_photos(source: Path, organized: Path, catalog: Catalog):
@@ -768,3 +754,137 @@ def test_faces_section_does_not_break_the_document_when_face_store_raises(
     assert doc["history"] is not None
     assert doc["projection"] is not None
     assert doc["overrides"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Concurrency (deferred issue #11)
+# ---------------------------------------------------------------------------
+#
+# `_library_section`, `_evidence_section`, and `_queues_section` reach
+# `catalog._conn` directly for aggregate SQL that has no `Catalog` wrapper
+# method, so each acquires `catalog.lock` around its query block (see the
+# module docstring's "Accepted inconsistency, and the lock that is NOT a fix
+# for it" section). `tests/test_catalog.py::
+# test_concurrent_reads_and_writes_from_multiple_threads_raise_nothing`
+# covers concurrent access to *public* `Catalog` methods only -- it never
+# calls `stats.collect()`, so it cannot catch a regression that deletes one
+# of these three locks. This test closes that gap: it mirrors the same
+# fixed-thread/fixed-op, collect-all-exceptions-then-assert harness, but
+# drives writer threads against `Catalog.upsert` concurrently with reader
+# threads calling `stats.collect()`.
+#
+# Mutation-probe evidence (see task-4-report.md for the full record):
+# commenting out the `with catalog.lock:` in `_library_section` reliably
+# reproduced `sqlite3.OperationalError`/`ValueError` failures from this test
+# within the fixed op counts below -- no count increase was needed.
+
+
+def test_stats_collect_under_writer_load_raises_nothing(
+    catalog: Catalog, control: ControlPlane
+) -> None:
+    """Deferred issue #11: stats.py's three direct-_conn query blocks hold
+    catalog.lock, but nothing failed if those locks were deleted -- the
+    public-method concurrency test never drives collect(). This does:
+    N writer threads upserting while M threads call stats.collect(); every
+    exception is collected and the test fails on any.
+
+    Deterministic on purpose (fixed thread/op counts, not a timed loop), the
+    same way tests/test_catalog.py's concurrency test is -- see that test's
+    comment for why.
+
+    Every `collect()` call is wrapped section-by-section in `_safe` (see
+    stats.py's module docstring), so an unguarded `catalog._conn` race in
+    `_library_section`/`_evidence_section`/`_queues_section` does NOT surface
+    as an exception escaping `collect()` -- `_safe` catches it, logs it, and
+    reports that section as `None` instead. So an exception escaping
+    `stats.collect()` itself is not the only failure signature to watch for:
+    each collector also asserts `library`/`evidence`/`queues` are never
+    `None` on a catalog that always has rows in it (pre-seeded below before
+    the concurrent phase starts) -- a `None` there, with real data present
+    and no synthetic fault injected, means one of those sections' queries
+    just raised, which is exactly the swallowed race this test exists to
+    catch. Catalog rows are pre-seeded (not just written concurrently by the
+    writer threads) so `_library_section`'s aggregate JOIN over `sources` has
+    real, non-trivial work to do from the very first `collect()` call,
+    widening the race window.
+
+    SQLite same-connection races are probabilistic, so "raises/returns-None
+    nothing" is the property under test, not a guarantee that a reintroduced
+    bug reproduces on every single run -- but the mutation probe run during
+    development (see task-4-report.md: commenting out `_library_section`'s
+    `with catalog.lock:`) reproduced a failure on every one of several runs
+    at these thread/op counts, well within this test's ~10s runtime budget.
+    """
+    import queue
+    import threading
+
+    SEED_ROWS = 200
+    WRITER_THREADS = 6
+    WRITE_OPS_PER_THREAD = 150
+    COLLECTOR_THREADS = 6
+    COLLECT_OPS_PER_THREAD = 40
+
+    for i in range(SEED_ROWS):
+        digest = f"SEED-{i}"
+        source_path = f"/seed/{i}.jpg"
+        catalog.upsert(
+            sha256_b64url=digest,
+            original_path=source_path,
+            organized_path=f"/lib/seed/{i}.jpg",
+        )
+        catalog.record_source(digest, source_path, size=1024, mtime_ns=i)
+
+    errors: "queue.Queue[BaseException]" = queue.Queue()
+    expected_keys = {
+        "now", "library", "evidence", "queues", "history",
+        "projection", "overrides", "faces",
+    }
+
+    def _writer(thread_id: int) -> None:
+        try:
+            for i in range(WRITE_OPS_PER_THREAD):
+                digest = f"C{thread_id}-{i}"
+                source_path = f"/src/w{thread_id}/{i}.jpg"
+                catalog.upsert(
+                    sha256_b64url=digest,
+                    original_path=source_path,
+                    organized_path=f"/lib/w{thread_id}/{i}.jpg",
+                )
+                catalog.record_source(digest, source_path, size=1024, mtime_ns=i)
+        except BaseException as exc:  # noqa: BLE001 -- captured for the assertion below
+            errors.put(exc)
+
+    def _collector(thread_id: int) -> None:
+        try:
+            for _ in range(COLLECT_OPS_PER_THREAD):
+                doc = stats.collect(catalog, control, now=datetime.now(timezone.utc))
+                assert set(doc.keys()) == expected_keys, doc.keys()
+                for key in ("library", "evidence", "queues"):
+                    assert doc[key] is not None, (
+                        f"{key!r} section came back None under writer load -- "
+                        "its query raised and was swallowed by _safe (see "
+                        "docstring above)"
+                    )
+        except BaseException as exc:  # noqa: BLE001
+            errors.put(exc)
+
+    threads = [
+        threading.Thread(target=_writer, args=(n,), name=f"writer-{n}")
+        for n in range(WRITER_THREADS)
+    ] + [
+        threading.Thread(target=_collector, args=(n,), name=f"collector-{n}")
+        for n in range(COLLECTOR_THREADS)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert all(not t.is_alive() for t in threads), "a thread did not finish within 60s"
+
+    collected: list[BaseException] = []
+    while not errors.empty():
+        collected.append(errors.get_nowait())
+    assert collected == [], (
+        f"{len(collected)} exception(s) raised by concurrent stats.collect()/"
+        f"Catalog.upsert access: {[repr(e) for e in collected]}"
+    )

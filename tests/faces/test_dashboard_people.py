@@ -3,12 +3,11 @@
 import numpy as np
 import pytest
 
-from imageharbor.catalog import Catalog
 from imageharbor.dashboard import people
 from imageharbor.faces import cluster
 from imageharbor.faces.attribute import Proposal
 from imageharbor.faces.decode import Detection
-from imageharbor.faces.store import FaceStore, ScannedFace
+from imageharbor.faces.store import ScannedFace
 
 
 def _det():
@@ -20,15 +19,6 @@ def _det():
 def _v(vals):
     a = np.asarray(vals, dtype=np.float32)
     return a / np.linalg.norm(a)
-
-
-@pytest.fixture
-def store(tmp_path):
-    db = tmp_path / "catalog.db"
-    Catalog(db).close()
-    s = FaceStore(db)
-    yield s
-    s.close()
 
 
 def _one_cluster(store, faces=2, digest_prefix="d"):

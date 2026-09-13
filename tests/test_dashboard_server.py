@@ -225,13 +225,6 @@ def _dispatch_json(handler_cls: type, method: str, path: str, payload: Any = Non
 
 
 @pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
-
-
-@pytest.fixture()
 def control(catalog: Catalog) -> ControlPlane:
     return ControlPlane(catalog, env_interval=300, env_enrich=True)
 
