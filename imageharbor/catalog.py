@@ -258,21 +258,32 @@ class Catalog:
         # any in-process failure (see `watcher.run_once`'s docstring).
         self._own_run_ids: set[int] = set()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        # A single connection is now shared between the watcher and the
-        # dashboard, guarded by self.lock (see the class docstring) -- so
-        # every write and every settings read is fully serialized in-process
-        # and never actually contends at the SQLite level. This pragma is
-        # kept anyway as a pin against a future second connection (e.g. the
-        # "smaller change now, real second connection later" path noted
-        # above), which WOULD contend at the SQLite level and rely on this
-        # wait rather than the in-process lock.
-        self._conn.execute("PRAGMA busy_timeout=5000;")
-        self._conn.executescript(_SCHEMA)
-        self._ensure_photo_columns()
-        self._conn.commit()
-        self._guard_legacy_catalog()
+        try:
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            # A single connection is now shared between the watcher and the
+            # dashboard, guarded by self.lock (see the class docstring) -- so
+            # every write and every settings read is fully serialized in-process
+            # and never actually contends at the SQLite level. This pragma is
+            # kept anyway as a pin against a future second connection (e.g. the
+            # "smaller change now, real second connection later" path noted
+            # above), which WOULD contend at the SQLite level and rely on this
+            # wait rather than the in-process lock.
+            self._conn.execute("PRAGMA busy_timeout=5000;")
+            self._conn.executescript(_SCHEMA)
+            self._ensure_photo_columns()
+            self._conn.commit()
+            self._guard_legacy_catalog()
+        except BaseException:
+            # `_guard_legacy_catalog` (or any earlier setup step) can raise
+            # before this object finishes constructing -- e.g. a pre-redesign
+            # catalog raises `LegacyCatalogError` here. When `__init__` raises,
+            # no `Catalog` instance survives for a caller to `close()`, so the
+            # connection opened above would otherwise leak until GC finalizes
+            # it (a `ResourceWarning: unclosed database`, not a log line).
+            # Close it ourselves before propagating.
+            self._conn.close()
+            raise
         logger.debug("Catalog opened at %s", db_path)
 
     def _ensure_photo_columns(self) -> None:

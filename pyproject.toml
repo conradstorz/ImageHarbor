@@ -73,6 +73,11 @@ markers = [
     "corpus: runs against a real Google Takeout export on disk. Opt-in, never in CI.",
 ]
 addopts = "--strict-markers -m \"not corpus\""
+filterwarnings = [
+    # A leaked sqlite connection is a latent bug, not a log line. Catalog
+    # has close()/context-manager support; every opener must use it.
+    "error::ResourceWarning",
+]
 
 # Lint only in R1 -- no `ruff format`, no line-length rules: a wholesale
 # reformat of 15k LOC is deliberate churn we are not buying in the same
