@@ -1,6 +1,6 @@
 """Tests for the AI enrichment pass and its non-degradation guarantee."""
 
-from imageharbor import tiers
+from imageharbor import concept_map, tiers
 from imageharbor.ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from imageharbor.catalog import Catalog
 from imageharbor.enrich import enrich_library
@@ -382,4 +382,75 @@ def test_a_concept_map_hit_never_calls_pick_class(tmp_path):
     assert stats.enriched == 1
     assert stats.ai_failed == []
     assert stats.errors == 0
+    cat.close()
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: class_for()/remember() are LOCAL SQLite I/O, not backend calls
+# -- a raise there must stay inside the per-row outer try/except (io_failed,
+# breaker untouched, pass continues to later rows), never escape
+# enrich_library entirely.
+# ---------------------------------------------------------------------------
+
+
+def test_a_class_for_failure_is_io_evidence_and_the_pass_continues(tmp_path, monkeypatch):
+    from imageharbor.circuit_breaker import BreakerState, CircuitBreaker
+
+    src = _make(tmp_path, "IMG_1.jpg", b"one")
+    (src / "IMG_2.jpg").write_bytes(b"two")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("catalog I/O exploded in class_for")
+
+    monkeypatch.setattr(concept_map, "class_for", boom)
+
+    # trip_threshold=1 means a single fed failure would open the breaker --
+    # this proves class_for's failure never reaches record_failure().
+    breaker = CircuitBreaker(trip_threshold=1, backoff_base=1.0, backoff_cap=1.0)
+    stats = enrich_library(cat, dest, FixedClassifier(), breaker=breaker)
+
+    # Both rows were reached -- the exception in row 1 did not abort the pass.
+    assert stats.total == 2
+    assert len(stats.io_failed) == 2
+    assert stats.ai_failed == []
+    assert stats.enriched == 0
+    assert stats.aborted is False
+    assert breaker.state == BreakerState.CLOSED
+    cat.close()
+
+
+def test_a_remember_failure_is_io_evidence_and_the_pass_continues(tmp_path, monkeypatch):
+    from imageharbor.circuit_breaker import CircuitBreaker
+
+    # Nonsense stems so concept_map.class_for misses for every row (as in
+    # test_a_pick_class_failure_is_ai_evidence_and_feeds_the_breaker above),
+    # which drives every row through the pick_class fallback. StubClassifier's
+    # pick_class inherits the ABC default (900) and never raises, so it
+    # succeeds and remember() is reached.
+    src = _make(tmp_path, "zzxxqq1.jpg", b"one")
+    (src / "zzxxqq2.jpg").write_bytes(b"two")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("catalog I/O exploded in remember")
+
+    monkeypatch.setattr(concept_map, "remember", boom)
+
+    breaker = CircuitBreaker(trip_threshold=1, backoff_base=1.0, backoff_cap=1.0)
+    stats = enrich_library(cat, dest, StubClassifier(), breaker=breaker)
+
+    assert stats.total == 2
+    assert len(stats.io_failed) == 2
+    assert stats.ai_failed == []
+    assert stats.enriched == 0
+    assert stats.aborted is False
+    # pick_class succeeded, so record_success() ran before remember() blew up --
+    # a real backend success, not a failure, so a CLOSED breaker here is
+    # expected either way; the load-bearing assertion is that it never opened.
+    assert not breaker.is_open()
     cat.close()
