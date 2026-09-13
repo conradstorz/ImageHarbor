@@ -141,7 +141,7 @@ Module responsibilities:
   late-sidecar-discovery case described above, and orphan detection needs the
   whole-batch pairing index, which isn't finished building until `_survey`
   returns; `_ingest_archive` is the point where a zip handle for that specific
-  archive is already open for the work it's about to do anyway. Seven
+  archive is already open for the work it's about to do anyway. Eight
   modules: `metadata.py` (pure Google-JSON parser, never raises; timestamp
   parsing uses epoch + timedelta arithmetic instead of `datetime.fromtimestamp`
   to remain platform-independent for pre-1970 dates — the latter raises `OSError`
@@ -153,9 +153,12 @@ Module responsibilities:
   (preserves non-media members verbatim, described below), `survey.py` (read-only
   measurement of an archive set -- two passes: central directories to build the
   whole-batch pairing index, then a reopen to sniff members whose extension is
-  unrecognized and read per-media sidecars), and `report.py` (pure: turns a
+  unrecognized and read per-media sidecars), `report.py` (pure: turns a
   collected inventory into the report document, split from `survey.py` for the
-  same reason `projections.py` is split from `stats.py`).
+  same reason `projections.py` is split from `stats.py`), and `store.py`
+  (`TakeoutStore` — the `takeout_archives`/`takeout_members` read/write
+  methods, extracted from `Catalog` in R5 onto the same shared connection and
+  lock; see `catalog.py`'s bullet above for how it is composed).
 - **`takeout/provenance.py`** — preserves every archive member that is **not**
   an image or video, verbatim, under
   `<organized_dir>/.takeout-provenance/<archive_id>/` (keyed by the SHA-256 of
@@ -364,7 +367,15 @@ Module responsibilities:
   `deferred`/`parsed`/`ignored`/`skipped_trash` and non-terminal `pending`/
   `failed`) back Takeout ingestion's four idempotency layers. Both are purely
   additive, so `SCHEMA_VERSION` stays `"2"` and an existing catalog upgrades in
-  place.
+  place. **R5:** the read/write methods over these two tables no longer live
+  on `Catalog` — they were extracted (2026-09-13) into `TakeoutStore`
+  (`imageharbor/takeout/store.py`), composed onto the same connection and
+  lock as `self.takeout = TakeoutStore(conn=self._conn, lock=self.lock)` in
+  `Catalog.__init__` (constructed via a local import to avoid a cycle with
+  `takeout/ingest.py`'s `from ..catalog import Catalog`). SQL and docstrings
+  moved verbatim; call sites are `catalog.takeout.<method>(...)` (e.g.
+  `catalog.takeout.member_set(...)`, `catalog.takeout.status_counts()`) —
+  there is no bare `catalog.takeout_*` left anywhere in the codebase.
   Two more additive tables back the operational dashboard (`dashboard/`,
   below), also without bumping `SCHEMA_VERSION`: a `runs` table (`id`, `kind`
   'facts'|'enrich', `started_at`, `ended_at` NULL while a pass is in flight or

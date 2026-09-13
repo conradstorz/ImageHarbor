@@ -208,8 +208,8 @@ def test_videos_are_deferred_with_a_date_and_no_bytes_copied(dirs, catalog: Cata
     assert stats.ingested == 0
     assert list(dest.rglob("*.mp4")) == []
 
-    identity = catalog.takeout_archives_all()[0]["archive_id"]
-    row = [m for m in catalog.takeout_members_all(identity) if m["kind"] == "video"][0]
+    identity = catalog.takeout.archives_all()[0]["archive_id"]
+    row = [m for m in catalog.takeout.members_all(identity) if m["kind"] == "video"][0]
     assert row["status"] == "deferred"
     assert row["taken_at"].startswith("2015-03-09")
 
@@ -249,8 +249,8 @@ def test_a_video_failure_does_not_abort_the_batch(dirs, catalog: Catalog, monkey
     assert stats.failed == 1
     assert len(list((dest / "Undated").glob("*.jpg"))) == 1
 
-    identity = catalog.takeout_archives_all()[0]["archive_id"]
-    rows = {m["member_path"]: m for m in catalog.takeout_members_all(identity)}
+    identity = catalog.takeout.archives_all()[0]["archive_id"]
+    rows = {m["member_path"]: m for m in catalog.takeout.members_all(identity)}
     assert rows[f"{D}/clip.mp4"]["status"] == "failed"
 
 
@@ -264,8 +264,8 @@ def test_trash_is_enumerated_but_not_ingested(dirs, catalog: Catalog) -> None:
 
     assert stats.skipped_trash == 1
     assert stats.ingested == 1
-    identity = catalog.takeout_archives_all()[0]["archive_id"]
-    statuses = {m["member_path"]: m["status"] for m in catalog.takeout_members_all(identity)}
+    identity = catalog.takeout.archives_all()[0]["archive_id"]
+    statuses = {m["member_path"]: m["status"] for m in catalog.takeout.members_all(identity)}
     assert statuses["Takeout/Google Photos/Trash/deleted.jpg"] == "skipped_trash"
 
 
@@ -303,12 +303,12 @@ def test_include_trash_run_reaches_complete_and_stays_skipped_after(
     )
 
     ingest_archives(archives, dest, catalog)
-    identity = catalog.takeout_archives_all()[0]["archive_id"]
-    assert catalog.takeout_archive_get(identity)["status"] == "complete"
+    identity = catalog.takeout.archives_all()[0]["archive_id"]
+    assert catalog.takeout.archive_get(identity)["status"] == "complete"
 
     second = ingest_archives(archives, dest, catalog, include_trash=True)
     assert second.ingested == 1
-    assert catalog.takeout_archive_get(identity)["status"] == "complete"
+    assert catalog.takeout.archive_get(identity)["status"] == "complete"
 
     third = ingest_archives(archives, dest, catalog)
     assert third.ingested == 0
@@ -588,9 +588,9 @@ def test_a_failed_retry_keeps_what_the_member_already_knew(
 
     ingest_archives(archives, dest, catalog)
 
-    identity = catalog.takeout_archives_all()[0]["archive_id"]
+    identity = catalog.takeout.archives_all()[0]["archive_id"]
     first_row = [
-        m for m in catalog.takeout_members_all(identity)
+        m for m in catalog.takeout.members_all(identity)
         if m["member_path"] == f"{D}/IMG_1234.jpg"
     ][0]
     assert first_row["sha256_b64url"] is not None
@@ -616,7 +616,7 @@ def test_a_failed_retry_keeps_what_the_member_already_knew(
     assert stats.failed == 1
 
     retried_row = [
-        m for m in catalog.takeout_members_all(identity)
+        m for m in catalog.takeout.members_all(identity)
         if m["member_path"] == f"{D}/IMG_1234.jpg"
     ][0]
     assert retried_row["status"] == "failed"
@@ -766,7 +766,7 @@ def test_a_deleted_provenance_room_is_recreated_by_re_ingesting_a_complete_archi
     first = ingest_archives(archives, dest, catalog)
     assert first.ingested == 1
 
-    identity = catalog.takeout_archives_all()[0]["archive_id"]
+    identity = catalog.takeout.archives_all()[0]["archive_id"]
     room = dest / provenance.ROOM_NAME / identity
     manifest = provenance.manifest_path(dest, identity)
     assert room.exists()
@@ -791,7 +791,7 @@ def test_a_deleted_provenance_room_is_recreated_by_re_ingesting_a_complete_archi
     assert room.exists(), "the provenance room must be recreated"
     assert manifest.exists(), "the manifest must be rewritten"
     assert any(room.rglob("a.jpg.json")), "the preserved document must be back"
-    assert catalog.takeout_archive_get(identity)["status"] == "complete"
+    assert catalog.takeout.archive_get(identity)["status"] == "complete"
 
 
 def test_a_photo_with_no_albums_json_in_its_directory_still_organizes(
@@ -1044,7 +1044,7 @@ def test_index_only_paired_sidecar_is_not_filed_as_an_orphan(
 
     from imageharbor.takeout import provenance
 
-    identity = catalog.takeout_archives_all()[0]["archive_id"]
+    identity = catalog.takeout.archives_all()[0]["archive_id"]
     room = dest / provenance.ROOM_NAME / identity
     orphaned = room / "orphaned" / "some-other-photo.jpg.json"
     claimed = room / D / "some-other-photo.jpg.json"

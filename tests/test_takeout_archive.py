@@ -101,7 +101,7 @@ def test_identify_hashes_on_a_miss(tmp_path: Path, catalog: Catalog) -> None:
 def test_identify_uses_the_stat_fast_path(tmp_path: Path, catalog: Catalog, monkeypatch) -> None:
     z = _zip(tmp_path / "t.zip", {"d/a.jpg": b"aaa"})
     identity = archive.identify(z, catalog)
-    catalog.takeout_archive_upsert(
+    catalog.takeout.archive_upsert(
         archive_id=identity.archive_id,
         last_path=str(z),
         size=identity.size,
@@ -119,7 +119,7 @@ def test_identify_uses_the_stat_fast_path(tmp_path: Path, catalog: Catalog, monk
 def test_a_renamed_archive_resolves_to_the_same_id(tmp_path: Path, catalog: Catalog) -> None:
     z = _zip(tmp_path / "t.zip", {"d/a.jpg": b"aaa"})
     first = archive.identify(z, catalog)
-    catalog.takeout_archive_upsert(
+    catalog.takeout.archive_upsert(
         archive_id=first.archive_id, last_path=str(z), size=first.size,
         mtime_ns=first.mtime_ns,
     )

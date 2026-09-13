@@ -1036,7 +1036,7 @@ def takeout_ingest(
 def takeout_status(catalog_path: Path) -> None:
     """Report Takeout ingestion progress."""
     with Catalog(catalog_path) as cat:
-        counts = cat.takeout_status_counts()
+        counts = cat.takeout.status_counts()
 
     archives = counts["archives"]
     total = sum(archives.values())

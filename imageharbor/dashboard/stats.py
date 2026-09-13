@@ -428,7 +428,7 @@ def _queues_section(catalog: Catalog, unenriched_count: int | None) -> dict:
         ).fetchall()
         failed_active = [dict(r) for r in failed_active_rows]
 
-    takeout = catalog.takeout_status_counts()
+    takeout = catalog.takeout.status_counts()
     takeout_pending = takeout.get("members", {}).get("pending", 0)
 
     return {

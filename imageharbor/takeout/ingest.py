@@ -384,16 +384,16 @@ class _Ingestor:
                 else:
                     self.stats.index_archives_fell_back += 1
 
-            row = self.catalog.takeout_archive_get(identity.archive_id)
+            row = self.catalog.takeout.archive_get(identity.archive_id)
 
             if row is not None and row["status"] == "complete":
                 reopened = False
                 if self.include_trash and not self.dry_run:
                     # A user who changes their mind must not be blocked by the
                     # terminal status an earlier run recorded.
-                    moved = self.catalog.takeout_members_unskip_trash(identity.archive_id)
+                    moved = self.catalog.takeout.members_unskip_trash(identity.archive_id)
                     if moved:
-                        self.catalog.takeout_archive_set_status(
+                        self.catalog.takeout.archive_set_status(
                             identity.archive_id, "partial"
                         )
                         self.stats.archives_reopened += 1
@@ -403,7 +403,7 @@ class _Ingestor:
                     # the pairing index, and is re-examined in the second pass
                     # below once the index exists. Member paths come from the
                     # catalog, so no zip is opened and nothing is decompressed.
-                    rows = self.catalog.takeout_members_all(identity.archive_id)
+                    rows = self.catalog.takeout.members_all(identity.archive_id)
                     for db_member in rows:
                         all_members.append(db_member["member_path"])
                         self.owner[db_member["member_path"]] = path
@@ -417,7 +417,7 @@ class _Ingestor:
                 logger.error("Archive %s is unreadable: %s", path.name, exc)
                 self.stats.archives_corrupt += 1
                 if not self.dry_run:
-                    self.catalog.takeout_archive_upsert(
+                    self.catalog.takeout.archive_upsert(
                         archive_id=identity.archive_id,
                         last_path=str(path),
                         size=identity.size,
@@ -428,7 +428,7 @@ class _Ingestor:
                 continue
 
             if not self.dry_run:
-                self.catalog.takeout_archive_upsert(
+                self.catalog.takeout.archive_upsert(
                     archive_id=identity.archive_id,
                     last_path=str(path),
                     size=identity.size,
@@ -437,7 +437,7 @@ class _Ingestor:
                     status="partial",
                 )
                 for member in members:
-                    self.catalog.takeout_member_add(
+                    self.catalog.takeout.member_add(
                         archive_id=identity.archive_id,
                         member_path=member.path,
                         kind=member.kind,
@@ -553,10 +553,10 @@ class _Ingestor:
 
                 for row in stale:
                     # Every field this row already holds must be passed back:
-                    # `takeout_member_set` is a blind full-row UPDATE and would
+                    # `catalog.takeout.member_set` is a blind full-row UPDATE and would
                     # otherwise null what it does not receive. `sidecar_path` is
                     # deliberately left None -- re-ingesting is what establishes it.
-                    self.catalog.takeout_member_set(
+                    self.catalog.takeout.member_set(
                         identity.archive_id,
                         row["member_path"],
                         status=_PENDING,
@@ -565,7 +565,7 @@ class _Ingestor:
                         sidecar_path=None,
                         last_error=row["last_error"],
                     )
-                self.catalog.takeout_archive_set_status(identity.archive_id, "partial")
+                self.catalog.takeout.archive_set_status(identity.archive_id, "partial")
                 todo.append((identity, members))
                 continue
 
@@ -749,7 +749,7 @@ class _Ingestor:
         if identity.archive_id in self._album_indexed:
             return
         self._album_indexed.add(identity.archive_id)
-        for row in self.catalog.takeout_members_all(identity.archive_id):
+        for row in self.catalog.takeout.members_all(identity.archive_id):
             if row["kind"] != archive.KIND_ALBUM:
                 continue
             folder = row["member_path"].rpartition("/")[0].rpartition("/")[2] or None
@@ -781,7 +781,7 @@ class _Ingestor:
         files, never a duplicate write.
         """
         try:
-            rows = self.catalog.takeout_members_all(identity.archive_id)
+            rows = self.catalog.takeout.members_all(identity.archive_id)
             members = [
                 archive.MemberInfo(
                     path=row["member_path"], size=row["size"],
@@ -809,7 +809,7 @@ class _Ingestor:
     def _mark_failed(self, identity: archive.ArchiveIdentity, row: sqlite3.Row, error: str) -> None:
         """Record a member as failed WITHOUT discarding what it already knew.
 
-        `takeout_member_set` is a blind full-row UPDATE, so a failure branch
+        `catalog.takeout.member_set` is a blind full-row UPDATE, so a failure branch
         that passes only `status` and `last_error` nulls `sha256_b64url`,
         `taken_at`, and `sidecar_path`. That matters most for a member the
         second survey pass just reopened: the reopen deliberately carried
@@ -824,7 +824,7 @@ class _Ingestor:
         run appear to succeed while recording nothing. It is stated here
         because the abort would otherwise look accidental.
         """
-        self.catalog.takeout_member_set(
+        self.catalog.takeout.member_set(
             identity.archive_id,
             row["member_path"],
             status=_FAILED,
@@ -904,7 +904,7 @@ class _Ingestor:
         # the sole arbiter of truth and takeout_members can only lag it.
         # `last_error` is deliberately omitted: this member just succeeded,
         # so clearing any error from a previous attempt is correct.
-        self.catalog.takeout_member_set(
+        self.catalog.takeout.member_set(
             identity.archive_id,
             member_path,
             status=status,
@@ -1039,7 +1039,7 @@ class _Ingestor:
                 self.stats.missing_metadata += 1
             # `last_error` is deliberately omitted: this member just succeeded,
             # so clearing any error from a previous attempt is correct.
-            self.catalog.takeout_member_set(
+            self.catalog.takeout.member_set(
                 identity.archive_id,
                 member_path,
                 status=_DEFERRED,
@@ -1065,7 +1065,7 @@ class _Ingestor:
         # the zip still needs to be opened once so `_preserve_provenance` can
         # rebuild a missing/incomplete room. `images`/`videos` stay empty in
         # that case, so the loops below do nothing either way.
-        pending = self.catalog.takeout_members_pending(identity.archive_id)
+        pending = self.catalog.takeout.members_pending(identity.archive_id)
         images = [r for r in pending if r["kind"] == archive.KIND_IMAGE]
         videos = [r for r in pending if r["kind"] == archive.KIND_VIDEO]
 
@@ -1078,7 +1078,7 @@ class _Ingestor:
         except (zipfile.BadZipFile, OSError) as exc:
             logger.error("Archive %s failed mid-ingest: %s", identity.path.name, exc)
             self.stats.archives_corrupt += 1
-            self.catalog.takeout_archive_set_status(
+            self.catalog.takeout.archive_set_status(
                 identity.archive_id, "corrupt", str(exc)
             )
             return
@@ -1086,8 +1086,8 @@ class _Ingestor:
         for row in videos:
             self._defer_video(identity, row)
 
-        if not self.catalog.takeout_members_pending(identity.archive_id):
-            self.catalog.takeout_archive_set_status(identity.archive_id, "complete")
+        if not self.catalog.takeout.members_pending(identity.archive_id):
+            self.catalog.takeout.archive_set_status(identity.archive_id, "complete")
 
         self.stats.per_archive.append(
             {"archive": identity.path.name, "members": len(images) + len(videos)}
