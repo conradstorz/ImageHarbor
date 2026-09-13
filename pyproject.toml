@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "imageharbor"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Deterministic, resumable photo organization system"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -44,6 +44,12 @@ dev = [
 
 [project.scripts]
 imageharbor = "imageharbor.cli:main"
+
+[tool.setuptools_scm]
+# A build with no .git and no SETUPTOOLS_SCM_PRETEND_VERSION_FOR_IMAGEHARBOR
+# (tests/test_packaging.py's git-less wheel; a bare source snapshot) gets a
+# recognizable non-version rather than an error.
+fallback_version = "0.0.0"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -16,4 +16,10 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
+try:
+    __version__ = _dist_version("imageharbor")
+except PackageNotFoundError:  # source tree with no installed dist
+    __version__ = "unknown+uninstalled"
