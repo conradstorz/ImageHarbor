@@ -195,6 +195,30 @@ def test_resume_after_a_mid_archive_crash_processes_only_the_remainder(
     assert stats.ingested == 1
 
 
+def test_stale_staging_debris_is_swept_at_run_start(dirs, catalog: Catalog) -> None:
+    # A kill -9 mid-extract leaves full-size images in mkdtemp dirs under
+    # <dest>/.takeout-staging -- INSIDE the library the user backs up.
+    # Repeated kills silently accumulate real space. run() owns the floor.
+    archives, dest = dirs
+    staging = dest / ".takeout-staging"
+    debris = staging / "tmpOLD" / "leftover.jpg"
+    debris.parent.mkdir(parents=True)
+    debris.write_bytes(b"\xff\xd8\xff\xe0old bytes")
+
+    _zip(
+        archives / "takeout-001.zip",
+        {
+            f"{D}/2015-03-09.jpg": _jpeg(1),
+            f"{D}/2015-03-09.jpg.json": _sidecar("2015-03-09.jpg", 1425905792),
+        },
+    )
+    ingest_archives(archives, dest, catalog)
+
+    assert not debris.exists()
+    assert not debris.parent.exists()
+    assert staging.exists()  # recreated fresh for the run
+
+
 def test_a_corrupt_archive_does_not_stop_its_neighbours(dirs, catalog: Catalog) -> None:
     archives, dest = dirs
     (archives / "broken.zip").write_bytes(b"this is not a zip file")

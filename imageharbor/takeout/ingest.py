@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import sqlite3
 import zipfile
 from dataclasses import dataclass, field
@@ -1112,6 +1113,13 @@ class _Ingestor:
                         self.stats.deferred += 1
             return self.stats
 
+        # Sweep debris from a previous killed run before creating the floor
+        # fresh. Safe: staging is never resume state (phase 2 resumes from
+        # takeout_members -- see archive.discard_staged), and the single-
+        # writer deployment means nothing else owns this directory now.
+        # ignore_errors: a locked leftover must degrade to wasted space,
+        # never abort the ingest that would supersede it.
+        shutil.rmtree(self.staging_dir, ignore_errors=True)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         try:
             for identity, _members in todo:
