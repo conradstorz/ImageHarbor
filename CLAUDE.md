@@ -255,8 +255,7 @@ Module responsibilities:
   **no longer decides where a file lives on disk** — `enrich.py` writes it into
   the sidecar's `classification.folder_path` field only, as a human-readable
   record of the PCS tree the file was filed under. Actual placement comes from
-  `date_resolver.ResolvedDate.folder`. `snapshot_text()` renders the current
-  taxonomy for the classifier prompt. `taxonomy.py` itself was not touched by the
+  `date_resolver.ResolvedDate.folder`. `taxonomy.py` itself was not touched by the
   facts/enrichment split — `enrich.py` calls `resolve_or_create(class,
   primary_subject)` with a fixed top-level class and **no `sub_parent`**, so in
   practice the taxonomy is effectively **two levels** (fixed class →
@@ -315,6 +314,11 @@ Module responsibilities:
   **not** validate a PCS prefix (there is none anymore); legacy
   `<pcs>-<descriptor>_<digest>` stems from before this redesign still parse
   unchanged, since the prefix is otherwise unconstrained.
+- **`util.py`** — tiny stdlib-only leaf module (no intra-package imports) holding
+  `now_iso()` and `json_default()`, shared across the package. Consumers
+  re-export them under their old private names (`from .util import now_iso as
+  _now_iso`) to preserve the tests' per-module monkeypatch surface — do not
+  "simplify" call sites to `util.now_iso()`.
 - **`catalog.py`** — SQLite (WAL mode). The `photos` table (keyed by the unique
   `sha256_b64url`) is the source of truth for **resumability and duplicate
   detection** (`is_known`); `upsert` is idempotent (`ON CONFLICT … DO UPDATE`) and

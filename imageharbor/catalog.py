@@ -190,8 +190,6 @@ _ADDED_PHOTO_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
-
-
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=_json_default)
 
@@ -1037,7 +1035,8 @@ class Catalog:
             )
             self._conn.commit()
             run_id = cursor.lastrowid
-            assert run_id is not None, "lastrowid is always set after an INSERT"
+            if run_id is None:
+                raise RuntimeError("run_start returned no id")
             self._own_run_ids.add(run_id)
             return run_id
 

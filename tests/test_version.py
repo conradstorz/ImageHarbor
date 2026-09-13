@@ -21,4 +21,4 @@ def test_no_hardcoded_version_literals_remain():
     assert 'version = "0.1.0"' not in text
     assert 'dynamic = ["version"]' in text
     init = Path(imageharbor.__file__).read_text(encoding="utf-8")
-    assert '__version__ = "0' not in init
+    assert not re.search(r'__version__\s*=\s*"\d', init)
