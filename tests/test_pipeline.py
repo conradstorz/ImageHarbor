@@ -12,7 +12,6 @@ from imageharbor.catalog import Catalog
 from imageharbor.hashing import verify_pcs_file
 from imageharbor.pipeline import ExternalEvidence, Pipeline
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

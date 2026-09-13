@@ -6,7 +6,6 @@ import pytest
 
 from imageharbor.discovery import SUPPORTED_EXTENSIONS, discover_images
 
-
 # ---------------------------------------------------------------------------
 # SUPPORTED_EXTENSIONS
 # ---------------------------------------------------------------------------

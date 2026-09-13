@@ -21,13 +21,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from imageharbor import watcher
 from imageharbor.catalog import Catalog
 from imageharbor.dashboard.control import ControlPlane
 from imageharbor.faces import runner
 from imageharbor.faces.cluster import Cluster
 from imageharbor.faces.decode import Detection
 from imageharbor.faces.store import FaceStore
-from imageharbor import watcher
 from imageharbor.watcher import FacesConfig, watch
 
 # These tests exercise the branch the *real* import state opens -- they do not

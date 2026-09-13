@@ -17,7 +17,6 @@ from .pipeline import Pipeline
 from .takeout import index_reader
 from .takeout.ingest import ingest_archives
 
-
 # ---------------------------------------------------------------------------
 # Root command group
 # ---------------------------------------------------------------------------

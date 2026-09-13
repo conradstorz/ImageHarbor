@@ -6,15 +6,14 @@ from pathlib import Path
 import pytest
 
 from imageharbor.hashing import (
-    compute_sha256_bytes,
     compute_sha256_b64url,
+    compute_sha256_bytes,
     decode_base64url,
     encode_base64url,
     extract_digest_from_stem,
     verify_file,
     verify_pcs_file,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -125,7 +125,7 @@ def _scan_one(
         if crops:
             photo_dir.mkdir(parents=True, exist_ok=True)
         for i, (det, crop, embedding) in enumerate(
-            zip(aligned_detections, crops, embeddings)
+            zip(aligned_detections, crops, embeddings, strict=True)
         ):
             crop.save(photo_dir / f"{digest}-{i}.jpg", quality=85)
             records.append((det, embedding, embedder.model_name, None))

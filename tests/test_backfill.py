@@ -17,7 +17,6 @@ from imageharbor.catalog import Catalog
 from imageharbor.pipeline import Pipeline
 from imageharbor.sidecar import merge_sidecar, read_sidecar, sidecar_path_for
 
-
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
 # ---------------------------------------------------------------------------

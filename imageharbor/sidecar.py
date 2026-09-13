@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .sidecar_schema import SCHEMA_VERSION as SIDECAR_SCHEMA_VERSION
 from .sidecar_schema import merge as merge_documents
 from .util import json_default as _json_default
 

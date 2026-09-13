@@ -31,6 +31,8 @@ dev = [
     # real session `importorskip` it, so the suite runs green without the
     # 200 MB runtime. Guarded by tests/test_packaging.py.
     "numpy>=1.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
 
 [project.scripts]
@@ -64,3 +66,13 @@ markers = [
     "corpus: runs against a real Google Takeout export on disk. Opt-in, never in CI.",
 ]
 addopts = "--strict-markers -m \"not corpus\""
+
+# Lint only in R1 -- no `ruff format`, no line-length rules: a wholesale
+# reformat of 15k LOC is deliberate churn we are not buying in the same
+# release that introduces CI. Rules: pyflakes + pycodestyle errors + import
+# order + bugbear.
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
