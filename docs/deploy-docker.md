@@ -32,6 +32,12 @@ To run without AI (filename-keyword stub), set `IMAGEHARBOR_AI: stub`.
 
 ## 3. Build and run
 
+Images are published automatically: `docker compose pull` fetches the
+latest release from `ghcr.io/conradstorz/imageharbor` (public, no login
+needed to pull). `docker compose up -d` after a pull upgrades in place.
+
+To build and run a local version instead:
+
 ```
 docker compose build
 docker compose up -d
@@ -86,6 +92,24 @@ To disable the dashboard entirely, set `command: watch --no-dashboard` (or add
 `--no-dashboard` to the `command:` list) — the watcher organizes exactly the
 same either way; a dashboard failure (e.g. the port already bound on the host)
 never stops it, it only logs a warning.
+
+## Security model
+
+The dashboard is an operations console, not a public site. Its exposure
+model, in one table:
+
+| Layer | Default | On hpz440 |
+|---|---|---|
+| Bind address | `127.0.0.1` (loopback only) | `0.0.0.0` in-container; reachable only via the published port on the tailnet |
+| Mutating routes (`POST /api/*`) | open on loopback | require `X-Dashboard-Token` = `IMAGEHARBOR_DASHBOARD_TOKEN` (the page prompts once and remembers it per-browser) |
+| Host-header allowlist | loopback names only | must list every name/IP the dashboard is browsed as (`IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS`) — this is the DNS-rebinding defense |
+| Read-only routes (`/api/stats`, face crops) | no token | reachable by anyone who can reach the port and passes the Host check — treat the tailnet as the trust boundary |
+
+What this deliberately does NOT provide: TLS (the tailnet link is already
+encrypted end-to-end), per-user accounts, or protection of read-only data
+from someone already inside the tailnet. If any of those assumptions stop
+holding (e.g. the port is ever published beyond the tailnet), put a real
+reverse proxy with auth in front instead of extending this scheme.
 
 ## 6. Faces (optional)
 
