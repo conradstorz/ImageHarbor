@@ -109,7 +109,22 @@ def survey_archives(archives_dir: Path) -> SurveyInventory:
     zips: list[Path] = []
     loose_files: list[Path] = []
     for entry in sorted(archives_dir.iterdir()):
-        if not entry.is_file():
+        try:
+            is_file = entry.is_file()
+        except OSError as exc:
+            # Same promise as every other call in this module: a locked or
+            # vanished entry is counted and logged, never allowed to abort a
+            # run that may have already measured other archives.
+            logger.warning("survey: cannot stat %s: %s", entry.name, exc)
+            if entry.suffix.lower() == ".zip":
+                inv.unreadable_archives += 1
+                inv.archives.append(
+                    ArchiveFact(name=entry.name, size=0, members=0, error=str(exc))
+                )
+            else:
+                inv.unreadable_loose_files += 1
+            continue
+        if not is_file:
             continue
         if entry.suffix.lower() == ".zip":
             zips.append(entry)
