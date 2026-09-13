@@ -61,6 +61,8 @@ import warnings
 from dataclasses import fields
 from pathlib import Path
 
+import pytest
+
 from imageharbor.catalog import Catalog
 from imageharbor.takeout import index_reader, pairing
 from imageharbor.takeout.ingest import ingest_archives
@@ -127,6 +129,27 @@ if INDEX_SOURCE == "literal_schema":
         "of the sibling's pairing, not the sibling's actual implementation. "
         "See this module's docstring.",
         stacklevel=1,
+    )
+
+
+def test_the_sibling_oracle_actually_loaded_where_required():
+    """On a machine that HAS the sibling checkout (Conrad's box; any env
+    that sets the flag), the differential tests must run against the real
+    oracle -- a silent fallback there means every equivalence test below
+    is checking ImageHarbor against itself. Elsewhere this skips VISIBLY,
+    which is the honest summary-line for "the oracle is absent"."""
+    import os
+
+    if os.environ.get("IMAGEHARBOR_REQUIRE_SIBLING_ORACLE") != "1":
+        pytest.skip(
+            "IMAGEHARBOR_REQUIRE_SIBLING_ORACLE not set; oracle degradation "
+            f"is permitted here (INDEX_SOURCE={INDEX_SOURCE})"
+        )
+    assert INDEX_SOURCE == "sibling_writer", (
+        "IMAGEHARBOR_REQUIRE_SIBLING_ORACLE=1 but the sibling writer did not "
+        f"load from {_SIBLING_PATH} -- the differential tests in this module "
+        "just ran in near-tautological literal_schema mode. Fix the sibling "
+        "checkout (or unset the flag if the machine legitimately lacks it)."
     )
 
 
