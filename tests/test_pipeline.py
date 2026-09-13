@@ -940,3 +940,36 @@ def test_the_already_verified_fast_path_performs_no_fsync(
 
     assert result.status == "copied"
     assert events == []
+
+
+def test_a_read_only_source_file_still_copies_verifies_and_catalogs(
+    tmp_path: Path, organized_dir: Path, catalog: Catalog
+) -> None:
+    """Regression: fsync_file opens "rb+", and shutil.copy2 preserves the
+    source's mode bits -- so a read-only source (production: an RO-mounted
+    NAS share, mode 0o444) used to yield a read-only destination that
+    fsync_file could not open, raising PermissionError and degrading the
+    file to status="error". The fix fsyncs while the destination is still
+    default-permission/writable and only then copies the source's mode via
+    shutil.copystat, so a read-only source must still copy cleanly.
+    """
+    import os
+
+    src = tmp_path / "src"
+    src.mkdir()
+    photo = _make_jpeg(src / "beach.jpg")
+    os.chmod(photo, 0o444)
+
+    try:
+        result = Pipeline(src, organized_dir, catalog).process_file(photo)
+
+        assert result.status == "copied"
+        organized = list(organized_dir.rglob("*.jpg"))
+        assert len(organized) == 1
+        assert verify_pcs_file(organized[0])
+    finally:
+        # Restore write bits so tmp_path teardown (rmtree) doesn't choke on
+        # a read-only file, especially on Windows.
+        os.chmod(photo, 0o666)
+        for organized_file in organized_dir.rglob("*.jpg"):
+            os.chmod(organized_file, 0o666)

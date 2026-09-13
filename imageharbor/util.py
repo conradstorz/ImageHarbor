@@ -32,7 +32,13 @@ def fsync_file(path: Path) -> None:
     (``_commit``) raises ``OSError: [Errno 9] Bad file descriptor`` against a
     handle opened read-only. ``"rb+"`` requires the file to already exist and
     never truncates it, so no bytes are at risk -- it only widens the handle
-    enough for the flush to be valid on every platform this runs on.
+    enough for the flush to be valid on every platform this runs on. Because
+    of the ``"rb+"`` open, callers must invoke this before applying any
+    source mode bits: a read-only destination (e.g. copied from an
+    RO-mounted source) cannot be opened ``"rb+"`` and raises
+    ``PermissionError`` -- see pipeline.py's copyfile/fsync/copystat
+    sequence, which fsyncs while the destination is still
+    default-permission/writable and only then copies the source's mode.
     """
     with open(path, "rb+") as fh:
         os.fsync(fh.fileno())
