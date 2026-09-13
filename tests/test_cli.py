@@ -909,7 +909,7 @@ def test_watch_dashboard_port_is_accepted_and_forwarded(monkeypatch, tmp_path):
 
     def _fake_serve(
         catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
-        crop_dir=None, stop_event,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
     ):
         captured["port"] = port
         return None  # a dashboard failure must never stop the watcher
@@ -926,6 +926,121 @@ def test_watch_dashboard_port_is_accepted_and_forwarded(monkeypatch, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert captured["port"] == 12345
+
+
+def test_watch_dashboard_token_env_empty_string_normalizes_to_none(monkeypatch, tmp_path):
+    """`IMAGEHARBOR_DASHBOARD_TOKEN=""` (docker-compose's shipped default,
+    before an operator has chosen a real token) must reach `serve()` as
+    `None`, not as the empty string -- an empty-string token would otherwise
+    mean 'every POST must send X-Dashboard-Token: ' rather than 'no token
+    configured'.
+    """
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["token"] = token
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+    monkeypatch.setenv("IMAGEHARBOR_DASHBOARD_TOKEN", "")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["watch", "--source", str(src), "--dest", str(dest)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["token"] is None
+
+
+def test_watch_dashboard_token_is_forwarded_when_set(monkeypatch, tmp_path):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["token"] = token
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-token", "s3cret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["token"] == "s3cret"
+
+
+def test_watch_dashboard_allowed_hosts_default_empty_string_is_empty_list(
+    monkeypatch, tmp_path
+):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["allowed_hosts"] = allowed_hosts
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["watch", "--source", str(src), "--dest", str(dest)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["allowed_hosts"] == []
+
+
+def test_watch_dashboard_allowed_hosts_splits_strips_and_drops_empties(
+    monkeypatch, tmp_path
+):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["allowed_hosts"] = allowed_hosts
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-allowed-hosts", " hpz440.tailnet ,, example.com",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["allowed_hosts"] == ["hpz440.tailnet", "example.com"]
 
 
 def test_watch_still_runs_when_the_dashboard_port_is_already_bound(monkeypatch, tmp_path):

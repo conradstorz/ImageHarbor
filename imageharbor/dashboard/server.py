@@ -24,6 +24,7 @@ a second thing that is broken.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import math
@@ -134,6 +135,7 @@ def make_handler(
     store: FaceStore | None = None,
     crop_dir: Path | None = None,
     allowed_hosts: frozenset[str] = frozenset(),
+    token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a ``BaseHTTPRequestHandler`` subclass closed over one dashboard.
 
@@ -156,6 +158,14 @@ def make_handler(
     :func:`_host_allowed`) -- an empty default keeps every caller that does
     not configure ``--dashboard-allowed-hosts`` accepting exactly the
     loopback names it always did.
+
+    ``token``, when set, is the shared secret every ``do_POST`` request must
+    present (header ``X-Dashboard-Token``, compared with
+    ``hmac.compare_digest``) -- checked immediately after the Host gate, so
+    an unrecognized Host is still rejected first. ``None`` (the default)
+    means POSTs are open, exactly as before this option existed -- the
+    loopback bind is the mitigation for a caller that never sets it. GETs
+    never require the token.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -266,6 +276,14 @@ def make_handler(
                                   "--dashboard-allowed-hosts"},
                     )
                     return
+                if token is not None:
+                    supplied = self.headers.get("X-Dashboard-Token", "")
+                    if not hmac.compare_digest(supplied, token):
+                        self._send_json(
+                            HTTPStatus.UNAUTHORIZED,
+                            {"error": "missing or wrong X-Dashboard-Token"},
+                        )
+                        return
                 if self.path == "/api/pause":
                     self._handle_pause()
                 elif self.path == "/api/settings":
@@ -535,6 +553,7 @@ def serve(
     store: FaceStore | None = None,
     crop_dir: Path | None = None,
     allowed_hosts: Sequence[str] = (),
+    token: str | None = None,
     stop_event: threading.Event,
 ) -> threading.Thread | None:
     """Start the dashboard on a daemon thread, sharing *stop_event* with the caller.
@@ -567,6 +586,7 @@ def serve(
         store=store,
         crop_dir=crop_dir,
         allowed_hosts=normalized_hosts,
+        token=token,
     )
     try:
         httpd = _DashboardHTTPServer((host, port), handler_cls)

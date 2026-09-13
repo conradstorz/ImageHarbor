@@ -132,26 +132,39 @@ def _request(
     *,
     host: str | None = "localhost",
     allowed_hosts: frozenset[str] = frozenset(),
-    body: bytes = b"",
+    body: Any = b"",
     headers: dict[str, str] | None = None,
+    token_configured: str | None = None,
+    token_header: str | None = None,
 ):
     """Dispatch one request through a *fresh, throwaway* handler.
 
-    Used only by the Host-header allowlist tests below, which care about
-    the gate firing before any routing -- not about a seeded catalog -- so
-    each call gets its own disposable in-memory catalog/control rather than
-    reaching for the module's `handler_cls` fixture (which bakes in a fixed
-    `allowed_hosts=frozenset()` at fixture-construction time, before a test
-    body gets to choose one).
+    Used by the Host-header allowlist tests and the token-gate tests below,
+    both of which care about a gate firing before any routing -- not about a
+    seeded catalog -- so each call gets its own disposable in-memory
+    catalog/control rather than reaching for the module's `handler_cls`
+    fixture (which bakes in fixed `allowed_hosts=frozenset()`/`token=None`
+    at fixture-construction time, before a test body gets to choose either).
+
+    ``body`` accepts a JSON-serializable value in addition to raw bytes, for
+    the token tests below that don't otherwise need `_dispatch_json`'s
+    response-parsing.  ``token_configured`` becomes the handler's `token`;
+    ``token_header`` -- when given -- becomes the request's
+    `X-Dashboard-Token` header.
     """
+    if not isinstance(body, (bytes, bytearray)):
+        body = json.dumps(body).encode("utf-8")
+    hdrs = dict(headers or {})
+    if token_header is not None:
+        hdrs["X-Dashboard-Token"] = token_header
     cat = Catalog(Path(tempfile.mkdtemp()) / "catalog.db")
     try:
         ctrl = ControlPlane(cat, env_interval=300, env_enrich=True)
         handler_cls = dashboard_server.make_handler(
-            cat, ctrl, allowed_hosts=allowed_hosts
+            cat, ctrl, allowed_hosts=allowed_hosts, token=token_configured
         )
         return _dispatch(
-            handler_cls, method, path, host=host, body=body, headers=headers
+            handler_cls, method, path, host=host, body=body, headers=hdrs
         )
     finally:
         cat.close()
@@ -605,6 +618,44 @@ def test_host_matching_is_case_insensitive_and_handles_ipv6_brackets():
     status, _, _ = _request("GET", "/healthz", host="LOCALHOST:8080")
     assert status == 200
     status, _, _ = _request("GET", "/healthz", host="[::1]:8080")
+    assert status == 200
+
+
+# ---------------------------------------------------------------------------
+# Shared-secret token gate on POST (R2 Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_post_without_token_is_401_when_token_configured():
+    status, _, body = _request(
+        "POST", "/api/pause", body={"paused": True}, token_configured="s3cret",
+    )
+    assert status == 401
+
+
+def test_post_with_wrong_token_is_401():
+    status, _, _ = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="s3cret", token_header="wrong",
+    )
+    assert status == 401
+
+
+def test_post_with_the_right_token_succeeds():
+    status, _, _ = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="s3cret", token_header="s3cret",
+    )
+    assert status == 200
+
+
+def test_get_never_requires_the_token():
+    status, _, _ = _request("GET", "/api/stats", token_configured="s3cret")
+    assert status == 200
+
+
+def test_posts_work_unauthenticated_when_no_token_is_configured():
+    status, _, _ = _request("POST", "/api/pause", body={"paused": True})
     assert status == 200
 
 

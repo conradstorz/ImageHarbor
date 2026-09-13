@@ -495,6 +495,23 @@ def enrich(
     help="Disable the operational dashboard.",
 )
 @click.option(
+    "--dashboard-token",
+    envvar="IMAGEHARBOR_DASHBOARD_TOKEN",
+    default=None,
+    help="Shared secret required (X-Dashboard-Token header) on every "
+    "dashboard POST. Unset = POSTs are open; fine on the default loopback "
+    "bind, set it whenever --dashboard-host is not 127.0.0.1.",
+)
+@click.option(
+    "--dashboard-allowed-hosts",
+    envvar="IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS",
+    default="",
+    show_default=True,
+    help="Comma-separated extra hostnames the dashboard answers for, beyond "
+    "the loopback names it always accepts (localhost/127.0.0.1/::1). Set "
+    "this whenever --dashboard-host is not 127.0.0.1 (see docs/deploy-docker.md).",
+)
+@click.option(
     "--faces/--no-faces",
     "faces",
     envvar="IMAGEHARBOR_FACES",
@@ -561,6 +578,8 @@ def watch(
     dashboard_port: int,
     dashboard_host: str,
     no_dashboard: bool,
+    dashboard_token: str | None,
+    dashboard_allowed_hosts: str,
     faces: bool,
     face_model_dir: Path | None,
     face_threshold: str | None,
@@ -583,6 +602,16 @@ def watch(
     classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
     dest.mkdir(parents=True, exist_ok=True)
     parsed_face_threshold = _parse_face_threshold(face_threshold)
+
+    # docker-compose.yml ships IMAGEHARBOR_DASHBOARD_TOKEN="" by default (no
+    # token chosen yet) -- an empty string must mean "no token", not "token
+    # is the empty string" (which `hmac.compare_digest` would otherwise
+    # happily match against an empty header).
+    if not dashboard_token:
+        dashboard_token = None
+    parsed_allowed_hosts = [
+        h.strip() for h in dashboard_allowed_hosts.split(",") if h.strip()
+    ]
 
     stop_event = threading.Event()
 
@@ -670,6 +699,8 @@ def watch(
                 breaker=breaker,
                 store=face_store,
                 crop_dir=face_config.crop_dir if face_config is not None else None,
+                allowed_hosts=parsed_allowed_hosts,
+                token=dashboard_token,
                 stop_event=stop_event,
             )
             if dashboard_thread is None:
