@@ -285,23 +285,30 @@ def enrich_library(
                 )
 
             if write_sidecars:
+                updates: dict = {
+                    "classification": {
+                        "pcs_code": pcs_code,
+                        "folder_path": taxonomy.folder_path(pcs_code),
+                        "primary_subject": content.primary_subject,
+                        "scene": content.scene,
+                        "caption": content.caption,
+                        "objects": content.objects,
+                        "tags": content.tags,
+                        "ocr_text": content.ocr_text,
+                        "model_version": content.model_version,
+                    }
+                }
+                if final_path is not actual:
+                    # The rename fired: record the descriptor the filename
+                    # now carries, so sidecar, filename, and catalog agree.
+                    # Deferred-known-issues #9.
+                    updates["descriptor"] = {
+                        "value": descriptor,
+                        "tier": tiers.DESC_AI_SUBJECT,
+                        "source": tiers.DESC_SOURCE_NAMES[tiers.DESC_AI_SUBJECT],
+                    }
                 try:
-                    merge_sidecar(
-                        final_path,
-                        {
-                            "classification": {
-                                "pcs_code": pcs_code,
-                                "folder_path": taxonomy.folder_path(pcs_code),
-                                "primary_subject": content.primary_subject,
-                                "scene": content.scene,
-                                "caption": content.caption,
-                                "objects": content.objects,
-                                "tags": content.tags,
-                                "ocr_text": content.ocr_text,
-                                "model_version": content.model_version,
-                            }
-                        },
-                    )
+                    merge_sidecar(final_path, updates)
                 except Exception:
                     logger.warning(
                         "Failed to update sidecar for %s", final_path, exc_info=True

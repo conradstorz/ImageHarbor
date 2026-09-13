@@ -328,6 +328,65 @@ def test_pause_check_true_from_the_start_enriches_nothing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# A renamed file's sidecar agrees with its own filename (deferred #9, R3 Task 5)
+# ---------------------------------------------------------------------------
+
+
+def test_a_renamed_files_sidecar_agrees_with_its_own_filename(tmp_path):
+    """Deferred issue #9: enrich merged only `classification`, so the sidecar
+    kept the facts-pass descriptor and contradicted the filename it sits
+    beside -- self-contradictory in exactly the case the tier system exists
+    to make legible.
+    """
+    import json
+    from pathlib import Path
+
+    from imageharbor.sidecar import sidecar_path_for
+
+    cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
+
+    stats = enrich_library(cat, dest, FixedClassifier(), write_sidecars=True)
+    assert stats.renamed == 1
+
+    renamed = Path(cat.get_by_sha256(result.sha256_b64url)["organized_path"])
+    doc = json.loads(sidecar_path_for(renamed).read_text(encoding="utf-8"))
+
+    assert doc["descriptor"]["tier"] == tiers.DESC_AI_SUBJECT
+    assert doc["descriptor"]["value"] in renamed.name
+    # The facts-pass block is history, not lost (never-lose rule).
+    assert any(
+        h.get("tier") == tiers.DESC_NONE for h in doc["descriptor"].get("history", [])
+    )
+    cat.close()
+
+
+def test_re_enriching_leaves_the_descriptor_sidecar_byte_identical(tmp_path):
+    """Idempotence: re-enriching an already-renamed row must not grow the
+    sidecar's descriptor history -- the merge must dedupe the superseded
+    block by value, or a repeated pass would leak history forever.
+    """
+    from pathlib import Path
+
+    from imageharbor.sidecar import sidecar_path_for
+
+    cat, dest, result = _facts(tmp_path, "IMG_20190704_123456.jpg")
+    enrich_library(cat, dest, FixedClassifier(), write_sidecars=True)
+
+    renamed = Path(cat.get_by_sha256(result.sha256_b64url)["organized_path"])
+    before = sidecar_path_for(renamed).read_bytes()
+
+    stats = enrich_library(cat, dest, FixedClassifier(), write_sidecars=True, reclassify=True)
+    assert stats.total == 1
+
+    after_path = Path(cat.get_by_sha256(result.sha256_b64url)["organized_path"])
+    assert after_path == renamed  # no further rename fired
+    after = sidecar_path_for(after_path).read_bytes()
+
+    assert after == before
+    cat.close()
+
+
+# ---------------------------------------------------------------------------
 # pick_class fallback failures are AI evidence (R3 Task 1)
 # ---------------------------------------------------------------------------
 
