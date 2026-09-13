@@ -60,13 +60,6 @@ def _jpeg(marker: bytes) -> bytes:
 
 
 @pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
-
-
-@pytest.fixture()
 def control(catalog: Catalog) -> ControlPlane:
     return ControlPlane(catalog, env_interval=300, env_enrich=True)
 
@@ -132,13 +125,6 @@ def _seed_faces(store: FaceStore) -> dict[str, int]:
         "unreviewed": 1,
         "singletons": 1,
     }
-
-
-@pytest.fixture()
-def organized_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "organized"
-    d.mkdir()
-    return d
 
 
 def _run_pipeline_with_three_photos(source: Path, organized: Path, catalog: Catalog):

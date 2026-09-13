@@ -10,8 +10,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from imageharbor.backfill import BackfillStats, backfill_sidecars
 from imageharbor.catalog import Catalog
 from imageharbor.pipeline import Pipeline
@@ -40,29 +38,6 @@ def _make_real_exif_jpeg(path: Path) -> Path:
     exif[36864] = b"0230"  # ExifVersion, raw bytes on real cameras
     Image.new("RGB", (4, 4), "red").save(path, "JPEG", exif=exif.tobytes())
     return path
-
-
-@pytest.fixture()
-def source_dir(tmp_path: Path) -> Path:
-    src = tmp_path / "source"
-    src.mkdir()
-    _make_jpeg(src / "beach_photo.jpg")
-    _make_jpeg(src / "mountain_view.jpg", b"\xff\xd8\xff\xe0" + b"\x01" * 16 + b"\xff\xd9")
-    return src
-
-
-@pytest.fixture()
-def organized_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "organized"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
 
 
 def _organize_without_sidecars(source_dir: Path, organized_dir: Path, catalog: Catalog) -> None:

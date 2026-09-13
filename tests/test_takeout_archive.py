@@ -18,13 +18,6 @@ def _zip(path: Path, entries: dict[str, bytes]) -> Path:
     return path
 
 
-@pytest.fixture()
-def catalog(tmp_path: Path):
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
-
-
 # --- classification --------------------------------------------------------
 
 

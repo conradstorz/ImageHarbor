@@ -8,14 +8,6 @@ from imageharbor import catalog as catalog_module
 from imageharbor.catalog import Catalog, _from_json
 
 
-@pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
-    db = tmp_path / "test_catalog.db"
-    cat = Catalog(db)
-    yield cat
-    cat.close()
-
-
 def _fake_digest(n: int = 0) -> str:
     return ("A" * 43)[:-len(str(n))] + str(n) if n else "A" * 43
 

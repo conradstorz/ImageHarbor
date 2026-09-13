@@ -16,21 +16,11 @@ or a crash -- see the "hostile values" section at the bottom.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import pytest
 
 from imageharbor.catalog import Catalog
 from imageharbor.dashboard.control import ControlPlane
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
-    db = tmp_path / "test_catalog.db"
-    cat = Catalog(db)
-    yield cat
-    cat.close()
-
 
 # ---------------------------------------------------------------------------
 # override precedence

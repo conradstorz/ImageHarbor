@@ -12,15 +12,6 @@ from imageharbor.faces.decode import Detection
 from imageharbor.faces.store import FaceStore, ScannedFace
 
 
-@pytest.fixture
-def store(tmp_path):
-    db = tmp_path / "catalog.db"
-    Catalog(db).close()
-    s = FaceStore(db)
-    yield s
-    s.close()
-
-
 def _det(x=0.0, score=0.9):
     return Detection(
         x=x, y=0.0, w=50.0, h=50.0, score=score,

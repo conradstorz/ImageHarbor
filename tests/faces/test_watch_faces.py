@@ -113,20 +113,6 @@ def source_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def organized_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "organized"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path):
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
-
-
-@pytest.fixture()
 def face_store(tmp_path: Path):
     store = FaceStore(tmp_path / "catalog.db")
     yield store

@@ -23,29 +23,6 @@ def _make_jpeg(path: Path, content: bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 16 +
     return path
 
 
-@pytest.fixture()
-def source_dir(tmp_path: Path) -> Path:
-    src = tmp_path / "source"
-    src.mkdir()
-    _make_jpeg(src / "beach_photo.jpg")
-    _make_jpeg(src / "mountain_view.jpg", b"\xff\xd8\xff\xe0" + b"\x01" * 16 + b"\xff\xd9")
-    return src
-
-
-@pytest.fixture()
-def organized_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "organized"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path):
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
-
-
 def test_run_pass_processes_new_files(source_dir: Path, organized_dir: Path, catalog: Catalog) -> None:
     pipeline = Pipeline(source_dir, organized_dir, catalog)
     stats = run_pass(pipeline=pipeline, catalog=catalog, source=source_dir)

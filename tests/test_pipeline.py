@@ -30,34 +30,6 @@ def _make_image(path: Path, content: bytes = b"fake-image-bytes") -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def source_dir(tmp_path: Path) -> Path:
-    src = tmp_path / "source"
-    src.mkdir()
-    _make_jpeg(src / "beach_photo.jpg")
-    _make_jpeg(src / "mountain_view.jpg", b"\xff\xd8\xff\xe0" + b"\x01" * 16 + b"\xff\xd9")
-    return src
-
-
-@pytest.fixture()
-def organized_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "organized"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
-
-
-# ---------------------------------------------------------------------------
 # General hashing / dedup / copy / verify behavior
 # ---------------------------------------------------------------------------
 

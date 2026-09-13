@@ -7,7 +7,6 @@ Synthetic zips built in tmp_path replicate the real export's name shapes. No
 from __future__ import annotations
 
 import json
-import zipfile
 from pathlib import Path
 
 import pytest
@@ -16,25 +15,9 @@ from imageharbor.catalog import Catalog
 from imageharbor.takeout import archive as archive_mod
 from imageharbor.takeout import ingest as ingest_mod
 from imageharbor.takeout.ingest import ingest_archives
+from tests.takeout_helpers import D, _jpeg, _sidecar, _zip
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9"
-D = "Takeout/AlbumArchive/Hangouts/album"
-
-
-def _jpeg(n: int) -> bytes:
-    return b"\xff\xd8\xff\xe0" + bytes([n]) * 16 + b"\xff\xd9"
-
-
-def _sidecar(title: str, seconds: int, people: tuple[str, ...] = ()) -> bytes:
-    doc = {
-        "title": title,
-        "creationTime": {"timestampSeconds": str(seconds + 14836)},
-        "photoTakenTime": {"timestampSeconds": str(seconds)},
-        "geoData": {"latitude": 38.2768361, "longitude": -85.7357389},
-    }
-    if people:
-        doc["people"] = [{"name": n} for n in people]
-    return json.dumps(doc).encode()
 
 
 def _read_sidecar(dest: Path, stem_contains: str) -> dict:
@@ -75,29 +58,6 @@ def _make_stale_index(path: Path, *, name: str, size: int, mtime: int) -> Path:
     from tests.test_takeout_index_reader import make_index
 
     return make_index(path, archives=((name, size, mtime, 0, None),))
-
-
-def _zip(path: Path, entries: dict[str, bytes]) -> Path:
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, data in entries.items():
-            zf.writestr(name, data)
-    return path
-
-
-@pytest.fixture()
-def dirs(tmp_path: Path):
-    archives = tmp_path / "archives"
-    archives.mkdir()
-    dest = tmp_path / "organized"
-    dest.mkdir()
-    return archives, dest
-
-
-@pytest.fixture()
-def catalog(tmp_path: Path):
-    cat = Catalog(tmp_path / "catalog.db")
-    yield cat
-    cat.close()
 
 
 # --- the happy path --------------------------------------------------------
