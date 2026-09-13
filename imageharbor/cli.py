@@ -480,10 +480,36 @@ def enrich(
     help="Port for the operational dashboard.",
 )
 @click.option(
+    "--dashboard-host",
+    envvar="IMAGEHARBOR_DASHBOARD_HOST",
+    default="127.0.0.1",
+    show_default=True,
+    help="Interface the dashboard binds. Loopback by default; set 0.0.0.0 "
+    "to expose it beyond this machine (then set --dashboard-token and "
+    "--dashboard-allowed-hosts -- see docs/deploy-docker.md).",
+)
+@click.option(
     "--no-dashboard",
     is_flag=True,
     default=False,
     help="Disable the operational dashboard.",
+)
+@click.option(
+    "--dashboard-token",
+    envvar="IMAGEHARBOR_DASHBOARD_TOKEN",
+    default=None,
+    help="Shared secret required (X-Dashboard-Token header) on every "
+    "dashboard POST. Unset = POSTs are open; fine on the default loopback "
+    "bind, set it whenever --dashboard-host is not 127.0.0.1.",
+)
+@click.option(
+    "--dashboard-allowed-hosts",
+    envvar="IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS",
+    default="",
+    show_default=True,
+    help="Comma-separated extra hostnames the dashboard answers for, beyond "
+    "the loopback names it always accepts (localhost/127.0.0.1/::1). Set "
+    "this whenever --dashboard-host is not 127.0.0.1 (see docs/deploy-docker.md).",
 )
 @click.option(
     "--faces/--no-faces",
@@ -550,7 +576,10 @@ def watch(
     poison_max_fails: int,
     quarantine_dir: Path | None,
     dashboard_port: int,
+    dashboard_host: str,
     no_dashboard: bool,
+    dashboard_token: str | None,
+    dashboard_allowed_hosts: str,
     faces: bool,
     face_model_dir: Path | None,
     face_threshold: str | None,
@@ -573,6 +602,34 @@ def watch(
     classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
     dest.mkdir(parents=True, exist_ok=True)
     parsed_face_threshold = _parse_face_threshold(face_threshold)
+
+    # docker-compose.yml ships IMAGEHARBOR_DASHBOARD_TOKEN="" by default (no
+    # token chosen yet) -- an empty string must mean "no token", not "token
+    # is the empty string" (which `hmac.compare_digest` would otherwise
+    # happily match against an empty header).
+    if not dashboard_token:
+        dashboard_token = None
+    parsed_allowed_hosts = [
+        h.strip() for h in dashboard_allowed_hosts.split(",") if h.strip()
+    ]
+
+    # Exposed-without-token warning (R2 pre-merge finding): the loopback
+    # bind is the mitigation for an unset token (see --dashboard-token's own
+    # help text above) -- a non-loopback bind with no token means every
+    # mutating endpoint is open to anyone who can reach the port. One
+    # warning, not per-cycle noise, matching the --faces-unavailable idiom
+    # below.
+    if (
+        dashboard_host not in {"127.0.0.1", "::1", "localhost"}
+        and dashboard_token is None
+        and not no_dashboard
+    ):
+        click.echo(
+            f"Dashboard is bound to {dashboard_host} with no --dashboard-token: "
+            "every mutating endpoint is open to anyone who can reach the port. "
+            "Set IMAGEHARBOR_DASHBOARD_TOKEN.",
+            err=True,
+        )
 
     stop_event = threading.Event()
 
@@ -656,19 +713,24 @@ def watch(
             click.echo("Dashboard disabled (--no-dashboard).")
         else:
             dashboard_thread = dashboard_server.serve(
-                catalog, control, port=dashboard_port, breaker=breaker,
+                catalog, control, port=dashboard_port, host=dashboard_host,
+                breaker=breaker,
                 store=face_store,
                 crop_dir=face_config.crop_dir if face_config is not None else None,
+                allowed_hosts=parsed_allowed_hosts,
+                token=dashboard_token,
                 stop_event=stop_event,
             )
             if dashboard_thread is None:
                 click.echo(
-                    f"Dashboard could not bind port {dashboard_port}; "
+                    f"Dashboard could not bind {dashboard_host}:{dashboard_port}; "
                     "continuing without it.",
                     err=True,
                 )
             else:
-                click.echo(f"Dashboard listening on http://0.0.0.0:{dashboard_port}/")
+                click.echo(
+                    f"Dashboard listening on http://{dashboard_host}:{dashboard_port}/"
+                )
 
         stats = _watcher.watch(
             pipeline=pipeline,

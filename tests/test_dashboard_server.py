@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import socket
+import tempfile
 import threading
 from http.client import HTTPResponse
 from pathlib import Path
@@ -85,16 +87,41 @@ def _raw_request(
     method: str,
     path: str,
     *,
+    host: str | None = "localhost",
     body: bytes = b"",
-    headers: dict[str, str] | None = None,
+    headers: dict[str, str | None] | None = None,
+    extra_header_lines: list[str] | None = None,
 ) -> bytes:
-    lines = [f"{method} {path} HTTP/1.1", "Host: test"]
-    hdrs = dict(headers or {})
-    if body and "Content-Length" not in hdrs:
-        hdrs["Content-Length"] = str(len(body))
-    for key, value in hdrs.items():
+    """Build a raw HTTP/1.1 request.
+
+    A POST gets ``Content-Type: application/json`` by default (R2 Task 3 --
+    every real POST in this API sends JSON) -- pass ``headers={"Content-Type":
+    "text/plain"}`` to override it, or ``headers={"Content-Type": None}`` to
+    omit the header entirely. ``extra_header_lines`` appends raw header lines
+    verbatim, after the normal ones -- used by the duplicate-Host-header test,
+    which needs two ``Host:`` lines and a plain ``dict`` can't hold that.
+    """
+    lines = [f"{method} {path} HTTP/1.1"]
+    if host is not None:
+        lines.append(f"Host: {host}")
+    hdrs: dict[str, str | None] = dict(headers or {})
+    if method == "POST" and "Content-Type" not in hdrs:
+        hdrs["Content-Type"] = "application/json"
+    resolved = {k: v for k, v in hdrs.items() if v is not None}
+    if body and "Content-Length" not in resolved:
+        resolved["Content-Length"] = str(len(body))
+    for key, value in resolved.items():
         lines.append(f"{key}: {value}")
-    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+    for line in extra_header_lines or []:
+        lines.append(line)
+    # HTTP header bytes are ISO-8859-1 (Latin-1) on the wire -- that's what
+    # `http.client`/`http.server` actually encode/decode with -- NOT UTF-8.
+    # A header value within Latin-1's range (e.g. "café") round-trips
+    # correctly only when encoded that way here; encoding as UTF-8 would
+    # send two-byte sequences that the server's Latin-1 decode would then
+    # mangle into mojibake, which is a bug in this harness, not in the
+    # server under test.
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
     return head + body
 
 
@@ -108,18 +135,71 @@ class _ResponseSocketLike:
         return io.BytesIO(self._data)
 
 
-def _dispatch(handler_cls: type, method: str, path: str, **kwargs: Any):
+def _dispatch(
+    handler_cls: type,
+    method: str,
+    path: str,
+    *,
+    extra_header_lines: list[str] | None = None,
+    **kwargs: Any,
+):
     """Send one request through *handler_cls* with no socket, return the response.
 
     Returns (status, headers-dict, body-bytes).
     """
-    raw = _raw_request(method, path, **kwargs)
+    raw = _raw_request(method, path, extra_header_lines=extra_header_lines, **kwargs)
     sock = _FakeSocket(raw)
     handler_cls(sock, ("127.0.0.1", 54321), _DummyServer())
     resp = HTTPResponse(_ResponseSocketLike(bytes(sock.sent)))
     resp.begin()
     body = resp.read()
     return resp.status, dict(resp.getheaders()), body
+
+
+def _request(
+    method: str,
+    path: str,
+    *,
+    host: str | None = "localhost",
+    allowed_hosts: frozenset[str] = frozenset(),
+    body: Any = b"",
+    headers: dict[str, str] | None = None,
+    token_configured: str | None = None,
+    token_header: str | None = None,
+):
+    """Dispatch one request through a *fresh, throwaway* handler.
+
+    Used by the Host-header allowlist tests and the token-gate tests below,
+    both of which care about a gate firing before any routing -- not about a
+    seeded catalog -- so each call gets its own disposable in-memory
+    catalog/control rather than reaching for the module's `handler_cls`
+    fixture (which bakes in fixed `allowed_hosts=frozenset()`/`token=None`
+    at fixture-construction time, before a test body gets to choose either).
+
+    ``body`` accepts a JSON-serializable value in addition to raw bytes, for
+    the token tests below that don't otherwise need `_dispatch_json`'s
+    response-parsing.  ``token_configured`` becomes the handler's `token`;
+    ``token_header`` -- when given -- becomes the request's
+    `X-Dashboard-Token` header.
+    """
+    if not isinstance(body, (bytes, bytearray)):
+        body = json.dumps(body).encode("utf-8")
+    hdrs = dict(headers or {})
+    if token_header is not None:
+        hdrs["X-Dashboard-Token"] = token_header
+    tmp_dir = tempfile.mkdtemp()
+    cat = Catalog(Path(tmp_dir) / "catalog.db")
+    try:
+        ctrl = ControlPlane(cat, env_interval=300, env_enrich=True)
+        handler_cls = dashboard_server.make_handler(
+            cat, ctrl, allowed_hosts=allowed_hosts, token=token_configured
+        )
+        return _dispatch(
+            handler_cls, method, path, host=host, body=body, headers=hdrs
+        )
+    finally:
+        cat.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _dispatch_json(handler_cls: type, method: str, path: str, payload: Any = None, **kwargs: Any):
@@ -535,6 +615,83 @@ def test_index_returns_200_html(handler_cls) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Host-header allowlist (DNS-rebinding defense)
+# ---------------------------------------------------------------------------
+
+
+def test_a_request_with_a_foreign_host_header_is_refused():
+    # DNS-rebinding defense: evil.example resolves to this box, browser sends
+    # Host: evil.example -- the server must refuse to serve it.
+    status, headers, body = _request("GET", "/api/stats", host="evil.example")
+    assert status == 403
+
+
+def test_a_request_with_no_host_header_is_refused():
+    status, headers, body = _request("GET", "/api/stats", host=None)
+    assert status == 403
+
+
+def test_loopback_hosts_are_always_allowed():
+    for host in ("localhost", "localhost:8080", "127.0.0.1", "127.0.0.1:9999"):
+        status, headers, body = _request("GET", "/healthz", host=host)
+        assert status == 200, host
+
+
+def test_a_configured_allowed_host_is_accepted_with_any_port():
+    # handler built with allowed_hosts frozenset including "hpz440.tailnet"
+    status, headers, body = _request(
+        "GET", "/healthz", host="hpz440.tailnet:8087",
+        allowed_hosts=frozenset({"hpz440.tailnet"}),
+    )
+    assert status == 200
+
+
+def test_host_matching_is_case_insensitive_and_handles_ipv6_brackets():
+    status, _, _ = _request("GET", "/healthz", host="LOCALHOST:8080")
+    assert status == 200
+    status, _, _ = _request("GET", "/healthz", host="[::1]:8080")
+    assert status == 200
+
+
+# ---------------------------------------------------------------------------
+# Shared-secret token gate on POST (R2 Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_post_without_token_is_401_when_token_configured():
+    status, _, body = _request(
+        "POST", "/api/pause", body={"paused": True}, token_configured="s3cret",
+    )
+    assert status == 401
+
+
+def test_post_with_wrong_token_is_401():
+    status, _, _ = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="s3cret", token_header="wrong",
+    )
+    assert status == 401
+
+
+def test_post_with_the_right_token_succeeds():
+    status, _, _ = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="s3cret", token_header="s3cret",
+    )
+    assert status == 200
+
+
+def test_get_never_requires_the_token():
+    status, _, _ = _request("GET", "/api/stats", token_configured="s3cret")
+    assert status == 200
+
+
+def test_posts_work_unauthenticated_when_no_token_is_configured():
+    status, _, _ = _request("POST", "/api/pause", body={"paused": True})
+    assert status == 200
+
+
+# ---------------------------------------------------------------------------
 # serve() -- port binding
 # ---------------------------------------------------------------------------
 
@@ -557,14 +714,14 @@ def test_serve_on_already_bound_port_returns_none_and_does_not_raise(
     catalog: Catalog, control: ControlPlane
 ) -> None:
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Bind the SAME host ("0.0.0.0", the wildcard) that `serve()` binds --
-    # not "127.0.0.1". On Windows, a wildcard bind and a same-port
-    # specific-address bind do not conflict by default (verified: binding
-    # 0.0.0.0:PORT succeeds even while 127.0.0.1:PORT is already listening),
-    # so a "127.0.0.1" blocker would make this test pass for the wrong
-    # reason -- no real conflict, `serve()` would bind fine, and the
-    # assertion would only hold by accident.
-    blocker.bind(("0.0.0.0", 0))
+    # Bind the SAME host ("127.0.0.1", `serve()`'s default) that `serve()`
+    # binds. On Windows, a wildcard bind and a same-port specific-address
+    # bind do not conflict with each other by default (verified: binding
+    # 0.0.0.0:PORT succeeds even while 127.0.0.1:PORT is already listening,
+    # and the reverse), so a "0.0.0.0" blocker would make this test pass for
+    # the wrong reason -- no real conflict, `serve()` would bind fine, and
+    # the assertion would only hold by accident.
+    blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
     port = blocker.getsockname()[1]
     try:
@@ -576,3 +733,200 @@ def test_serve_on_already_bound_port_returns_none_and_does_not_raise(
         assert result is None
     finally:
         blocker.close()
+
+
+def test_serve_binds_loopback_by_default(
+    catalog: Catalog, control: ControlPlane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Default bind must be loopback: a socket on 0.0.0.0 exposes every
+    # mutating endpoint to the LAN, which is opt-in (compose) from R2 on.
+    seen: dict[str, Any] = {}
+    real_ctor = dashboard_server._DashboardHTTPServer.__init__
+
+    def spy(self: Any, addr: Any, handler: Any) -> None:
+        seen["addr"] = addr
+        real_ctor(self, addr, handler)
+
+    monkeypatch.setattr(dashboard_server._DashboardHTTPServer, "__init__", spy)
+
+    stop_event = threading.Event()
+    thread = dashboard_server.serve(catalog, control, port=0, stop_event=stop_event)
+    try:
+        assert thread is not None
+        assert seen["addr"][0] == "127.0.0.1"
+    finally:
+        stop_event.set()
+        if thread is not None:
+            thread.join(timeout=5)
+
+
+def test_serve_binds_wildcard_only_on_request(
+    catalog: Catalog, control: ControlPlane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+    real_ctor = dashboard_server._DashboardHTTPServer.__init__
+
+    def spy(self: Any, addr: Any, handler: Any) -> None:
+        seen["addr"] = addr
+        real_ctor(self, addr, handler)
+
+    monkeypatch.setattr(dashboard_server._DashboardHTTPServer, "__init__", spy)
+
+    stop_event = threading.Event()
+    thread = dashboard_server.serve(
+        catalog, control, port=0, host="0.0.0.0", stop_event=stop_event
+    )
+    try:
+        assert thread is not None
+        assert seen["addr"][0] == "0.0.0.0"
+    finally:
+        stop_event.set()
+        if thread is not None:
+            thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Token comparison must never raise on non-ASCII input (R2 Task 1)
+# ---------------------------------------------------------------------------
+#
+# `hmac.compare_digest` raises `TypeError` when given `str` arguments that
+# contain non-ASCII characters (documented caveat: "only ascii characters are
+# supported" for str/str comparisons) -- which would surface as a bare 500
+# with a traceback, not the clean 401 a wrong token deserves.
+
+
+def test_non_ascii_token_header_with_ascii_configured_token_is_401_not_500():
+    status, _, body = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="s3cret", token_header="café",
+    )
+    assert status == 401
+    assert b"Traceback" not in body
+
+
+def test_non_ascii_configured_token_with_matching_header_succeeds():
+    status, _, _ = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="café", token_header="café",
+    )
+    assert status == 200
+
+
+def test_non_ascii_configured_token_with_wrong_header_is_401():
+    status, _, body = _request(
+        "POST", "/api/pause", body={"paused": True},
+        token_configured="café", token_header="wrong",
+    )
+    assert status == 401
+    assert b"Traceback" not in body
+
+
+# ---------------------------------------------------------------------------
+# Stalled body read -> clean 408 (R2 Task 2)
+# ---------------------------------------------------------------------------
+
+
+class _TimingOutRfile:
+    """Stand-in for a socket-backed rfile whose read stalls past the
+    handler's own `timeout` and raises, exactly like a real slowloris client
+    would once `settimeout` fires."""
+
+    def read(self, _length: int) -> bytes:
+        raise TimeoutError("simulated stalled client")
+
+
+def test_stalled_body_read_returns_408_not_a_traceback(handler_cls, caplog) -> None:
+    handler = handler_cls.__new__(handler_cls)
+    handler.headers = {"Content-Length": "16"}  # type: ignore[attr-defined]
+    handler.rfile = _TimingOutRfile()  # type: ignore[attr-defined]
+
+    value, status, message = handler._read_json_body()
+
+    assert value is None
+    assert status == 408
+    assert message == "request body timed out"
+    assert not any(r.levelname in ("ERROR", "CRITICAL") for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CSRF: POSTs require Content-Type: application/json (R2 Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_post_with_text_plain_content_type_is_415(handler_cls) -> None:
+    status, _, body = _dispatch(
+        handler_cls,
+        "POST",
+        "/api/pause",
+        body=b'{"paused": true}',
+        headers={"Content-Type": "text/plain"},
+    )
+    assert status == 415
+    assert b"Traceback" not in body
+
+
+def test_post_with_application_json_and_charset_is_accepted(handler_cls) -> None:
+    status, _, _ = _dispatch(
+        handler_cls,
+        "POST",
+        "/api/pause",
+        body=b'{"paused": true}',
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    assert status == 200
+
+
+def test_post_with_missing_content_type_is_415(handler_cls) -> None:
+    status, _, body = _dispatch(
+        handler_cls,
+        "POST",
+        "/api/pause",
+        body=b'{"paused": true}',
+        headers={"Content-Type": None},
+    )
+    assert status == 415
+    assert b"Traceback" not in body
+
+
+# ---------------------------------------------------------------------------
+# Host hygiene (R2 Task 4)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_host_headers_are_refused(handler_cls) -> None:
+    status, _, _ = _dispatch(
+        handler_cls, "GET", "/healthz",
+        extra_header_lines=["Host: evil.example"],
+    )
+    assert status == 403
+
+
+def test_duplicate_host_headers_are_refused_on_post(handler_cls) -> None:
+    status, _, _ = _dispatch(
+        handler_cls, "POST", "/api/pause",
+        body=b'{"paused": true}',
+        extra_header_lines=["Host: evil.example"],
+    )
+    assert status == 403
+
+
+def test_host_with_trailing_dot_is_allowed(handler_cls) -> None:
+    status, _, _ = _dispatch(handler_cls, "GET", "/healthz", host="localhost.")
+    assert status == 200
+
+
+def test_forbidden_host_message_names_the_flag_and_env_var(handler_cls) -> None:
+    status, _, body = _dispatch(handler_cls, "GET", "/healthz", host="evil.example")
+    assert status == 403
+    parsed = json.loads(body.decode("utf-8"))
+    assert "--dashboard-allowed-hosts" in parsed["error"]
+    assert "IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS" in parsed["error"]
+
+
+# ---------------------------------------------------------------------------
+# Handler timeout is pinned (R2 Task 5)
+# ---------------------------------------------------------------------------
+
+
+def test_handler_timeout_is_pinned_to_10_seconds(handler_cls) -> None:
+    assert handler_cls.timeout == 10

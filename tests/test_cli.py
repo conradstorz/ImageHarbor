@@ -907,8 +907,12 @@ def test_watch_dashboard_port_is_accepted_and_forwarded(monkeypatch, tmp_path):
 
     captured = {}
 
-    def _fake_serve(catalog, control, *, port, breaker=None, store=None, crop_dir=None, stop_event):
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
         captured["port"] = port
+        captured["host"] = host
         return None  # a dashboard failure must never stop the watcher
 
     monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
@@ -923,6 +927,154 @@ def test_watch_dashboard_port_is_accepted_and_forwarded(monkeypatch, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert captured["port"] == 12345
+    # --dashboard-host reaches serve() too (test hygiene item, R2 review):
+    # not exercised here since no --dashboard-host is passed, but pins the
+    # default so a future wiring regression that drops the kwarg is caught.
+    assert captured["host"] == "127.0.0.1"
+
+
+def test_watch_dashboard_host_is_forwarded_to_serve(monkeypatch, tmp_path):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["host"] = host
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-host", "0.0.0.0",
+            "--dashboard-token", "s3cret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["host"] == "0.0.0.0"
+
+
+def test_watch_dashboard_token_env_empty_string_normalizes_to_none(monkeypatch, tmp_path):
+    """`IMAGEHARBOR_DASHBOARD_TOKEN=""` (docker-compose's shipped default,
+    before an operator has chosen a real token) must reach `serve()` as
+    `None`, not as the empty string -- an empty-string token would otherwise
+    mean 'every POST must send X-Dashboard-Token: ' rather than 'no token
+    configured'.
+    """
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["token"] = token
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+    monkeypatch.setenv("IMAGEHARBOR_DASHBOARD_TOKEN", "")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["watch", "--source", str(src), "--dest", str(dest)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["token"] is None
+
+
+def test_watch_dashboard_token_is_forwarded_when_set(monkeypatch, tmp_path):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["token"] = token
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-token", "s3cret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["token"] == "s3cret"
+
+
+def test_watch_dashboard_allowed_hosts_default_empty_string_is_empty_list(
+    monkeypatch, tmp_path
+):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["allowed_hosts"] = allowed_hosts
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["watch", "--source", str(src), "--dest", str(dest)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["allowed_hosts"] == []
+
+
+def test_watch_dashboard_allowed_hosts_splits_strips_and_drops_empties(
+    monkeypatch, tmp_path
+):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, allowed_hosts=(), token=None, stop_event,
+    ):
+        captured["allowed_hosts"] = allowed_hosts
+        return None
+
+    monkeypatch.setattr(dashboard_server, "serve", _fake_serve)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-allowed-hosts", " hpz440.tailnet ,, example.com",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["allowed_hosts"] == ["hpz440.tailnet", "example.com"]
 
 
 def test_watch_still_runs_when_the_dashboard_port_is_already_bound(monkeypatch, tmp_path):
@@ -961,10 +1113,11 @@ def test_watch_still_runs_when_the_dashboard_port_is_already_bound(monkeypatch, 
     monkeypatch.setattr(_watcher, "watch", _fake_watch)
 
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Wildcard bind, matching what `serve()` itself binds -- see
-    # test_dashboard_server.py's identical comment for why "127.0.0.1"
-    # would not actually conflict on Windows.
-    blocker.bind(("0.0.0.0", 0))
+    # Loopback bind, matching `serve()`'s new default host -- see
+    # test_dashboard_server.py's identical comment for why a "0.0.0.0"
+    # blocker would not actually conflict with a "127.0.0.1" bind (or vice
+    # versa) on Windows.
+    blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
     port = blocker.getsockname()[1]
     try:
@@ -982,6 +1135,78 @@ def test_watch_still_runs_when_the_dashboard_port_is_already_bound(monkeypatch, 
         assert "could not bind" in result.output.lower()
     finally:
         blocker.close()
+
+
+# ---------------------------------------------------------------------------
+# exposed-without-token warning (R2 pre-merge finding)
+# ---------------------------------------------------------------------------
+
+
+def test_watch_warns_when_dashboard_exposed_with_no_token(monkeypatch, tmp_path):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_server, "serve", lambda *a, **k: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-host", "0.0.0.0",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "IMAGEHARBOR_DASHBOARD_TOKEN" in result.output
+    assert result.output.count("IMAGEHARBOR_DASHBOARD_TOKEN") == 1
+
+
+def test_watch_does_not_warn_when_dashboard_host_is_loopback(monkeypatch, tmp_path):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_server, "serve", lambda *a, **k: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["watch", "--source", str(src), "--dest", str(dest)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "IMAGEHARBOR_DASHBOARD_TOKEN" not in result.output
+
+
+def test_watch_does_not_warn_when_a_token_is_set(monkeypatch, tmp_path):
+    from imageharbor.dashboard import server as dashboard_server
+
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_server, "serve", lambda *a, **k: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-host", "0.0.0.0",
+            "--dashboard-token", "s3cret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "IMAGEHARBOR_DASHBOARD_TOKEN" not in result.output
+
+
+def test_watch_does_not_warn_when_dashboard_is_disabled(monkeypatch, tmp_path):
+    src, dest = _fake_watch_cli(monkeypatch, tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "watch", "--source", str(src), "--dest", str(dest),
+            "--dashboard-host", "0.0.0.0", "--no-dashboard",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "IMAGEHARBOR_DASHBOARD_TOKEN" not in result.output
 
 
 # ---------------------------------------------------------------------------

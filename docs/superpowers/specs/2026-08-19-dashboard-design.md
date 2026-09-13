@@ -4,6 +4,15 @@
 **Status:** implemented (2026-08-19) — see "Departures from this design" below
 **Extends:** [`2026-07-31-dockerized-watcher-design.md`](2026-07-31-dockerized-watcher-design.md)
 
+> **Superseded exposure posture.** As of v1.1.0 (2026-09-13, R2), the "binds
+> all interfaces, no authentication" posture described below is superseded:
+> the dashboard now binds loopback by default, gates requests behind a
+> Host-header allowlist, requires a shared-secret token
+> (`X-Dashboard-Token`) on every POST, and requires
+> `Content-Type: application/json` on every POST. See
+> `docs/deploy-docker.md`'s "Security model" for the current, authoritative
+> exposure story.
+
 ## Goal
 
 Give the long-running watcher a web page that answers *what has it done, what

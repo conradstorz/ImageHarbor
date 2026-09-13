@@ -378,7 +378,37 @@
 
 </main>
 
-<footer>Polling /api/stats every 5s. No authentication -- see the design doc's Non-goals.</footer>
+<footer>Polling /api/stats every 5s.</footer>
+
+<script>
+  // Shared by both IIFEs below: attaches the dashboard's access token (if
+  // one has been entered) to every POSTing fetch, and prompts for it once
+  // on a 401 before retrying. Declared here, outside either IIFE, so both
+  // the stats/controls script and the separate People-review script (which
+  // deliberately keeps its own postJSON/error handling -- see the comment
+  // on that IIFE) can call it without duplicating the token/prompt logic.
+  const TOKEN_KEY = "imageharbor-dashboard-token";
+
+  async function postJson(url, payload) {
+    const attempt = () => {
+      let token = null;
+      try { token = localStorage.getItem(TOKEN_KEY); } catch (e) { /* storage unavailable */ }
+      const headers = { "Content-Type": "application/json" };
+      if (token) headers["X-Dashboard-Token"] = token;
+      return fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+    };
+    let resp = await attempt();
+    if (resp.status === 401) {
+      const entered = window.prompt(
+        "This dashboard requires its access token (IMAGEHARBOR_DASHBOARD_TOKEN):");
+      if (entered) {
+        try { localStorage.setItem(TOKEN_KEY, entered.trim()); } catch (e) { /* ignore */ }
+        resp = await attempt();
+      }
+    }
+    return resp;
+  }
+</script>
 
 <script>
 (function () {
@@ -582,11 +612,7 @@
   }
 
   async function postJSON(url, body) {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const resp = await postJson(url, body);
     if (!resp.ok) {
       let detail = "";
       try { detail = (await resp.json()).error || ""; } catch (e) { /* ignore */ }
@@ -690,11 +716,7 @@
   }
 
   async function postJSON(url, body) {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const resp = await postJson(url, body);
     let data = null;
     try { data = await resp.json(); } catch (e) { /* no JSON body */ }
     if (!resp.ok) {

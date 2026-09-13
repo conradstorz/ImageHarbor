@@ -20,8 +20,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /usr/local/bin/uv
 # the release workflow passes the tag here. A local `docker build` without
 # the arg gets 0.0.0 -- visibly a non-release.
 ARG IMAGEHARBOR_VERSION=0.0.0
+# uv must use the base image's own CPython, never fetch a managed one.
 ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_IMAGEHARBOR=${IMAGEHARBOR_VERSION} \
-    UV_PROJECT_ENVIRONMENT=/opt/venv
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON_PREFERENCE=only-system
 
 # LICENSE ships in the image: this is an AGPL network service; the conveyed
 # artifact must carry the licence text (README.md "Licence" section).

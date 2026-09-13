@@ -24,10 +24,12 @@ a second thing that is broken.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import math
 import threading
+from collections.abc import Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -69,6 +71,41 @@ MAX_BODY_BYTES = 64 * 1024
 # ever being "defended against on read" instead of rejected outright.
 _SETTINGS_KEYS = ("interval", "enrich", "faces")
 
+# Hostnames the dashboard always answers for, regardless of what an operator
+# configures via --dashboard-allowed-hosts -- the loopback names a browser or
+# curl on this same box legitimately uses.
+_ALWAYS_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _host_allowed(header_value: str | None, allowed: frozenset[str]) -> bool:
+    """Whether a request's Host header names this server.
+
+    DNS-rebinding defense: a browser at an attacker's page can be pointed at
+    a hostname that resolves to this machine; the Host header still carries
+    the attacker's name. Absent Host is refused too -- every legitimate
+    client (browser, curl, the compose healthcheck) sends one. Matching is
+    on the hostname alone (port stripped, case-folded, IPv6 brackets
+    removed): the port is already fixed by the socket we are serving on.
+    """
+    if not header_value:
+        return False
+    host = header_value.strip().lower()
+    if host.startswith("["):          # [::1]:8080
+        host = host[1:].partition("]")[0]
+    else:
+        host = host.partition(":")[0]
+    # A trailing dot names the same host (DNS root label, e.g. "localhost.")
+    # -- strip it so a browser/curl that happens to send the FQDN form isn't
+    # refused for a distinction DNS itself doesn't make.
+    host = host.rstrip(".")
+    return host in _ALWAYS_ALLOWED_HOSTS or host in allowed
+
+
+_HOST_ERROR_BODY = {
+    "error": "host header not recognized; see --dashboard-allowed-hosts / "
+    "IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS"
+}
+
 
 def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload).encode("utf-8")
@@ -107,6 +144,8 @@ def make_handler(
     breaker: CircuitBreaker | None = None,
     store: FaceStore | None = None,
     crop_dir: Path | None = None,
+    allowed_hosts: frozenset[str] = frozenset(),
+    token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a ``BaseHTTPRequestHandler`` subclass closed over one dashboard.
 
@@ -124,10 +163,30 @@ def make_handler(
     The People routes must then degrade to a plain 404 rather than raising:
     the same "dashboard failure never stops organizing" rule, applied to "this
     run has no face pipeline" rather than to a query that raised.
+
+    ``allowed_hosts`` is additional to ``_ALWAYS_ALLOWED_HOSTS`` (see
+    :func:`_host_allowed`) -- an empty default keeps every caller that does
+    not configure ``--dashboard-allowed-hosts`` accepting exactly the
+    loopback names it always did.
+
+    ``token``, when set, is the shared secret every ``do_POST`` request must
+    present (header ``X-Dashboard-Token``, compared with
+    ``hmac.compare_digest``) -- checked immediately after the Host gate, so
+    an unrecognized Host is still rejected first. ``None`` (the default)
+    means POSTs are open, exactly as before this option existed -- the
+    loopback bind is the mitigation for a caller that never sets it. GETs
+    never require the token.
     """
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ImageHarborDashboard/1"
+
+        # Closes the slowloris/unbounded-read DoS: a stalled client's
+        # `rfile.read` now raises `TimeoutError` after 10s instead of
+        # hanging the handler thread forever. The existing per-handler
+        # `except Exception` in do_GET/do_POST turns that into a closed
+        # connection, never a crash -- never-stop-the-watcher holds.
+        timeout = 10
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
             # Route access logging through the project's logger rather than
@@ -185,7 +244,20 @@ def make_handler(
                 )
             if length == 0:
                 return {}, None, None
-            raw = self.rfile.read(length)
+            try:
+                raw = self.rfile.read(length)
+            except OSError:
+                # A stalled/slow client whose `rfile.read` blocks past the
+                # handler's own `timeout` (see `Handler.timeout` above) has
+                # its socket read raise `TimeoutError` (an `OSError`
+                # subclass) rather than returning -- without this, that
+                # would propagate up through `do_POST`'s `except Exception`
+                # as an unhandled-looking failure. A clean 408 here is the
+                # correct HTTP answer for "you took too long", and it never
+                # gets logged at exception level (see log_message /
+                # never-stop-the-watcher) -- a stalled client is not this
+                # process's bug.
+                return None, HTTPStatus.REQUEST_TIMEOUT, "request body timed out"
             try:
                 return json.loads(raw.decode("utf-8")), None, None
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -193,8 +265,29 @@ def make_handler(
 
         # -- routing --------------------------------------------------------
 
+        def _host_ok(self) -> bool:
+            """Host-header gate shared by do_GET/do_POST.
+
+            A duplicate Host header (two ``Host:`` lines) is refused outright
+            -- `self.headers.get("Host")` would silently return only the
+            first one, which is exactly the ambiguity a request-smuggling /
+            DNS-rebinding attempt can exploit to sneak a second, attacker
+            Host past a filter that only looks at the first value. Every
+            legitimate client (browser, curl, the compose healthcheck) sends
+            exactly one.
+            """
+            host_headers = self.headers.get_all("Host") or []
+            if len(host_headers) != 1 or not _host_allowed(
+                host_headers[0], allowed_hosts
+            ):
+                self._send_json(HTTPStatus.FORBIDDEN, _HOST_ERROR_BODY)
+                return False
+            return True
+
         def do_GET(self) -> None:  # noqa: N802 (http.server's naming convention)
             try:
+                if not self._host_ok():
+                    return
                 if self.path == "/":
                     self._handle_index()
                 elif self.path == "/api/stats":
@@ -213,6 +306,47 @@ def make_handler(
 
         def do_POST(self) -> None:  # noqa: N802
             try:
+                if not self._host_ok():
+                    return
+                if token is not None:
+                    supplied = self.headers.get("X-Dashboard-Token", "")
+                    # `hmac.compare_digest` raises `TypeError` when given
+                    # `str` operands containing non-ASCII characters (its own
+                    # documented caveat) -- encoding both sides to bytes
+                    # first keeps a wrong/garbled token a clean 401 instead
+                    # of an unhandled-exception 500.
+                    # `surrogateescape` on the supplied side means an
+                    # invalid-UTF-8 header still decodes (http.server hands
+                    # header values back as `str` already) to *some* bytes
+                    # rather than raising here -- it will simply never equal
+                    # the configured token, which is the correct outcome for
+                    # garbage input.
+                    if not hmac.compare_digest(
+                        supplied.encode("utf-8", "surrogateescape"),
+                        token.encode("utf-8"),
+                    ):
+                        self._send_json(
+                            HTTPStatus.UNAUTHORIZED,
+                            {"error": "missing or wrong X-Dashboard-Token"},
+                        )
+                        return
+                # CSRF defense: a plain HTML form or a bare `fetch` with no
+                # explicit headers submits as `text/plain` (or omits
+                # Content-Type), which the browser is happy to send
+                # cross-origin with NO CORS preflight. Requiring
+                # `application/json` forces a preflight for any cross-origin
+                # POST, which is what actually stops a hostile page the
+                # operator's browser merely happens to have open from
+                # silently POSTing to this API on the tokenless loopback
+                # bind.
+                content_type = self.headers.get("Content-Type", "")
+                media_type = content_type.split(";", 1)[0].strip().casefold()
+                if media_type != "application/json":
+                    self._send_json(
+                        HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                        {"error": "Content-Type must be application/json"},
+                    )
+                    return
                 if self.path == "/api/pause":
                     self._handle_pause()
                 elif self.path == "/api/settings":
@@ -477,9 +611,12 @@ def serve(
     control: ControlPlane,
     *,
     port: int,
+    host: str = "127.0.0.1",
     breaker: CircuitBreaker | None = None,
     store: FaceStore | None = None,
     crop_dir: Path | None = None,
+    allowed_hosts: Sequence[str] = (),
+    token: str | None = None,
     stop_event: threading.Event,
 ) -> threading.Thread | None:
     """Start the dashboard on a daemon thread, sharing *stop_event* with the caller.
@@ -502,14 +639,24 @@ def serve(
     `docker stop` (which sets *stop_event*) still triggers a clean
     `server_close()`.
     """
+    normalized_hosts = frozenset(
+        h.strip().lower() for h in allowed_hosts if h.strip()
+    )
     handler_cls = make_handler(
-        catalog, control, breaker=breaker, store=store, crop_dir=crop_dir
+        catalog,
+        control,
+        breaker=breaker,
+        store=store,
+        crop_dir=crop_dir,
+        allowed_hosts=normalized_hosts,
+        token=token,
     )
     try:
-        httpd = _DashboardHTTPServer(("0.0.0.0", port), handler_cls)
+        httpd = _DashboardHTTPServer((host, port), handler_cls)
     except OSError:
         logger.warning(
-            "dashboard: could not bind port %d; continuing without a dashboard",
+            "dashboard: could not bind %s:%d; continuing without a dashboard",
+            host,
             port,
             exc_info=True,
         )

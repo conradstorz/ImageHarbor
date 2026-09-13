@@ -6,8 +6,10 @@
 #     (via /etc/fstab or autofs; NAS credentials live there, not here.)
 services:
   imageharbor:
-    build: .
-    image: imageharbor:latest
+    # Pulls the released image from GHCR (published automatically on every
+    # green merge -- see .github/workflows/release.yml). To run a local
+    # build instead: docker build -t ghcr.io/conradstorz/imageharbor:latest .
+    image: ghcr.io/conradstorz/imageharbor:latest
     command: watch
     environment:
       IMAGEHARBOR_SOURCE: /data/source
@@ -22,6 +24,14 @@ services:
       IMAGEHARBOR_FACES: "1"
       IMAGEHARBOR_FACE_MODEL_DIR: /data/models
       IMAGEHARBOR_FACE_THRESHOLD: ""     # set from `faces calibrate` output
+      # Dashboard exposure (R2): inside the container the server must bind
+      # 0.0.0.0 for the published port to work; exposure is bounded by the
+      # host's port publish (tailnet-only on hpz440). The token gates every
+      # mutating request; the allowlist is the DNS-rebinding defense and
+      # must name every host/IP the dashboard is browsed as.
+      IMAGEHARBOR_DASHBOARD_HOST: 0.0.0.0
+      IMAGEHARBOR_DASHBOARD_TOKEN: ""          # REQUIRED: set a long random string before `up`
+      IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS: ""  # e.g. "100.69.239.123,hpz440"
     ports:
       # Host 8087, not 8080: GTE's console already owns 8080 on this host.
       # A collision here is SILENT -- `serve()` logs the bind failure and the

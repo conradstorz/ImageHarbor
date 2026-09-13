@@ -180,3 +180,48 @@ def test_read_member_returns_bytes(tmp_path: Path) -> None:
     z = _zip(tmp_path / "t.zip", {"d/a.json": b'{"title": "x"}'})
     with zipfile.ZipFile(z, "r") as zf:
         assert archive.read_member(zf, "d/a.json") == b'{"title": "x"}'
+
+
+def test_a_backslash_member_name_cannot_escape_the_staging_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # On Windows pathlib treats "\" as a separator, so a member basename of
+    # r"..\..\..\pwned.txt" handed to `holder / name` walks OUT of the
+    # holder. The sanitizer must neutralize backslashes like any other
+    # illegal character.
+    #
+    # CPython's own zipfile (`ZipInfo.__init__` -> `_sanitize_filename`)
+    # already rewrites any backslash to "/" the moment a name round-trips
+    # through a real archive on Windows, which would mask the very bug this
+    # test exists to catch. `member.path` is attacker-controlled input to
+    # `extract_to` regardless of how a member name reaches it (a non-Python
+    # zip writer, a different platform, a future `iter_members` change), so
+    # the malicious name is injected directly into the `MemberInfo` and
+    # `zf.open` is patched to serve real bytes for it -- isolating exactly
+    # what `extract_to` does with a hostile `member.path`.
+    zip_path = tmp_path / "evil.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("payload.txt", b"gotcha")
+    staging = tmp_path / "staging"
+    malicious_path = "Takeout/..\\..\\..\\pwned.txt"
+    with zipfile.ZipFile(zip_path) as zf:
+        real_open = zf.open
+        monkeypatch.setattr(
+            zf, "open", lambda name, mode="r": real_open("payload.txt", mode)
+        )
+        member = archive.MemberInfo(
+            path=malicious_path,
+            size=6,
+            crc32=0,
+            kind=archive.KIND_IMAGE,
+        )
+        staged = archive.extract_to(zf, member, staging)
+    staged_resolved = staged.resolve()
+    assert staged_resolved.is_relative_to(staging.resolve())
+    assert "\\" not in staged.name
+    assert not (tmp_path / "pwned.txt").exists()
+    assert not (tmp_path.parent / "pwned.txt").exists()
+
+
+def test_sanitizer_replaces_backslashes() -> None:
+    assert "\\" not in archive._safe_name("..\\..\\evil.jpg")

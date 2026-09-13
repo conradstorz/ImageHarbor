@@ -49,8 +49,11 @@ _TRASH_COMPONENT = "trash"
 # parentheses) -- all of which are legal on every supported filesystem and
 # must survive untouched, because the staged file's NAME is evidence the date
 # and descriptor resolvers read. Only genuinely illegal characters are
-# replaced.
-_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+# replaced. Backslash is included not for cosmetic reasons but because it is
+# the zip-slip vector: pathlib on Windows treats "\" as a path separator, so
+# a member basename of e.g. r"..\..\..\pwned.txt" handed to `holder / name`
+# in `extract_to` walks OUT of the staging holder.
+_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 
 
 @dataclass(frozen=True)
@@ -169,6 +172,10 @@ def extract_to(zf: zipfile.ZipFile, member: MemberInfo, staging_dir: Path) -> Pa
     staging_dir.mkdir(parents=True, exist_ok=True)
     holder = Path(tempfile.mkdtemp(dir=str(staging_dir)))
     dest = holder / _safe_name(member.path.rpartition("/")[2])
+    if not dest.resolve().is_relative_to(holder.resolve()):
+        raise ValueError(
+            f"refusing to stage zip member outside its holder: {member.path!r}"
+        )
     with zf.open(member.path, "r") as src, open(dest, "wb") as out:
         shutil.copyfileobj(src, out, 65536)
     return dest
