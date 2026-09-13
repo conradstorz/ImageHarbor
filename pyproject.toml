@@ -18,7 +18,12 @@ dependencies = [
 openai = ["openai>=1.0.0"]
 faces = [
     "onnxruntime>=1.17,<2",
-    "numpy>=1.24",
+    # Upper-bounded at <2.3: numpy 2.3+ ships __init__.pyi using the PEP 695
+    # `type` statement unconditionally (no sys.version_info guard), which
+    # mypy rejects as a syntax error under our pinned `python_version =
+    # "3.10"` (see [tool.mypy] below) -- it aborts the whole run before any
+    # of our own code is even checked. 2.2.x's stubs predate that change.
+    "numpy>=1.24,<2.3",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -30,7 +35,9 @@ dev = [
     # dashboard files). onnxruntime deliberately stays out: tests that need a
     # real session `importorskip` it, so the suite runs green without the
     # 200 MB runtime. Guarded by tests/test_packaging.py.
-    "numpy>=1.24",
+    # Same <2.3 upper bound as the faces extra above, and for the same
+    # mypy/PEP-695-stub reason -- kept in sync deliberately.
+    "numpy>=1.24,<2.3",
     "ruff>=0.6",
     "mypy>=1.11",
 ]
@@ -76,3 +83,16 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B"]
+
+# Non-strict on purpose: the codebase is 99% return-annotated, so this
+# baseline is cheap to keep green; ratchet toward strict in later releases.
+[tool.mypy]
+files = ["imageharbor"]
+python_version = "3.10"
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["onnxruntime.*", "openai.*"]
+ignore_missing_imports = true

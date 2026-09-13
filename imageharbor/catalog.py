@@ -1026,6 +1026,7 @@ class Catalog:
             )
             self._conn.commit()
             run_id = cursor.lastrowid
+            assert run_id is not None, "lastrowid is always set after an INSERT"
             self._own_run_ids.add(run_id)
             return run_id
 

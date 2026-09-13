@@ -23,7 +23,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, ClassVar
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,10 @@ class TakeoutMetadata:
     # a __hash__ that raises TypeError at call time, because `google_exif` is a
     # dict -- a landmine for the first caller to put one of these in a set or
     # use it as a dict key. Equality still works and is what the tests use.
-    __hash__ = None
+    # mypy models object.__hash__ as Callable[[], int] (never Optional), so
+    # the idiomatic "explicitly unhashable" idiom always reads as a type
+    # mismatch to it -- a true false positive, not a real bug.
+    __hash__: ClassVar[None] = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)

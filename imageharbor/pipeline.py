@@ -13,6 +13,7 @@ import errno
 import logging
 import os
 import shutil
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -597,7 +598,7 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 
 
-def _source_entry(row) -> dict[str, Any]:
+def _source_entry(row: sqlite3.Row) -> dict[str, Any]:
     """A sidecar `sources[]` entry from a catalog `sources` row.
 
     `folder` is the immediate parent of the source path -- for a Takeout

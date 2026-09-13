@@ -286,6 +286,7 @@ def build_index(members: Iterable[str]) -> PairingIndex:
         match.sidecar
         for media_path in media
         if (match := _exact_match(media_path, partial)) is not None
+        and match.sidecar is not None
     }
     partial.claimed = frozenset(claimed)
 

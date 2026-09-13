@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -64,7 +65,7 @@ class TaxonomyNode:
     active: bool = True
 
 
-def _node(row) -> TaxonomyNode:
+def _node(row: sqlite3.Row) -> TaxonomyNode:
     return TaxonomyNode(
         code=row["code"],
         parent_code=row["parent_code"],

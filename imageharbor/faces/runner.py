@@ -303,11 +303,12 @@ def google_names(dest: Path) -> dict[str, list[str]]:
         if not digest:
             continue
         names = [
-            person.get("name")
+            name
             for person in doc.get("people", ())
             if isinstance(person, dict)
             and person.get("source") == "google_photos_people"
-            and person.get("name")
+            and isinstance((name := person.get("name")), str)
+            and name
         ]
         if names:
             out[digest] = names

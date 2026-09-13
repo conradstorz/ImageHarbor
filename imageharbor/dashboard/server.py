@@ -74,6 +74,32 @@ def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
 
+def _require_int(body: dict[str, Any], key: str) -> int:
+    """Read *key* from a parsed JSON body as a plain int, or raise ValueError.
+
+    `bool` is excluded even though it's an `int` subclass -- a stray
+    ``true``/``false`` in a request body is a wrong shape, not a 0/1 id.
+    The caller already turns `ValueError` into an HTTP 400 (see
+    `_handle_people_action`), so this keeps that same "reject outright,
+    never defend against it on read" boundary the `_SETTINGS_KEYS` check
+    above uses, just applied to `people`'s id-shaped fields.
+    """
+    value = body.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer, got {value!r}")
+    return value
+
+
+def _require_int_list(body: dict[str, Any], key: str) -> list[int]:
+    """Read *key* as a list of plain ints (missing key -> empty list)."""
+    value = body.get(key) or []
+    if not isinstance(value, list) or not all(
+        isinstance(v, int) and not isinstance(v, bool) for v in value
+    ):
+        raise ValueError(f"{key} must be a list of integers, got {value!r}")
+    return value
+
+
 def make_handler(
     catalog: Catalog,
     control: ControlPlane,
@@ -400,19 +426,23 @@ def make_handler(
             try:
                 if action == "confirm":
                     result = people.confirm(
-                        store, body.get("cluster_id"), body.get("name", "")
+                        store, _require_int(body, "cluster_id"), body.get("name", "")
                     )
                 elif action == "reject":
                     result = people.reject(
-                        store, body.get("cluster_id"), body.get("name", "")
+                        store, _require_int(body, "cluster_id"), body.get("name", "")
                     )
                 elif action == "merge":
                     result = people.merge(
-                        store, body.get("person_id"), body.get("cluster_ids") or []
+                        store,
+                        _require_int(body, "person_id"),
+                        _require_int_list(body, "cluster_ids"),
                     )
                 elif action == "split":
                     result = people.split(
-                        store, body.get("cluster_id"), body.get("face_ids") or []
+                        store,
+                        _require_int(body, "cluster_id"),
+                        _require_int_list(body, "face_ids"),
                     )
                 else:
                     self._send_text(HTTPStatus.NOT_FOUND, "not found")

@@ -16,6 +16,7 @@ merging an already-complete sidecar safe (it is a no-op by construction).
 from __future__ import annotations
 
 import logging
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,7 +66,7 @@ def _already_recorded_at_or_above(existing: dict, key: str, catalog_tier: int) -
     return normalize_tier(block.get("tier")) >= catalog_tier
 
 
-def _build_updates(organized_path: Path, row, existing: dict) -> dict:
+def _build_updates(organized_path: Path, row: sqlite3.Row, existing: dict) -> dict:
     """The same update dict the facts pass builds for a fresh sidecar,
     rebuilt here from what the catalog and the organized copy still hold.
 
@@ -153,7 +154,7 @@ def backfill_sidecars(
 def _backfill_row(
     organized_dir: Path,
     catalog: Catalog,
-    row,
+    row: sqlite3.Row,
     *,
     dry_run: bool,
     stats: BackfillStats,
