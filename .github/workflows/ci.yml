@@ -40,3 +40,14 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked --extra dev
       - run: uv run pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          build-args: |
+            IMAGEHARBOR_VERSION=0.0.0
