@@ -322,10 +322,12 @@ Module responsibilities:
   `<pcs>-<descriptor>_<digest>` stems from before this redesign still parse
   unchanged, since the prefix is otherwise unconstrained.
 - **`util.py`** — tiny stdlib-only leaf module (no intra-package imports) holding
-  `now_iso()` and `json_default()`, shared across the package. Consumers
-  re-export them under their old private names (`from .util import now_iso as
-  _now_iso`) to preserve the tests' per-module monkeypatch surface — do not
-  "simplify" call sites to `util.now_iso()`.
+  `now_iso()`, `json_default()`, and `fsync_file()`, shared across the package.
+  Consumers re-export them under their old private names (`from .util import
+  now_iso as _now_iso`) to preserve the tests' per-module monkeypatch surface —
+  do not "simplify" call sites to `util.now_iso()`. `fsync_file()` must be
+  called before any source mode bits land on the destination — see the
+  pipeline's copyfile → fsync → copystat sequence below.
 - **`catalog.py`** — SQLite (WAL mode). The `photos` table (keyed by the unique
   `sha256_b64url`) is the source of truth for **resumability and duplicate
   detection** (`is_known`); `upsert` is idempotent (`ON CONFLICT … DO UPDATE`) and
@@ -794,7 +796,14 @@ Module responsibilities:
   staging file the caller owns and created as disposable, never a real
   original): the ordering becomes rename → verify → catalog, with verification
   still reading the destination — nothing enters the catalog unverified either
-  way.
+  way. Written bytes are fsynced (`util.fsync_file`) *before* verification
+  reads them back, so verification can never durably assert "copied, verified"
+  for data that only reached the OS page cache and not the platter (a
+  power-loss gap, not merely a process-crash one). The copy is deliberately
+  `shutil.copyfile` → `fsync_file` → `shutil.copystat`, never `shutil.copy2` —
+  `copy2` applies the source's mode bits as part of the copy itself, before
+  `fsync_file`'s `"rb+"` handle would open, and a read-only source (the
+  production RO NAS mount) then fails every copy with `PermissionError`.
 - **Runtime output directories are git-ignored, not source** (`Photos-Organized/`,
   `Review/`, `Duplicates/`, `Logs/`, `catalog.db`, etc. in `.gitignore`).
 - **Faces never rename or move a file.** No code path in `imageharbor/faces/`

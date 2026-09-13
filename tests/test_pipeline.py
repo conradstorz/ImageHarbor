@@ -342,11 +342,11 @@ def test_pipeline_resume_skips_copy_when_dest_verifies(
     # the images are unknown, but the verified organized files already exist.
     fresh_catalog = Catalog(tmp_path / "fresh.db")
 
-    # copy2 must NOT be called for a destination that already exists and verifies.
+    # copyfile must NOT be called for a destination that already exists and verifies.
     def _no_copy(*_a, **_k):
-        raise AssertionError("shutil.copy2 must not be called on a verified resume")
+        raise AssertionError("shutil.copyfile must not be called on a verified resume")
 
-    monkeypatch.setattr("imageharbor.pipeline.shutil.copy2", _no_copy)
+    monkeypatch.setattr("imageharbor.pipeline.shutil.copyfile", _no_copy)
 
     try:
         stats = Pipeline(source_dir, organized_dir, fresh_catalog).run()

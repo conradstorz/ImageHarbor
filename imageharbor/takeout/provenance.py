@@ -122,9 +122,12 @@ def _write_bytes(dest: Path, data: bytes) -> None:
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".tmp")
-    tmp.write_bytes(data)
-    fsync_file(tmp)
-    tmp.replace(dest)
+    try:
+        tmp.write_bytes(data)
+        fsync_file(tmp)
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _load_manifest(path: Path) -> dict:

@@ -508,8 +508,9 @@ def test_a_remember_failure_is_io_evidence_and_the_pass_continues(tmp_path, monk
     assert stats.ai_failed == []
     assert stats.enriched == 0
     assert stats.aborted is False
-    # pick_class succeeded, so record_success() ran before remember() blew up --
-    # a real backend success, not a failure, so a CLOSED breaker here is
-    # expected either way; the load-bearing assertion is that it never opened.
+    # remember() (enrich.py:190) runs before record_success() (:199-200), so
+    # on this path the breaker is never touched at all -- neither success nor
+    # failure is recorded; the load-bearing assertion is only that it never
+    # opened.
     assert not breaker.is_open()
     cat.close()
