@@ -907,7 +907,10 @@ def test_watch_dashboard_port_is_accepted_and_forwarded(monkeypatch, tmp_path):
 
     captured = {}
 
-    def _fake_serve(catalog, control, *, port, breaker=None, store=None, crop_dir=None, stop_event):
+    def _fake_serve(
+        catalog, control, *, port, host="127.0.0.1", breaker=None, store=None,
+        crop_dir=None, stop_event,
+    ):
         captured["port"] = port
         return None  # a dashboard failure must never stop the watcher
 
@@ -961,10 +964,11 @@ def test_watch_still_runs_when_the_dashboard_port_is_already_bound(monkeypatch, 
     monkeypatch.setattr(_watcher, "watch", _fake_watch)
 
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Wildcard bind, matching what `serve()` itself binds -- see
-    # test_dashboard_server.py's identical comment for why "127.0.0.1"
-    # would not actually conflict on Windows.
-    blocker.bind(("0.0.0.0", 0))
+    # Loopback bind, matching `serve()`'s new default host -- see
+    # test_dashboard_server.py's identical comment for why a "0.0.0.0"
+    # blocker would not actually conflict with a "127.0.0.1" bind (or vice
+    # versa) on Windows.
+    blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
     port = blocker.getsockname()[1]
     try:

@@ -480,6 +480,15 @@ def enrich(
     help="Port for the operational dashboard.",
 )
 @click.option(
+    "--dashboard-host",
+    envvar="IMAGEHARBOR_DASHBOARD_HOST",
+    default="127.0.0.1",
+    show_default=True,
+    help="Interface the dashboard binds. Loopback by default; set 0.0.0.0 "
+    "to expose it beyond this machine (then set --dashboard-token and "
+    "--dashboard-allowed-hosts -- see docs/deploy-docker.md).",
+)
+@click.option(
     "--no-dashboard",
     is_flag=True,
     default=False,
@@ -550,6 +559,7 @@ def watch(
     poison_max_fails: int,
     quarantine_dir: Path | None,
     dashboard_port: int,
+    dashboard_host: str,
     no_dashboard: bool,
     faces: bool,
     face_model_dir: Path | None,
@@ -656,19 +666,22 @@ def watch(
             click.echo("Dashboard disabled (--no-dashboard).")
         else:
             dashboard_thread = dashboard_server.serve(
-                catalog, control, port=dashboard_port, breaker=breaker,
+                catalog, control, port=dashboard_port, host=dashboard_host,
+                breaker=breaker,
                 store=face_store,
                 crop_dir=face_config.crop_dir if face_config is not None else None,
                 stop_event=stop_event,
             )
             if dashboard_thread is None:
                 click.echo(
-                    f"Dashboard could not bind port {dashboard_port}; "
+                    f"Dashboard could not bind {dashboard_host}:{dashboard_port}; "
                     "continuing without it.",
                     err=True,
                 )
             else:
-                click.echo(f"Dashboard listening on http://0.0.0.0:{dashboard_port}/")
+                click.echo(
+                    f"Dashboard listening on http://{dashboard_host}:{dashboard_port}/"
+                )
 
         stats = _watcher.watch(
             pipeline=pipeline,

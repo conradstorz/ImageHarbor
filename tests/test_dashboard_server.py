@@ -631,14 +631,14 @@ def test_serve_on_already_bound_port_returns_none_and_does_not_raise(
     catalog: Catalog, control: ControlPlane
 ) -> None:
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Bind the SAME host ("0.0.0.0", the wildcard) that `serve()` binds --
-    # not "127.0.0.1". On Windows, a wildcard bind and a same-port
-    # specific-address bind do not conflict by default (verified: binding
-    # 0.0.0.0:PORT succeeds even while 127.0.0.1:PORT is already listening),
-    # so a "127.0.0.1" blocker would make this test pass for the wrong
-    # reason -- no real conflict, `serve()` would bind fine, and the
-    # assertion would only hold by accident.
-    blocker.bind(("0.0.0.0", 0))
+    # Bind the SAME host ("127.0.0.1", `serve()`'s default) that `serve()`
+    # binds. On Windows, a wildcard bind and a same-port specific-address
+    # bind do not conflict with each other by default (verified: binding
+    # 0.0.0.0:PORT succeeds even while 127.0.0.1:PORT is already listening,
+    # and the reverse), so a "0.0.0.0" blocker would make this test pass for
+    # the wrong reason -- no real conflict, `serve()` would bind fine, and
+    # the assertion would only hold by accident.
+    blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
     port = blocker.getsockname()[1]
     try:
@@ -650,3 +650,53 @@ def test_serve_on_already_bound_port_returns_none_and_does_not_raise(
         assert result is None
     finally:
         blocker.close()
+
+
+def test_serve_binds_loopback_by_default(
+    catalog: Catalog, control: ControlPlane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Default bind must be loopback: a socket on 0.0.0.0 exposes every
+    # mutating endpoint to the LAN, which is opt-in (compose) from R2 on.
+    seen: dict[str, Any] = {}
+    real_ctor = dashboard_server._DashboardHTTPServer.__init__
+
+    def spy(self: Any, addr: Any, handler: Any) -> None:
+        seen["addr"] = addr
+        real_ctor(self, addr, handler)
+
+    monkeypatch.setattr(dashboard_server._DashboardHTTPServer, "__init__", spy)
+
+    stop_event = threading.Event()
+    thread = dashboard_server.serve(catalog, control, port=0, stop_event=stop_event)
+    try:
+        assert thread is not None
+        assert seen["addr"][0] == "127.0.0.1"
+    finally:
+        stop_event.set()
+        if thread is not None:
+            thread.join(timeout=5)
+
+
+def test_serve_binds_wildcard_only_on_request(
+    catalog: Catalog, control: ControlPlane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+    real_ctor = dashboard_server._DashboardHTTPServer.__init__
+
+    def spy(self: Any, addr: Any, handler: Any) -> None:
+        seen["addr"] = addr
+        real_ctor(self, addr, handler)
+
+    monkeypatch.setattr(dashboard_server._DashboardHTTPServer, "__init__", spy)
+
+    stop_event = threading.Event()
+    thread = dashboard_server.serve(
+        catalog, control, port=0, host="0.0.0.0", stop_event=stop_event
+    )
+    try:
+        assert thread is not None
+        assert seen["addr"][0] == "0.0.0.0"
+    finally:
+        stop_event.set()
+        if thread is not None:
+            thread.join(timeout=5)

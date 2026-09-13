@@ -530,6 +530,7 @@ def serve(
     control: ControlPlane,
     *,
     port: int,
+    host: str = "127.0.0.1",
     breaker: CircuitBreaker | None = None,
     store: FaceStore | None = None,
     crop_dir: Path | None = None,
@@ -568,10 +569,11 @@ def serve(
         allowed_hosts=normalized_hosts,
     )
     try:
-        httpd = _DashboardHTTPServer(("0.0.0.0", port), handler_cls)
+        httpd = _DashboardHTTPServer((host, port), handler_cls)
     except OSError:
         logger.warning(
-            "dashboard: could not bind port %d; continuing without a dashboard",
+            "dashboard: could not bind %s:%d; continuing without a dashboard",
+            host,
             port,
             exc_info=True,
         )
