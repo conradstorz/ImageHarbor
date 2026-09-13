@@ -24,6 +24,6 @@ class DetectorLike(Protocol):
 
 class EmbedderLike(Protocol):
     model_name: str
-    dim: int | None
+    dim: int
 
     def embed_batch(self, crops: Sequence[Image.Image]) -> np.ndarray: ...
