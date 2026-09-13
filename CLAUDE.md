@@ -222,8 +222,15 @@ Module responsibilities:
   single pipeline used, writes classification to the catalog and sidecar
   **unconditionally**, but renames/moves the file **only when
   `tiers.is_upgrade` says so** — an AI subject (tier 20) can never displace a
-  human-authored filename (tier 30). Drives the circuit breaker (an AI-perception
-  failure feeds it; everything after `describe()` is local work and must not).
+  human-authored filename (tier 30). Drives the circuit breaker: a `describe()`
+  failure or a `pick_class` fallback failure (both real backend calls) feed it
+  and abort the pass on trip, exactly the same way; everything else after
+  `describe()` — taxonomy resolution, catalog write, tier-gated rename — is
+  local work and must not. `breaker.record_success()` is recorded once a row's
+  backend calls have all actually succeeded (describe, and pick_class when the
+  concept map missed) rather than right after `describe()`, so a row whose
+  `describe()` succeeds but whose `pick_class` fallback then fails cannot reset
+  the breaker's consecutive-failure counter out from under itself.
   Enrichment failure leaves a file at its current tier, which is always valid: the
   facts pass already gave it a real name and a real home.
 - **`pcs.py`** — **seed data + helpers only**: `PCS_CATEGORIES` defines the 9 fixed
@@ -771,8 +778,10 @@ Module responsibilities:
   instead, and otherwise leaves the prefix unconstrained — which is also why
   legacy PCS-prefixed filenames from before this redesign still parse.
 - **Non-AI failures must never feed the circuit breaker.** Only a failure raised
-  by `AIClassifier.describe()` (AI-perception evidence) counts toward
-  `--breaker-threshold`; a filesystem fault (a missing organized file, a failed
+  by the classifier's backend-facing calls — `describe()` and the `pick_class`
+  fallback — counts toward `--breaker-threshold` (`adjudicate` is caught inside
+  `taxonomy.resolve_or_create` and degrades to minting a new code, so it never
+  reaches the breaker); a filesystem fault (a missing organized file, a failed
   rename, a permissions error) must be handled and counted separately, never
   reported to the breaker as if it were backend-outage evidence. The facts pass
   makes no AI calls at all, so it never touches the breaker.

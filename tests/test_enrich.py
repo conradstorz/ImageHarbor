@@ -325,3 +325,61 @@ def test_pause_check_true_from_the_start_enriches_nothing(tmp_path):
     assert stats.enriched == 0
     assert cat.get_by_sha256(result.sha256_b64url)["enriched_at"] is None
     cat.close()
+
+
+# ---------------------------------------------------------------------------
+# pick_class fallback failures are AI evidence (R3 Task 1)
+# ---------------------------------------------------------------------------
+
+
+class DescribesButCannotPick(StubClassifier):
+    """describe() succeeds (perception is fine); pick_class() dies.
+
+    Models a real OpenAIClassifier whose backend goes down between the
+    describe() chat call and the pick_class() chat call for a concept-map
+    miss -- pick_class is a network call too, so its failure is the same
+    kind of AI evidence describe()'s failure is.
+    """
+
+    def pick_class(self, content, classes):
+        raise RuntimeError("backend died mid-pass")
+
+
+def test_a_pick_class_failure_is_ai_evidence_and_feeds_the_breaker(tmp_path):
+    from imageharbor.circuit_breaker import CircuitBreaker
+
+    # Nonsense stems so concept_map.class_for misses for every row (StubClassifier
+    # derives primary_subject from the filename, and none of these words are in
+    # STATIC_SEED or the learned-concepts store).
+    src = _make(tmp_path, "zzxxqq1.jpg", b"one")
+    (src / "zzxxqq2.jpg").write_bytes(b"two")
+    (src / "zzxxqq3.jpg").write_bytes(b"three")
+    dest = tmp_path / "dest"
+    cat = Catalog(tmp_path / "c.db")
+    Pipeline(src, dest, cat).run()
+
+    breaker = CircuitBreaker(trip_threshold=3, backoff_base=1.0, backoff_cap=1.0)
+    stats = enrich_library(cat, dest, DescribesButCannotPick(), breaker=breaker)
+
+    assert stats.ai_failed  # not io_failed
+    assert stats.io_failed == []
+    assert stats.aborted is True  # breaker opened and the pass stopped
+    assert breaker.is_open()
+    cat.close()
+
+
+def test_a_concept_map_hit_never_calls_pick_class(tmp_path):
+    """A learned-concepts hit must enrich fine even with a broken pick_class.
+
+    Proves the pick_class fallback is the only new breaker-feeding path --
+    a subject the concept map already knows never reaches pick_class at all.
+    """
+    cat, dest, result = _facts(tmp_path, "beachy.jpg")
+    cat.learned_concept_remember("beachy", "600")
+
+    stats = enrich_library(cat, dest, DescribesButCannotPick())
+
+    assert stats.enriched == 1
+    assert stats.ai_failed == []
+    assert stats.errors == 0
+    cat.close()
