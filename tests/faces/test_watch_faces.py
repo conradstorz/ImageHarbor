@@ -582,6 +582,91 @@ def test_watch_warns_once_when_clustering_due_but_no_threshold_configured(
 
 
 # ---------------------------------------------------------------------------
+# the faces pass crashing must not take the watch loop down with it
+# ---------------------------------------------------------------------------
+
+
+def test_watch_survives_a_crashed_faces_pass_and_keeps_organizing(
+    tmp_path: Path,
+    source_dir: Path,
+    organized_dir: Path,
+    catalog: Catalog,
+    face_store: FaceStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`runner.scan` raising must not abort the loop: the SAME cycle's other
+    passes (facts organizing here) still complete, the crash is logged, the
+    breaker (reserved for `AIClassifier.describe()` failures -- see
+    CLAUDE.md's non-AI-failures invariant) is left untouched, and the next
+    cycle attempts the faces pass again rather than giving up on it forever.
+
+    Patches `imageharbor.faces.runner.scan` itself (not a `watcher` name):
+    watcher.py's faces-pass block does `from .faces import runner as
+    face_runner` fresh every cycle and then calls `face_runner.scan(...)`,
+    so `face_runner` is always the live `imageharbor.faces.runner` module
+    object and a patch on that module's `scan` attribute is what the loop
+    actually calls -- the same target `test_watch_forwards_pause_check_
+    into_the_faces_scan` above already patches.
+    """
+    from PIL import Image
+
+    import imageharbor.faces as faces_pkg
+    from imageharbor.circuit_breaker import BreakerState, CircuitBreaker
+
+    # `scan`/`propagate_sidecars` are faked below, so this test needs no real
+    # onnxruntime -- only `faces_available()`'s import-state check, which
+    # this monkeypatches the same way test_faces_available_true_when_onnx_
+    # importable does, so the test isn't skipped where the 'faces' extra
+    # (and therefore onnxruntime) isn't installed.
+    monkeypatch.setattr(faces_pkg, "HAS_ONNX", True)
+
+    path = source_dir / "photo0.jpg"
+    Image.new("RGB", (200, 200), (10, 100, 100)).save(path)
+
+    calls = {"n": 0}
+
+    def _flaky_scan(catalog, store, detector, embedder, crop_dir, *, gate, limit=None, should_stop=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom: simulated faces-pass crash")
+        return runner.ScanResult()
+
+    monkeypatch.setattr("imageharbor.faces.runner.scan", _flaky_scan)
+    monkeypatch.setattr("imageharbor.faces.runner.propagate_sidecars", lambda *a, **k: 0)
+
+    pipeline = _make_pipeline(source_dir, organized_dir, catalog)
+    face_config = _basic_face_config(tmp_path, organized_dir, face_store)
+    breaker = CircuitBreaker(trip_threshold=2)
+    stop = threading.Event()
+
+    with caplog.at_level(logging.ERROR):
+        wstats = watch(
+            pipeline=pipeline,
+            catalog=catalog,
+            interval=1.0,
+            stop_event=stop,
+            sleep=_one_cycle_sleep(stop, n=2),
+            faces_enabled=True,
+            face_config=face_config,
+            breaker=breaker,
+        )
+
+    # The crash happened on cycle 1; `scan` was called again on cycle 2 --
+    # the loop never gave up on the faces pass after one failure.
+    assert calls["n"] == 2
+    # Facts organizing (the OTHER pass in the same cycle) completed both
+    # times despite the faces-pass crash on cycle 1.
+    assert wstats.passes == 2
+    assert wstats.processed >= 1
+    assert any(organized_dir.rglob("*.jpg")), "the source photo was never organized"
+    # The crash is logged, not swallowed.
+    assert "faces pass crashed" in caplog.text
+    # Faces failures never touch the breaker.
+    assert breaker.state is BreakerState.CLOSED
+
+
+# ---------------------------------------------------------------------------
 # mutation target: the pause setting must reach the faces pass
 # ---------------------------------------------------------------------------
 

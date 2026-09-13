@@ -335,15 +335,49 @@ def test_crop_bytes_matches_each_kept_face_s_own_crop_past_a_gate_rejection(tmp_
     store.close()
 
 
+class _TwoReasonsDetector:
+    """Returns two detections for every photo: one that fails the score
+    check and one that fails the box-size check, against
+    ``runner.QualityGate(min_score=0.5, min_box=10)`` below -- so a single
+    scanned photo exercises both rejection reasons at once.
+    """
+
+    model_name = "yunet"
+
+    def detect(self, image, score_threshold=0.6, nms_threshold=0.3):
+        return [
+            # score 0.2 < gate.min_score (0.5) -> "low_score".
+            Detection(
+                x=10.0, y=10.0, w=50.0, h=50.0, score=0.2,
+                landmarks=((20.0, 20.0), (40.0, 20.0), (30.0, 30.0),
+                           (22.0, 42.0), (38.0, 42.0)),
+            ),
+            # score 0.9 clears min_score, but min(w, h)=5 < gate.min_box (10)
+            # -> "too_small".
+            Detection(
+                x=80.0, y=10.0, w=5.0, h=5.0, score=0.9,
+                landmarks=((82.0, 12.0), (87.0, 12.0), (85.0, 14.0),
+                           (83.0, 17.0), (87.0, 17.0)),
+            ),
+        ]
+
+
 def test_rejected_face_reasons_are_distinguishable(library):
-    # A rejected-for-quality face and a rejected-for-degenerate-landmarks
-    # face must not collapse into the same opaque marker -- see
+    # A rejected-for-low-score face and a rejected-for-too-small face must
+    # not collapse into the same opaque marker -- see
     # imageharbor/faces/store.py's `faces.rejected` column, which exists
-    # precisely to carry a reason.
+    # precisely to carry a reason. `limit=1` scans just photo0 (digest0),
+    # which the fake detector above hands both rejection reasons at once;
+    # querying by digest (rather than `LIMIT 1` on the whole table, which
+    # could not tell two reasons apart from one) is what makes this
+    # assertion actually able to catch a reason collapse.
     dest, db, store = library
     cat = Catalog(db)
-    runner.scan(cat, store, FakeDetector(), FakeEmbedder(), dest / ".crops",
-                gate=runner.QualityGate(0.5, 999), limit=1)
+    runner.scan(cat, store, _TwoReasonsDetector(), FakeEmbedder(), dest / ".crops",
+                gate=runner.QualityGate(0.5, 10), limit=1)
     cat.close()
-    row = store._conn.execute("SELECT rejected FROM faces LIMIT 1").fetchone()
-    assert row["rejected"] is not None
+    rows = store._conn.execute(
+        "SELECT rejected FROM faces WHERE sha256_b64url=?", ("digest0",)
+    ).fetchall()
+    reasons = {row["rejected"] for row in rows}
+    assert reasons == {"low_score", "too_small"}
