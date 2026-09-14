@@ -22,6 +22,21 @@ STATUS_STALLED = "stalled"
 STATUS_COMPLETE = "complete"
 STATUS_UNKNOWN = "unknown"
 
+
+class _UnreadableType:
+    """A parse site read SOMETHING and could not interpret it -- distinct
+    from None (absent) and 0 (genuinely zero). Deferred issue #10: eight
+    defects in three review rounds were all one of these three meanings
+    standing in for another."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNREADABLE"
+
+
+UNREADABLE = _UnreadableType()
+
 # How many recent passes inform the rate. Small enough to reflect current
 # conditions, large enough that one slow pass does not dominate.
 RECENT_PASSES = 10
@@ -121,55 +136,93 @@ def _safe_delta_seconds(later: datetime, earlier: datetime) -> float | None:
     return (later - earlier).total_seconds()
 
 
-def _rate(parsed: _ParsedRun) -> float | None:
-    """Photos per hour for one completed pass, or None if it cannot be read.
+def _parse_enriched(value: Any) -> int | None | _UnreadableType:
+    """Coerce *value* (a run row's `enriched` field) to a non-negative count.
 
-    A pass still in flight (`ended_at` NULL/unparseable) is excluded rather
-    than treated as zero-length -- an unfinished pass is not evidence of a
-    rate. So is a row a crashed pass left behind, which is the same shape.
-    A row whose two timestamps disagree on timezone-awareness is likewise
-    excluded: it cannot be read, so it is not evidence either. Nor is a row
-    that finished in under `MIN_PASS_SECONDS`: a duration that short cannot
-    have measured a sustainable rate, so it is excluded rather than divided.
+    `None` means the pass's yield was never recorded at all (the key is
+    missing, or explicitly null) -- absent, not zero. `UNREADABLE` means a
+    value WAS recorded but cannot be read as a count (a non-numeric string,
+    a negative number). A real `0` means the pass genuinely enriched nothing
+    -- that is evidence a rate sample should include, not evidence to
+    discard. Collapsing "never recorded" into "recorded as zero" (the
+    previous behaviour, via `int(x or 0)`) silently invented a data point a
+    pass never reported.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float) and value != value:  # NaN != NaN
+            return UNREADABLE
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return UNREADABLE
+    if parsed < 0:
+        return UNREADABLE
+    return parsed
+
+
+def _rate(parsed: _ParsedRun) -> float | None | _UnreadableType:
+    """Photos per hour for one completed pass.
+
+    Three outcomes: `None` means the pass is simply not evidence yet -- it
+    is still in flight (`ended_at` is absent) or its yield was never
+    recorded (`enriched` is absent). `UNREADABLE` means the row HAS the
+    shape of a completed pass but something in it cannot be trusted: the two
+    timestamps disagree on timezone-awareness, the measured duration is
+    under `MIN_PASS_SECONDS` (too short to have measured a sustainable
+    rate -- noise amplified by a tiny denominator, see MIN_PASS_SECONDS
+    above), or `enriched` was recorded but isn't a readable count. Either
+    way the row contributes nothing to the rate sample -- the distinction
+    exists so a caller inspecting *why* can tell "nothing to see here" from
+    "this row is corrupt", not because the two are currently handled
+    differently.
     """
     if parsed.end is None:
         return None
     seconds = _safe_delta_seconds(parsed.end, parsed.start)
     if seconds is None:
-        return None
+        return UNREADABLE
     if seconds < MIN_PASS_SECONDS:
         # Sub-floor duration: not evidence of a rate, just noise amplified by
         # a tiny denominator. See MIN_PASS_SECONDS above for the reasoning.
-        return None
+        return UNREADABLE
     hours = seconds / 3600.0
     if hours <= 0:
+        return UNREADABLE
+    enriched = _parse_enriched(parsed.enriched_raw)
+    if enriched is None:
         return None
-    try:
-        enriched = int(parsed.enriched_raw or 0)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(enriched, _UnreadableType):
+        return UNREADABLE
     return enriched / hours
 
 
-def _parse_backlog(value: Any) -> int | None:
-    """Coerce *value* to a non-negative int backlog, or None if unreadable.
+def _parse_backlog(value: Any) -> int | None | _UnreadableType:
+    """Coerce *value* to a non-negative int backlog.
 
-    None is deliberately distinct from 0. `int(None)`/`int("abc")` raise, and
-    `int(float('nan'))` also raises (checked explicitly below rather than
-    assumed, since the exact failure mode of NaN-to-int is easy to get
-    wrong) -- all of those mean "we could not read the backlog", which is a
-    different fact than "the backlog is genuinely zero". A negative count is
-    equally nonsensical and is treated the same way: unreadable, not "done".
-    Only a value that actually parses to >= 0 is a real backlog.
+    Three outcomes, not two: `None` means no backlog value was supplied at
+    all -- e.g. the caller's own precomputation of the count failed and it
+    honestly handed us `None` rather than inventing a number (see
+    `dashboard/stats.py`'s `count_unenriched()` hand-off). `UNREADABLE` means
+    a value WAS supplied but cannot be interpreted as a count: `int("abc")`
+    raises, `int(float('nan'))` also raises (checked explicitly below rather
+    than assumed, since the exact failure mode of NaN-to-int is easy to get
+    wrong), and a negative count is equally nonsensical. Both `None` and
+    `UNREADABLE` mean "we could not establish a real backlog" -- a different
+    fact than "the backlog is genuinely zero" -- but they are not the SAME
+    fact: one is silence, the other is noise. Only a value that actually
+    parses to >= 0 is a real backlog.
     """
+    if value is None:
+        return None
     try:
         if isinstance(value, float) and value != value:  # NaN != NaN
-            return None
+            return UNREADABLE
         parsed = int(value)
     except (TypeError, ValueError, OverflowError):
-        return None
+        return UNREADABLE
     if parsed < 0:
-        return None
+        return UNREADABLE
     return parsed
 
 
@@ -184,7 +237,7 @@ def _format_age(seconds: float) -> str:
 
 def project(
     runs: Sequence[Any] | None,
-    backlog: Any,
+    backlog: int | None,
     *,
     breaker_open: bool,
     paused: bool,
@@ -224,9 +277,18 @@ def project(
 
     parsed_backlog = _parse_backlog(backlog)
     if parsed_backlog is None:
-        # Cannot tell how much work is outstanding -- this is "unknown", not
-        # "nothing outstanding". Reporting COMPLETE here is exactly the
+        # Absent, not unreadable: no backlog value was supplied at all (the
+        # caller's own count precomputation failed and passed that failure
+        # through honestly -- see `_parse_backlog`). Cannot tell how much
+        # work is outstanding -- this is "unknown", not "nothing
+        # outstanding". Reporting COMPLETE here is exactly the
         # confident-wrong-answer this module exists to refuse.
+        return Projection(0, None, None, STATUS_UNKNOWN,
+                          "no backlog value is available")
+    if isinstance(parsed_backlog, _UnreadableType):
+        # A value WAS supplied but could not be interpreted as a count --
+        # distinct from the absent case above, though it resolves to the
+        # same UNKNOWN status.
         return Projection(0, None, None, STATUS_UNKNOWN,
                           f"backlog value is unreadable: {backlog!r}")
     backlog = parsed_backlog
@@ -249,7 +311,10 @@ def project(
     window = parsed[:RECENT_PASSES]
 
     rated = [(p, _rate(p)) for p in window]
-    rates = [r for _, r in rated if r is not None]
+    # Both `None` (absent -- not evidence yet) and `UNREADABLE` (present but
+    # corrupt) mean the same thing to the rate sample: exclude it. Only a
+    # real numeric rate -- including a genuine 0.0 -- counts.
+    rates = [r for _, r in rated if isinstance(r, (int, float))]
 
     if len(rates) < MIN_SAMPLES:
         return Projection(backlog, None, None, STATUS_UNKNOWN,
@@ -257,7 +322,7 @@ def project(
 
     # Independent staleness defense: a history can be entirely well-formed
     # and still be too old to say anything about the present.
-    ends = [p.end for p, r in rated if r is not None and p.end is not None]
+    ends = [p.end for p, r in rated if isinstance(r, (int, float)) and p.end is not None]
     if isinstance(now, datetime):
         ages = [age for age in (_safe_delta_seconds(now, end) for end in ends) if age is not None]
     else:

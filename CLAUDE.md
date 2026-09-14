@@ -645,17 +645,29 @@ Module responsibilities:
     with `dict(row)` at the catalog boundary before rows reach `projections`
     or the JSON document — do the same at any new call site that crosses
     from a `sqlite3.Row` into code that expects a `Mapping`.
-  - **The projections module conflates readability with meaning — a known,
-    not-yet-fixed gap.** Across three review rounds, eight defects were found
-    in `projections.py`, every one an unreadable or implausible input (an
-    unparseable timestamp, a negative backlog, a sub-second pass duration, a
-    timezone-naive/aware mismatch) treated as if it were a valid one, because
-    `None`/`0`/an empty collection each did double duty for "absent",
-    "unreadable", *and* "genuinely zero" at different call sites. An explicit
-    `Unreadable` sentinel at each parse site, distinct from a real `None`
-    and a real `0`, would turn the next such defect into a type error
-    instead of a silent misread — this is a deliberate follow-up, not done
-    here.
+  - **The absent/unreadable/zero conflation is fixed (R5).** Across three
+    review rounds, eight defects were found in `projections.py`, every one
+    an unreadable or implausible input (an unparseable timestamp, a
+    negative backlog, a sub-second pass duration, a timezone-naive/aware
+    mismatch) treated as if it were a valid one, because `None`/`0`/an
+    empty collection each did double duty for "absent", "unreadable", *and*
+    "genuinely zero" at different call sites. `projections.py` now defines
+    a module-level `_UnreadableType` singleton, `UNREADABLE`: a parse site
+    read *something* and could not interpret it, distinct from `None`
+    (nothing was there to read) and a real `0`/`0.0` (a genuine, usable
+    measurement). `_parse_backlog`, `_parse_enriched`, and `_rate` return
+    `T | None | _UnreadableType` and `project()`'s decision points branch on
+    all three explicitly — e.g. a backlog of `None` (the caller's own count
+    query failed) and a backlog of `"abc"` (nonsense) both still report
+    `STATUS_UNKNOWN`, but for a distinguishable reason, while a genuine `0`
+    reports `STATUS_COMPLETE`; a run row's `enriched` field being absent no
+    longer silently reads as a recorded zero (the old `int(x or 0)`), so a
+    pass that never recorded its yield is excluded from the rate sample
+    instead of being counted as a real zero-rate pass. External behavior for
+    well-formed inputs is unchanged — this only replaced *why* a value was
+    excluded with a typed fact, not *whether* it was. See
+    `tests/test_dashboard_projections.py`'s absent/unreadable/zero triple
+    tests for the pinned three-way behavior at each converted site.
 - **`faces/`** — a third pass, independent of facts and enrichment, that
   detects faces, embeds and clusters them, and proposes person names from
   photos Google Photos already tagged. It makes **no AI-backend call and no

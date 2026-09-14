@@ -16,6 +16,10 @@ from imageharbor.dashboard.projections import (
     STATUS_PROJECTED,
     STATUS_STALLED,
     STATUS_UNKNOWN,
+    UNREADABLE,
+    _parse_enriched,
+    _ParsedRun,
+    _rate,
     project,
 )
 
@@ -260,3 +264,69 @@ def test_a_non_datetime_now_does_not_raise(bad_now) -> None:
     """
     p = project(_steady(), backlog=500, breaker_open=False, paused=False, now=bad_now)
     assert p.status == STATUS_UNKNOWN
+
+
+# --- the UNREADABLE sentinel: absent / unreadable / zero take distinct paths -
+
+
+def test_backlog_absent_unreadable_and_zero_take_distinct_paths() -> None:
+    """`None`, a non-numeric value, and `0` used to all funnel through the
+    same `_parse_backlog` return value (`None` for the first two). They are
+    now typed distinctly -- `None` (absent, e.g. the caller's own count
+    query failed) and `UNREADABLE` (a value was supplied but is nonsense)
+    both still report STATUS_UNKNOWN (a real backlog was never established
+    either way), but say so for a different, checkable reason; a genuine `0`
+    takes a completely different branch to STATUS_COMPLETE.
+    """
+    absent = project(_steady(), backlog=None, breaker_open=False, paused=False, now=NOW)
+    unreadable = project(_steady(), backlog="not-a-number",  # type: ignore[arg-type]
+                          breaker_open=False, paused=False, now=NOW)
+    zero = project(_steady(), backlog=0, breaker_open=False, paused=False, now=NOW)
+
+    assert absent.status == STATUS_UNKNOWN
+    assert "no backlog value is available" in absent.reason
+
+    assert unreadable.status == STATUS_UNKNOWN
+    assert "unreadable" in unreadable.reason.lower()
+
+    assert zero.status == STATUS_COMPLETE
+    assert zero.reason != absent.reason
+    assert zero.reason != unreadable.reason
+
+
+def test_parse_enriched_absent_unreadable_and_zero_are_distinct() -> None:
+    """A run row's `enriched` field: missing, garbage, and genuinely zero.
+
+    Previously `_rate` computed `int(x or 0)`, which silently treated a
+    missing `enriched` key exactly like a recorded zero. `_parse_enriched`
+    now tells the three apart: `None` (never recorded) and `UNREADABLE`
+    (recorded but unreadable) are not the same fact, and neither is the
+    same fact as a real, recorded `0`.
+    """
+    assert _parse_enriched(None) is None
+    assert _parse_enriched("not-a-number") is UNREADABLE
+    assert _parse_enriched(-1) is UNREADABLE
+    assert _parse_enriched(0) == 0
+
+
+def test_rate_absent_unreadable_and_zero_take_distinct_paths() -> None:
+    """`_rate`'s three outcomes for an otherwise-valid pass row.
+
+    Absent: the pass has no `ended_at` at all (still in flight) -- not
+    evidence of anything, yet. Unreadable: the pass finished, but its two
+    timestamps disagree on timezone-awareness, so the duration cannot be
+    trusted -- present, but corrupt. Zero: the pass finished with a real,
+    comparable, above-floor duration and genuinely enriched nothing -- a
+    real measurement a rate sample should include, not discard.
+    """
+    start = NOW
+
+    in_flight = _ParsedRun(start=start, end=None, enriched_raw=5)
+    assert _rate(in_flight) is None
+
+    naive_end = start.replace(tzinfo=None) + timedelta(minutes=10)
+    mismatched = _ParsedRun(start=start, end=naive_end, enriched_raw=5)
+    assert _rate(mismatched) is UNREADABLE
+
+    real_zero = _ParsedRun(start=start, end=start + timedelta(minutes=10), enriched_raw=0)
+    assert _rate(real_zero) == 0.0
