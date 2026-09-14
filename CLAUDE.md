@@ -700,7 +700,10 @@ Module responsibilities:
   - **`watch --faces` wiring.** `cli.py` builds one `Detector`/`Embedder`/
     `FaceStore` per run (loading an ONNX session is too expensive to repeat
     every poll) into a `watcher.FacesConfig`, then `watch()`'s third pass —
-    after facts and enrichment — runs `runner.scan` (per-photo, `should_stop`
+    after facts and enrichment, implemented as `watcher._run_faces_pass`
+    (called once per cycle, with its two log-once warning latches owned by
+    `watch()`'s scope via a small `_FacesPassState` so they survive across
+    calls) — runs `runner.scan` (per-photo, `should_stop`
     wired to the same pause check the other two passes use) and
     `runner.propagate_sidecars` every cycle, but calls `runner.build_clusters`
     — a whole-library operation — only when `FaceStore.unclustered_face_
