@@ -3,7 +3,6 @@
 import json
 import math
 
-import click
 import numpy as np
 import pytest
 from PIL import Image
@@ -63,7 +62,7 @@ def test_measure_threshold_uses_single_face_single_name_photos(store):
 
 def test_measure_threshold_needs_at_least_two_names(store):
     store.record_scan("d0", "yunet", [ScannedFace(_det(), _v([1, 0, 0]), "auraface")])
-    with pytest.raises(click.ClickException):
+    with pytest.raises(runner.InsufficientAnchorsError):
         runner.measure_threshold(store, {"d0": ["Emma"]}, embed_model="auraface",
                                  target_precision=0.99)
 

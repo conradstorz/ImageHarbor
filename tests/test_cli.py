@@ -517,7 +517,11 @@ def test_catalog_list_shows_dash_for_unenriched_rows(runner: CliRunner, tmp_path
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
     assert len(lines) == 2
     assert all("—" in ln for ln in lines)
-    assert not any("900" in ln for ln in lines)
+    # The lines embed organized paths under tmp_path; pytest's own temp-dir
+    # counter can contain "900" (e.g. pytest-9001), so strip the path before
+    # asserting no fake classification leaked into the listing.
+    sanitized = [ln.replace(str(tmp_path), "") for ln in lines]
+    assert not any("900" in ln for ln in sanitized)
 
 
 def test_catalog_list_shows_real_class_for_enriched_rows(runner: CliRunner, tmp_path: Path) -> None:

@@ -225,33 +225,33 @@ def test_source_seen_upsert_updates(catalog: Catalog) -> None:
 
 
 def test_taxonomy_seed_insert_get_children(catalog: Catalog) -> None:
-    assert catalog.taxonomy_is_empty() is True
-    catalog.taxonomy_insert("500", None, "events", "500-events")
-    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
-    assert catalog.taxonomy_is_empty() is False
-    row = catalog.taxonomy_get("540")
+    assert catalog.taxonomy_store.is_empty() is True
+    catalog.taxonomy_store.insert("500", None, "events", "500-events")
+    catalog.taxonomy_store.insert("540", "500", "holidays", "540-holidays")
+    assert catalog.taxonomy_store.is_empty() is False
+    row = catalog.taxonomy_store.get("540")
     assert row["label"] == "holidays"
     assert row["parent_code"] == "500"
-    kids = catalog.taxonomy_children("500")
+    kids = catalog.taxonomy_store.children("500")
     assert [k["code"] for k in kids] == ["540"]
-    tops = catalog.taxonomy_children(None)
+    tops = catalog.taxonomy_store.children(None)
     assert [t["code"] for t in tops] == ["500"]
 
 
 def test_taxonomy_set_alias(catalog: Catalog) -> None:
-    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
-    catalog.taxonomy_insert("550", "500", "festivities", "550-festivities")
-    catalog.taxonomy_set_alias("550", "540")
-    row = catalog.taxonomy_get("550")
+    catalog.taxonomy_store.insert("540", "500", "holidays", "540-holidays")
+    catalog.taxonomy_store.insert("550", "500", "festivities", "550-festivities")
+    catalog.taxonomy_store.set_alias("550", "540")
+    row = catalog.taxonomy_store.get("550")
     assert row["alias_of"] == "540"
     assert row["active"] == 0
 
 
 def test_taxonomy_set_aliases(catalog: Catalog) -> None:
     import json
-    catalog.taxonomy_insert("540", "500", "holidays", "540-holidays")
-    catalog.taxonomy_set_aliases("540", ["festivities", "xmas"])
-    assert json.loads(catalog.taxonomy_get("540")["aliases"]) == ["festivities", "xmas"]
+    catalog.taxonomy_store.insert("540", "500", "holidays", "540-holidays")
+    catalog.taxonomy_store.set_aliases("540", ["festivities", "xmas"])
+    assert json.loads(catalog.taxonomy_store.get("540")["aliases"]) == ["festivities", "xmas"]
 
 
 # ---------------------------------------------------------------------------
@@ -718,10 +718,10 @@ def test_reopening_a_v2_catalog_is_a_noop(tmp_path):
 
 def test_takeout_archive_roundtrip(tmp_path) -> None:
     with Catalog(tmp_path / "c.db") as cat:
-        cat.takeout_archive_upsert(
+        cat.takeout.archive_upsert(
             archive_id="A" * 43, last_path="/nas/t1.zip", size=79, mtime_ns=1, member_count=196
         )
-        row = cat.takeout_archive_get("A" * 43)
+        row = cat.takeout.archive_get("A" * 43)
         assert row["status"] == "partial"
         assert row["member_count"] == 196
         assert row["last_path"] == "/nas/t1.zip"
@@ -729,12 +729,12 @@ def test_takeout_archive_roundtrip(tmp_path) -> None:
 
 def test_takeout_archive_stat_fast_path(tmp_path) -> None:
     with Catalog(tmp_path / "c.db") as cat:
-        cat.takeout_archive_upsert(
+        cat.takeout.archive_upsert(
             archive_id="A" * 43, last_path="/nas/t1.zip", size=79, mtime_ns=1
         )
-        assert cat.takeout_archive_get_by_stat("/nas/t1.zip", 79, 1)["archive_id"] == "A" * 43
-        assert cat.takeout_archive_get_by_stat("/nas/t1.zip", 79, 2) is None
-        assert cat.takeout_archive_get_by_stat("/other.zip", 79, 1) is None
+        assert cat.takeout.archive_get_by_stat("/nas/t1.zip", 79, 1)["archive_id"] == "A" * 43
+        assert cat.takeout.archive_get_by_stat("/nas/t1.zip", 79, 2) is None
+        assert cat.takeout.archive_get_by_stat("/other.zip", 79, 1) is None
 
 
 def test_takeout_archive_upsert_updates_location_not_identity(tmp_path, monkeypatch) -> None:
@@ -750,15 +750,15 @@ def test_takeout_archive_upsert_updates_location_not_identity(tmp_path, monkeypa
     timestamps = iter(["2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"])
     monkeypatch.setattr(catalog_module, "_now_iso", lambda: next(timestamps))
     with Catalog(tmp_path / "c.db") as cat:
-        cat.takeout_archive_upsert(
+        cat.takeout.archive_upsert(
             archive_id="A" * 43, last_path="/old/t1.zip", size=79, mtime_ns=1
         )
-        first_seen_at = cat.takeout_archive_get("A" * 43)["first_seen_at"]
-        cat.takeout_archive_upsert(
+        first_seen_at = cat.takeout.archive_get("A" * 43)["first_seen_at"]
+        cat.takeout.archive_upsert(
             archive_id="A" * 43, last_path="/new/t1.zip", size=79, mtime_ns=9
         )
-        assert len(cat.takeout_archives_all()) == 1
-        row = cat.takeout_archive_get("A" * 43)
+        assert len(cat.takeout.archives_all()) == 1
+        row = cat.takeout.archive_get("A" * 43)
         assert row["last_path"] == "/new/t1.zip"
         assert row["first_seen_at"] == first_seen_at
         assert row["last_seen_at"] != first_seen_at
@@ -767,16 +767,16 @@ def test_takeout_archive_upsert_updates_location_not_identity(tmp_path, monkeypa
 def test_takeout_member_add_never_resets_a_terminal_status(tmp_path) -> None:
     """Re-surveying an archive must not drag ingested members back to pending."""
     with Catalog(tmp_path / "c.db") as cat:
-        cat.takeout_member_add(
+        cat.takeout.member_add(
             archive_id="A" * 43, member_path="a/b.jpg", kind="image",
             size=10, crc32=1, status="pending",
         )
-        cat.takeout_member_set("A" * 43, "a/b.jpg", status="ingested", sha256_b64url="D" * 43)
-        cat.takeout_member_add(
+        cat.takeout.member_set("A" * 43, "a/b.jpg", status="ingested", sha256_b64url="D" * 43)
+        cat.takeout.member_add(
             archive_id="A" * 43, member_path="a/b.jpg", kind="image",
             size=10, crc32=1, status="pending",
         )
-        rows = cat.takeout_members_all("A" * 43)
+        rows = cat.takeout.members_all("A" * 43)
         assert len(rows) == 1
         assert rows[0]["status"] == "ingested"
         assert rows[0]["sha256_b64url"] == "D" * 43
@@ -789,23 +789,23 @@ def test_takeout_members_pending_returns_pending_and_failed_only(tmp_path) -> No
             ("d.jpg", "duplicate"), ("v.mp4", "deferred"), ("m.json", "parsed"),
             ("o.txt", "ignored"), ("t.jpg", "skipped_trash"),
         ):
-            cat.takeout_member_add(
+            cat.takeout.member_add(
                 archive_id="A" * 43, member_path=name, kind="image",
                 size=1, crc32=1, status=status,
             )
-        assert {r["member_path"] for r in cat.takeout_members_pending("A" * 43)} == {
+        assert {r["member_path"] for r in cat.takeout.members_pending("A" * 43)} == {
             "p.jpg", "f.jpg",
         }
 
 
 def test_takeout_members_unskip_trash(tmp_path) -> None:
     with Catalog(tmp_path / "c.db") as cat:
-        cat.takeout_member_add(
+        cat.takeout.member_add(
             archive_id="A" * 43, member_path="Trash/x.jpg", kind="image",
             size=1, crc32=1, status="skipped_trash",
         )
-        assert cat.takeout_members_unskip_trash("A" * 43) == 1
-        assert cat.takeout_members_pending("A" * 43)[0]["member_path"] == "Trash/x.jpg"
+        assert cat.takeout.members_unskip_trash("A" * 43) == 1
+        assert cat.takeout.members_pending("A" * 43)[0]["member_path"] == "Trash/x.jpg"
 
 
 def test_takeout_members_unskip_trash_is_kind_aware(tmp_path) -> None:
@@ -815,34 +815,34 @@ def test_takeout_members_unskip_trash_is_kind_aware(tmp_path) -> None:
     queue forever and the archive would never reach 'complete'.
     """
     with Catalog(tmp_path / "c.db") as cat:
-        cat.takeout_member_add(
+        cat.takeout.member_add(
             archive_id="A" * 43, member_path="Trash/x.jpg", kind="image",
             size=1, crc32=1, status="skipped_trash",
         )
-        cat.takeout_member_add(
+        cat.takeout.member_add(
             archive_id="A" * 43, member_path="Trash/x.jpg.json", kind="metadata",
             size=1, crc32=1, status="skipped_trash",
         )
-        assert cat.takeout_members_unskip_trash("A" * 43) == 2
-        rows = {r["member_path"]: r["status"] for r in cat.takeout_members_all("A" * 43)}
+        assert cat.takeout.members_unskip_trash("A" * 43) == 2
+        rows = {r["member_path"]: r["status"] for r in cat.takeout.members_all("A" * 43)}
         assert rows["Trash/x.jpg"] == "pending"
         assert rows["Trash/x.jpg.json"] == "parsed"
 
 
 def test_takeout_status_counts(tmp_path) -> None:
     with Catalog(tmp_path / "c.db") as cat:
-        cat.takeout_archive_upsert(
+        cat.takeout.archive_upsert(
             archive_id="A" * 43, last_path="/t1.zip", size=1, mtime_ns=1, status="complete"
         )
-        cat.takeout_member_add(
+        cat.takeout.member_add(
             archive_id="A" * 43, member_path="a.jpg", kind="image",
             size=1, crc32=1, status="ingested",
         )
-        cat.takeout_member_add(
+        cat.takeout.member_add(
             archive_id="A" * 43, member_path="b.mp4", kind="video",
             size=1, crc32=1, status="deferred",
         )
-        counts = cat.takeout_status_counts()
+        counts = cat.takeout.status_counts()
         assert counts["archives"]["complete"] == 1
         assert counts["members"]["ingested"] == 1
         assert counts["members"]["deferred"] == 1
@@ -855,12 +855,12 @@ def test_takeout_tables_do_not_bump_the_schema_version(tmp_path) -> None:
 
     assert SCHEMA_VERSION == "2"
     with Catalog(tmp_path / "c.db") as cat:
-        cat.takeout_archive_upsert(
+        cat.takeout.archive_upsert(
             archive_id="A" * 43, last_path="/t.zip", size=1, mtime_ns=1
         )
     # Reopening must not raise LegacyCatalogError or lose the row.
     with Catalog(tmp_path / "c.db") as cat:
-        assert cat.takeout_archive_get("A" * 43) is not None
+        assert cat.takeout.archive_get("A" * 43) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1195,3 +1195,46 @@ def test_concurrent_reads_and_writes_from_multiple_threads_raise_nothing(tmp_pat
         )
     finally:
         cat.close()
+
+
+# ---------------------------------------------------------------------------
+# run_select -- Task 3: the sanctioned guarded read door for the dashboard's
+# ad hoc aggregate SQL, retiring the `catalog._conn` reach-ins.
+# ---------------------------------------------------------------------------
+
+
+def test_run_select_returns_rows(catalog: Catalog) -> None:
+    digest = _fake_digest(1)
+    catalog.upsert(
+        sha256_b64url=digest,
+        original_path="/photos/beach.jpg",
+        organized_path="/organized/beach.jpg",
+    )
+    rows = catalog.run_select(
+        "SELECT sha256_b64url AS digest FROM photos WHERE sha256_b64url = ?",
+        (digest,),
+    )
+    assert [dict(r)["digest"] for r in rows] == [digest]
+
+
+def test_run_select_rejects_update(catalog: Catalog) -> None:
+    with pytest.raises(ValueError):
+        catalog.run_select("UPDATE photos SET organized_path = NULL")
+
+
+def test_run_select_rejects_pragma(catalog: Catalog) -> None:
+    with pytest.raises(ValueError):
+        catalog.run_select("PRAGMA table_info(photos)")
+
+
+def test_run_select_accepts_leading_whitespace_and_lowercase_select(
+    catalog: Catalog,
+) -> None:
+    rows = catalog.run_select("  select 1 as n")
+    assert rows[0]["n"] == 1
+
+
+def test_run_select_works_reentrantly_inside_catalog_lock(catalog: Catalog) -> None:
+    with catalog.lock:
+        rows = catalog.run_select("select 1 as n")
+    assert rows[0]["n"] == 1

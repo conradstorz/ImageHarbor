@@ -6,11 +6,16 @@ meaningfully, so a reader never has to check which one is in scope."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from imageharbor.catalog import Catalog
+
+if TYPE_CHECKING:
+    from imageharbor.faces.store import FaceStore
 
 
 def _make_jpeg(
@@ -25,7 +30,7 @@ def _make_jpeg(
 
 
 @pytest.fixture()
-def catalog(tmp_path: Path) -> Catalog:
+def catalog(tmp_path: Path) -> Iterator[Catalog]:
     cat = Catalog(tmp_path / "catalog.db")
     yield cat
     cat.close()
@@ -57,7 +62,7 @@ def dirs(tmp_path: Path):
 
 
 @pytest.fixture()
-def store(tmp_path: Path):
+def store(tmp_path: Path) -> Iterator[FaceStore]:
     # Imported here, not at module level (R4 review Minor #4): a missing
     # numpy (faces' only hard runtime dependency) should only take down
     # collection of the faces/dashboard modules that actually use this

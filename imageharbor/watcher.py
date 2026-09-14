@@ -358,6 +358,145 @@ def _failed_buffer_from_digests(
     return buffer
 
 
+@dataclass
+class _FacesPassState:
+    """Log-once-per-run warning latches for `_run_faces_pass`.
+
+    Created once before `watch()`'s loop and passed into `_run_faces_pass`
+    on every cycle, so a latch set on one cycle stays set on the next --
+    both conditions are permanent-until-fixed (the extra stays uninstalled,
+    or the threshold stays unset, until an operator acts), so warning again
+    every cycle would flood the log for as long as that stays true instead
+    of saying it once.
+    """
+
+    unavailable_warned: bool = False
+    no_threshold_warned: bool = False
+
+
+def _run_faces_pass(
+    *,
+    catalog: Catalog,
+    control: "ControlPlane | None",
+    faces_enabled: bool,
+    face_config: FacesConfig | None,
+    state: _FacesPassState,
+    wstats: WatchStats,
+) -> None:
+    """Run the third, independent faces pass for one `watch()` cycle, if enabled.
+
+    Mutates *wstats* (`faces_scanned`/`faces_found`/`faces_rejected`/
+    `faces_errors`) and *state* (the two log-once-per-run warning latches)
+    in place -- see `watch()`'s own docstring for the full behavior this
+    implements (availability/threshold warnings, recluster gating, etc.).
+
+    Deliberately takes no circuit-tripping parameter and consults none: a
+    face-scan failure is recorded by `runner.scan` into `failed_files` as
+    local evidence, never as AI-perception evidence about the classifier
+    backend that other circuit is reserved for. A crash anywhere in this
+    pass is caught here and logged, never allowed to take the watch loop
+    down with it -- same "one bad phase doesn't kill the process" rule
+    `run_once`'s own try/except enforces for facts/enrichment.
+    """
+    pass_faces_enabled = (
+        control.faces_enabled if control is not None else faces_enabled
+    )
+    if not (pass_faces_enabled and face_config is not None):
+        return
+    try:
+        if not faces_available():
+            if not state.unavailable_warned:
+                logger.warning(
+                    "faces enabled but the 'faces' extra is not "
+                    "installed (uv sync --extra faces); organizing "
+                    "and enrichment continue, the faces pass is "
+                    "skipped until it is",
+                )
+                state.unavailable_warned = True
+        else:
+            from .faces import runner as face_runner
+
+            face_result = face_runner.scan(
+                catalog,
+                face_config.store,
+                face_config.detector,
+                face_config.embedder,
+                face_config.crop_dir,
+                gate=face_config.gate,
+                should_stop=(
+                    control.pause_check if control is not None else None
+                ),
+            )
+            face_runner.propagate_sidecars(
+                face_config.store,
+                face_config.dest,
+                face_config.detector.model_name,
+            )
+
+            embed_model = face_config.embedder.model_name
+            unclustered = face_config.store.unclustered_face_count(embed_model)
+            # `not face_config.store.cluster_ids()` used to be
+            # unconditional and unscoped -- on a library where every
+            # detected face is gate-rejected (or nothing has ever
+            # been scanned), `unclustered` stays 0 forever and no
+            # cluster is ever produced for *this* embed_model, so
+            # that clause was True on every single cycle: an
+            # unbounded spin re-running `google_names` (a full
+            # `rglob`) each time for a library that structurally has
+            # nothing to cluster. Requiring `unclustered > 0` closes
+            # that; scoping `cluster_ids` by `embed_model` fixes the
+            # sibling bug where a stale cluster left behind by a
+            # since-abandoned embed_model masked a genuine "no
+            # clusters yet" for the current one.
+            recluster_due = unclustered > face_config.recluster_threshold or (
+                unclustered > 0
+                and not face_config.store.cluster_ids(embed_model)
+            )
+            if recluster_due:
+                if face_config.cluster_threshold is None:
+                    if not state.no_threshold_warned:
+                        logger.warning(
+                            "faces: %d unclustered face(s) but no "
+                            "cluster threshold is configured -- run "
+                            "`imageharbor faces calibrate` and set "
+                            "IMAGEHARBOR_FACE_THRESHOLD; clustering "
+                            "is skipped until it is (scanning and "
+                            "sidecar propagation continue)",
+                            unclustered,
+                        )
+                        state.no_threshold_warned = True
+                else:
+                    photo_names = face_runner.google_names(face_config.dest)
+                    face_runner.build_clusters(
+                        face_config.store,
+                        photo_names,
+                        embed_model=embed_model,
+                        threshold=face_config.cluster_threshold,
+                        min_score=face_config.cluster_min_score,
+                        min_support=face_config.cluster_min_support,
+                    )
+
+            wstats.faces_scanned += face_result.scanned
+            wstats.faces_found += face_result.faces
+            wstats.faces_rejected += face_result.rejected
+            wstats.faces_errors += face_result.errors
+            logger.info(
+                "faces pass %d: scanned=%d faces=%d rejected=%d errors=%d",
+                wstats.passes,
+                face_result.scanned,
+                face_result.faces,
+                face_result.rejected,
+                face_result.errors,
+            )
+    except Exception:
+        logger.exception(
+            "watch pass %d: faces pass crashed; organizing and "
+            "enrichment are unaffected and the loop continues to "
+            "the next pass",
+            wstats.passes,
+        )
+
+
 def run_once(
     source: Path,
     dest: Path,
@@ -510,20 +649,19 @@ def run_once(
                 # unknowable here; only the crash itself is recorded.
                 row_stats = enrich_stats if enrich_stats is not None else EnrichStats()
                 row_errors = row_stats.errors + (1 if enrich_crashed else 0)
-                # IMPORTANT finding #7 (2026-08-19 whole-branch review): this
-                # used to pass `row_errors` into BOTH `errors` and
-                # `enrich_failed`, so the dashboard history panel's 24h error
-                # figure (which sums `errors` across runs -- see
-                # `dashboard/stats.py`'s `_window_summary`) counted every
-                # enrichment failure twice: once as itself (`enrich_failed`)
-                # and once again as if it were a facts-phase error
-                # (`errors`). `errors` on a `runs` row means "facts-phase
-                # errors"; an 'enrich'-kind row has no facts phase at all, so
-                # it is always 0 here. `enrich_failed` alone carries every
+                # `errors` on a `runs` row means "facts-phase errors"; an
+                # 'enrich'-kind row has no facts phase at all, so it is
+                # always 0 here. `enrich_failed` alone carries every
                 # AI-perception and post-perception failure this pass hit
                 # (`EnrichStats.errors`, which already sums `ai_failed` +
                 # `io_failed`, plus the crash-in-flight count) -- see
-                # `EnrichStats`'s own fields in enrich.py.
+                # `EnrichStats`'s own fields in enrich.py. Never pass
+                # `row_errors` into both `errors` and `enrich_failed`: the
+                # dashboard history panel's 24h error figure sums `errors`
+                # across runs (`dashboard/stats.py`'s `_window_summary`), and
+                # doing so double-counts every enrichment failure -- once as
+                # itself (`enrich_failed`) and once again as if it were a
+                # facts-phase error (`errors`).
                 # Split (deferred #13): `row_stats.ai_failed` is exactly the
                 # AI-perception failures (classifier.describe()/pick_class()
                 # calls); everything else in `row_errors` is local-work
@@ -686,10 +824,10 @@ def watch(
     # the life of this `watch()` call -- both are permanent-until-fixed
     # states (the extra stays uninstalled, or the threshold stays unset,
     # until an operator acts), so warning again every cycle would flood the
-    # log for as long as that stays true instead of saying it once. See the
-    # faces-pass block below and this function's own docstring.
-    faces_unavailable_warned = False
-    faces_no_threshold_warned = False
+    # log for as long as that stays true instead of saying it once. Owned
+    # here (not inside `_run_faces_pass`) so the latches survive extraction
+    # across cycles -- see `_FacesPassState` and `_run_faces_pass`.
+    faces_pass_state = _FacesPassState()
     while not stop_event.is_set():
         # Read the pause flag fresh every iteration -- see the docstring
         # above for why a value captured once at startup would silently
@@ -803,113 +941,19 @@ def watch(
         )
 
         # -- faces pass (third, independent pass) --------------------------
-        # Read fresh every iteration, same as pause/interval/enrich_enabled
-        # above: a dashboard toggle must take effect on the very next cycle,
-        # not stay frozen at whatever `watch()` was started with.
-        pass_faces_enabled = (
-            control.faces_enabled if control is not None else faces_enabled
+        # `faces_enabled`/`control.faces_enabled` is re-read fresh inside
+        # `_run_faces_pass` on every call, same as pause/interval/
+        # enrich_enabled above: a dashboard toggle must take effect on the
+        # very next cycle, not stay frozen at whatever `watch()` was started
+        # with.
+        _run_faces_pass(
+            catalog=catalog,
+            control=control,
+            faces_enabled=faces_enabled,
+            face_config=face_config,
+            state=faces_pass_state,
+            wstats=wstats,
         )
-        if pass_faces_enabled and face_config is not None:
-            # A face-pass crash (as opposed to a per-photo failure, which
-            # `runner.scan` already catches and records into `failed_files`
-            # itself) must not take the whole watch loop down with it --
-            # same "one bad phase doesn't kill the process" rule `run_once`'s
-            # own try/except enforces for facts/enrichment above. Never
-            # touches *breaker*: that circuit is reserved for
-            # `AIClassifier.describe()` failures, and nothing in this block
-            # references it.
-            try:
-                if not faces_available():
-                    if not faces_unavailable_warned:
-                        logger.warning(
-                            "faces enabled but the 'faces' extra is not "
-                            "installed (uv sync --extra faces); organizing "
-                            "and enrichment continue, the faces pass is "
-                            "skipped until it is",
-                        )
-                        faces_unavailable_warned = True
-                else:
-                    from .faces import runner as face_runner
-
-                    face_result = face_runner.scan(
-                        catalog,
-                        face_config.store,
-                        face_config.detector,
-                        face_config.embedder,
-                        face_config.crop_dir,
-                        gate=face_config.gate,
-                        should_stop=(
-                            control.pause_check if control is not None else None
-                        ),
-                    )
-                    face_runner.propagate_sidecars(
-                        face_config.store,
-                        face_config.dest,
-                        face_config.detector.model_name,
-                    )
-
-                    embed_model = face_config.embedder.model_name
-                    unclustered = face_config.store.unclustered_face_count(embed_model)
-                    # `not face_config.store.cluster_ids()` used to be
-                    # unconditional and unscoped -- on a library where every
-                    # detected face is gate-rejected (or nothing has ever
-                    # been scanned), `unclustered` stays 0 forever and no
-                    # cluster is ever produced for *this* embed_model, so
-                    # that clause was True on every single cycle: an
-                    # unbounded spin re-running `google_names` (a full
-                    # `rglob`) each time for a library that structurally has
-                    # nothing to cluster. Requiring `unclustered > 0` closes
-                    # that; scoping `cluster_ids` by `embed_model` fixes the
-                    # sibling bug where a stale cluster left behind by a
-                    # since-abandoned embed_model masked a genuine "no
-                    # clusters yet" for the current one.
-                    recluster_due = unclustered > face_config.recluster_threshold or (
-                        unclustered > 0
-                        and not face_config.store.cluster_ids(embed_model)
-                    )
-                    if recluster_due:
-                        if face_config.cluster_threshold is None:
-                            if not faces_no_threshold_warned:
-                                logger.warning(
-                                    "faces: %d unclustered face(s) but no "
-                                    "cluster threshold is configured -- run "
-                                    "`imageharbor faces calibrate` and set "
-                                    "IMAGEHARBOR_FACE_THRESHOLD; clustering "
-                                    "is skipped until it is (scanning and "
-                                    "sidecar propagation continue)",
-                                    unclustered,
-                                )
-                                faces_no_threshold_warned = True
-                        else:
-                            photo_names = face_runner.google_names(face_config.dest)
-                            face_runner.build_clusters(
-                                face_config.store,
-                                photo_names,
-                                embed_model=embed_model,
-                                threshold=face_config.cluster_threshold,
-                                min_score=face_config.cluster_min_score,
-                                min_support=face_config.cluster_min_support,
-                            )
-
-                    wstats.faces_scanned += face_result.scanned
-                    wstats.faces_found += face_result.faces
-                    wstats.faces_rejected += face_result.rejected
-                    wstats.faces_errors += face_result.errors
-                    logger.info(
-                        "faces pass %d: scanned=%d faces=%d rejected=%d errors=%d",
-                        wstats.passes,
-                        face_result.scanned,
-                        face_result.faces,
-                        face_result.rejected,
-                        face_result.errors,
-                    )
-            except Exception:
-                logger.exception(
-                    "watch pass %d: faces pass crashed; organizing and "
-                    "enrichment are unaffected and the loop continues to "
-                    "the next pass",
-                    wstats.passes,
-                )
 
         if stop_event.is_set():
             break

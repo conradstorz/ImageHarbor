@@ -506,3 +506,39 @@ def test_organized_path_is_none_when_photos_table_does_not_exist(tmp_path):
     store = FaceStore(db)
     assert store.organized_path_for("d") is None
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# run_select -- Task 3: the sanctioned guarded read door for the dashboard's
+# ad hoc aggregate SQL, retiring the `store._conn` reach-ins.
+# ---------------------------------------------------------------------------
+
+
+def test_run_select_returns_rows(store):
+    store.record_scan("digestA", "yunet", [ScannedFace(_det(), _vec([1, 0, 0]), "auraface")])
+    rows = store.run_select(
+        "SELECT sha256_b64url AS digest FROM face_scan WHERE sha256_b64url = ?",
+        ("digestA",),
+    )
+    assert [dict(r)["digest"] for r in rows] == ["digestA"]
+
+
+def test_run_select_rejects_update(store):
+    with pytest.raises(ValueError):
+        store.run_select("UPDATE faces SET rejected = 'x'")
+
+
+def test_run_select_rejects_pragma(store):
+    with pytest.raises(ValueError):
+        store.run_select("PRAGMA table_info(faces)")
+
+
+def test_run_select_accepts_leading_whitespace_and_lowercase_select(store):
+    rows = store.run_select("  select 1 as n")
+    assert rows[0]["n"] == 1
+
+
+def test_run_select_works_reentrantly_inside_store_lock(store):
+    with store.lock:
+        rows = store.run_select("select 1 as n")
+    assert rows[0]["n"] == 1

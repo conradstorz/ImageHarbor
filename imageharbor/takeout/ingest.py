@@ -356,103 +356,7 @@ class _Ingestor:
                 self.stats.index_path = candidate
 
         for path in archive_paths:
-            self.stats.archives_seen += 1
-            identity = archive.identify(path, self.catalog)
-
-            if identity.archive_id in seen_archive_ids:
-                # The same archive reachable at two paths -- a kept
-                # re-download, typically. Surveying it twice would append its
-                # member list to `all_members` a second time, and
-                # `pairing.build_index` cannot tell "same archive, listed
-                # twice" from "two archives sharing a path": it would flag
-                # every media path as ambiguous and decline to pair ANY of
-                # them, dropping the whole batch into Undated/.
-                logger.info(
-                    "Skipping %s: same archive already surveyed at another path",
-                    path.name,
-                )
-                self.stats.archives_skipped += 1
-                continue
-            seen_archive_ids.add(identity.archive_id)
-
-            # Counted once per archive identity actually surveyed this run --
-            # a stale or missing index must never be silent about which
-            # archives it covered.
-            if self.index_path is not None:
-                if self.index is not None and self.index.covers(identity.path.name):
-                    self.stats.index_archives_covered += 1
-                else:
-                    self.stats.index_archives_fell_back += 1
-
-            row = self.catalog.takeout_archive_get(identity.archive_id)
-
-            if row is not None and row["status"] == "complete":
-                reopened = False
-                if self.include_trash and not self.dry_run:
-                    # A user who changes their mind must not be blocked by the
-                    # terminal status an earlier run recorded.
-                    moved = self.catalog.takeout_members_unskip_trash(identity.archive_id)
-                    if moved:
-                        self.catalog.takeout_archive_set_status(
-                            identity.archive_id, "partial"
-                        )
-                        self.stats.archives_reopened += 1
-                        reopened = True
-                if not reopened:
-                    # A complete archive still contributes its member paths to
-                    # the pairing index, and is re-examined in the second pass
-                    # below once the index exists. Member paths come from the
-                    # catalog, so no zip is opened and nothing is decompressed.
-                    rows = self.catalog.takeout_members_all(identity.archive_id)
-                    for db_member in rows:
-                        all_members.append(db_member["member_path"])
-                        self.owner[db_member["member_path"]] = path
-                    completed.append((identity, rows))
-                    continue
-
-            try:
-                with zipfile.ZipFile(path, "r") as zf:
-                    members = list(archive.iter_members(zf))
-            except (zipfile.BadZipFile, OSError) as exc:
-                logger.error("Archive %s is unreadable: %s", path.name, exc)
-                self.stats.archives_corrupt += 1
-                if not self.dry_run:
-                    self.catalog.takeout_archive_upsert(
-                        archive_id=identity.archive_id,
-                        last_path=str(path),
-                        size=identity.size,
-                        mtime_ns=identity.mtime_ns,
-                        status="corrupt",
-                        last_error=str(exc),
-                    )
-                continue
-
-            if not self.dry_run:
-                self.catalog.takeout_archive_upsert(
-                    archive_id=identity.archive_id,
-                    last_path=str(path),
-                    size=identity.size,
-                    mtime_ns=identity.mtime_ns,
-                    member_count=len(members),
-                    status="partial",
-                )
-                for member in members:
-                    self.catalog.takeout_member_add(
-                        archive_id=identity.archive_id,
-                        member_path=member.path,
-                        kind=member.kind,
-                        size=member.size,
-                        crc32=member.crc32,
-                        status=_initial_status(member, self.include_trash),
-                    )
-
-            for member in members:
-                all_members.append(member.path)
-                self.owner[member.path] = path
-                if _initial_status(member, self.include_trash) == _SKIPPED_TRASH:
-                    self.stats.skipped_trash += 1
-
-            todo.append((identity, members))
+            self._survey_enumerate_archive(path, seen_archive_ids, all_members, todo, completed)
 
         # ONE index across every archive in the batch. Google's multi-part
         # zips split by size across the file list, so a photo and its sidecar
@@ -502,24 +406,178 @@ class _Ingestor:
                 claimed.add(pairing_result.sidecar)
         self._claimed_sidecars = frozenset(claimed)
 
-        # SECOND PASS -- the late-sidecar case, and the reason the survey has
-        # two passes at all.
-        #
-        # Contributing a complete archive's member paths to the index (above)
-        # only solves ONE ordering: sidecars ingested first, the photos they
-        # describe arriving later. The opposite order is the common one -- you
-        # download part 1, ingest it, and its photos land in Undated/ because
-        # their sidecars are in part 2 which you have not downloaded yet. When
-        # part 2 arrives, part 1 is `complete`, so without this pass nothing
-        # would ever revisit those photos and they would stay Undated/ forever.
-        #
-        # A member is reopened only when it demonstrably gained something: it
-        # is an image or a video, it has no sidecar on record, and the index
-        # NOW resolves one for it. Re-ingesting it makes its bytes hash as a
-        # duplicate, which routes through `_maybe_upgrade_from_duplicate` and
-        # relocates the file -- no new placement code, exactly as designed.
-        # The check is pure string work against an in-memory index, so an
-        # archive that never gains metadata costs nothing to re-examine.
+        self._survey_second_pass_late_sidecars(completed, todo)
+
+        return todo
+
+    def _survey_enumerate_archive(
+        self,
+        path: Path,
+        seen_archive_ids: set[str],
+        all_members: list[str],
+        todo: list[tuple[archive.ArchiveIdentity, list[archive.MemberInfo]]],
+        completed: list[tuple[archive.ArchiveIdentity, list]],
+    ) -> None:
+        """Identify and enumerate one archive during `_survey`'s first pass.
+
+        Consumes one archive `path` plus the accumulators `_survey` is
+        building across the whole batch (`seen_archive_ids`, `all_members`,
+        `todo`, `completed`), and appends into them in place exactly as the
+        inline loop body used to. Mutates `self.stats` (seen/skipped/
+        reopened/corrupt and index-coverage counters) and `self.owner`, and
+        writes through to the catalog (`archive_upsert`/`member_add`/
+        `members_unskip_trash`/`archive_set_status`) for a partial or corrupt
+        archive. A duplicate archive identity, an already-`complete` archive
+        not reopened for trash (delegated to
+        `_survey_pass_one_recorded_members`), and a corrupt archive each
+        return early having done nothing further -- the same three points
+        where the original loop's `continue` moved on to the next path.
+        """
+        self.stats.archives_seen += 1
+        identity = archive.identify(path, self.catalog)
+
+        if identity.archive_id in seen_archive_ids:
+            # The same archive reachable at two paths -- a kept
+            # re-download, typically. Surveying it twice would append its
+            # member list to `all_members` a second time, and
+            # `pairing.build_index` cannot tell "same archive, listed
+            # twice" from "two archives sharing a path": it would flag
+            # every media path as ambiguous and decline to pair ANY of
+            # them, dropping the whole batch into Undated/.
+            logger.info(
+                "Skipping %s: same archive already surveyed at another path",
+                path.name,
+            )
+            self.stats.archives_skipped += 1
+            return
+        seen_archive_ids.add(identity.archive_id)
+
+        # Counted once per archive identity actually surveyed this run --
+        # a stale or missing index must never be silent about which
+        # archives it covered.
+        if self.index_path is not None:
+            if self.index is not None and self.index.covers(identity.path.name):
+                self.stats.index_archives_covered += 1
+            else:
+                self.stats.index_archives_fell_back += 1
+
+        row = self.catalog.takeout.archive_get(identity.archive_id)
+
+        if row is not None and row["status"] == "complete":
+            reopened = False
+            if self.include_trash and not self.dry_run:
+                # A user who changes their mind must not be blocked by the
+                # terminal status an earlier run recorded.
+                moved = self.catalog.takeout.members_unskip_trash(identity.archive_id)
+                if moved:
+                    self.catalog.takeout.archive_set_status(
+                        identity.archive_id, "partial"
+                    )
+                    self.stats.archives_reopened += 1
+                    reopened = True
+            if not reopened:
+                self._survey_pass_one_recorded_members(identity, path, all_members, completed)
+                return
+
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                members = list(archive.iter_members(zf))
+        except (zipfile.BadZipFile, OSError) as exc:
+            logger.error("Archive %s is unreadable: %s", path.name, exc)
+            self.stats.archives_corrupt += 1
+            if not self.dry_run:
+                self.catalog.takeout.archive_upsert(
+                    archive_id=identity.archive_id,
+                    last_path=str(path),
+                    size=identity.size,
+                    mtime_ns=identity.mtime_ns,
+                    status="corrupt",
+                    last_error=str(exc),
+                )
+            return
+
+        if not self.dry_run:
+            self.catalog.takeout.archive_upsert(
+                archive_id=identity.archive_id,
+                last_path=str(path),
+                size=identity.size,
+                mtime_ns=identity.mtime_ns,
+                member_count=len(members),
+                status="partial",
+            )
+            for member in members:
+                self.catalog.takeout.member_add(
+                    archive_id=identity.archive_id,
+                    member_path=member.path,
+                    kind=member.kind,
+                    size=member.size,
+                    crc32=member.crc32,
+                    status=_initial_status(member, self.include_trash),
+                )
+
+        for member in members:
+            all_members.append(member.path)
+            self.owner[member.path] = path
+            if _initial_status(member, self.include_trash) == _SKIPPED_TRASH:
+                self.stats.skipped_trash += 1
+
+        todo.append((identity, members))
+
+    def _survey_pass_one_recorded_members(
+        self,
+        identity: archive.ArchiveIdentity,
+        path: Path,
+        all_members: list[str],
+        completed: list[tuple[archive.ArchiveIdentity, list]],
+    ) -> None:
+        """For an archive already `complete` (and not reopened for trash),
+        contribute its member paths to the whole-batch pairing index from
+        the catalog's own record -- no zip opened, nothing decompressed --
+        and hold it in `completed` for `_survey_second_pass_late_sidecars`
+        to re-examine once the index exists.
+
+        Mutates `self.owner` (keyed by member path) and appends into
+        `all_members` and `completed` in place; touches no other state.
+        """
+        # A complete archive still contributes its member paths to
+        # the pairing index, and is re-examined in the second pass
+        # below once the index exists. Member paths come from the
+        # catalog, so no zip is opened and nothing is decompressed.
+        rows = self.catalog.takeout.members_all(identity.archive_id)
+        for db_member in rows:
+            all_members.append(db_member["member_path"])
+            self.owner[db_member["member_path"]] = path
+        completed.append((identity, rows))
+
+    def _survey_second_pass_late_sidecars(
+        self,
+        completed: list[tuple[archive.ArchiveIdentity, list]],
+        todo: list[tuple[archive.ArchiveIdentity, list[archive.MemberInfo]]],
+    ) -> None:
+        """SECOND PASS -- the late-sidecar case, and the reason the survey has
+        two passes at all.
+
+        Contributing a complete archive's member paths to the index (above)
+        only solves ONE ordering: sidecars ingested first, the photos they
+        describe arriving later. The opposite order is the common one -- you
+        download part 1, ingest it, and its photos land in Undated/ because
+        their sidecars are in part 2 which you have not downloaded yet. When
+        part 2 arrives, part 1 is `complete`, so without this pass nothing
+        would ever revisit those photos and they would stay Undated/ forever.
+
+        A member is reopened only when it demonstrably gained something: it
+        is an image or a video, it has no sidecar on record, and the index
+        NOW resolves one for it. Re-ingesting it makes its bytes hash as a
+        duplicate, which routes through `_maybe_upgrade_from_duplicate` and
+        relocates the file -- no new placement code, exactly as designed.
+        The check is pure string work against an in-memory index, so an
+        archive that never gains metadata costs nothing to re-examine.
+
+        Consumes `completed` (the complete archives held back by
+        `_survey_pass_one_recorded_members`); mutates `self.stats` and the
+        catalog (`member_set`/`archive_set_status`) and appends into `todo`
+        in place, exactly as the inline second pass used to.
+        """
         for identity, rows in completed:
             stale = [
                 row for row in rows
@@ -553,10 +611,10 @@ class _Ingestor:
 
                 for row in stale:
                     # Every field this row already holds must be passed back:
-                    # `takeout_member_set` is a blind full-row UPDATE and would
+                    # `catalog.takeout.member_set` is a blind full-row UPDATE and would
                     # otherwise null what it does not receive. `sidecar_path` is
                     # deliberately left None -- re-ingesting is what establishes it.
-                    self.catalog.takeout_member_set(
+                    self.catalog.takeout.member_set(
                         identity.archive_id,
                         row["member_path"],
                         status=_PENDING,
@@ -565,7 +623,7 @@ class _Ingestor:
                         sidecar_path=None,
                         last_error=row["last_error"],
                     )
-                self.catalog.takeout_archive_set_status(identity.archive_id, "partial")
+                self.catalog.takeout.archive_set_status(identity.archive_id, "partial")
                 todo.append((identity, members))
                 continue
 
@@ -602,8 +660,6 @@ class _Ingestor:
             # No media work is reported for a provenance-only reopen: nothing
             # is re-ingested, and a dry run performs no writes at all.
             todo.append((identity, []))
-
-        return todo
 
     # -- phase 2 ------------------------------------------------------------
 
@@ -749,7 +805,7 @@ class _Ingestor:
         if identity.archive_id in self._album_indexed:
             return
         self._album_indexed.add(identity.archive_id)
-        for row in self.catalog.takeout_members_all(identity.archive_id):
+        for row in self.catalog.takeout.members_all(identity.archive_id):
             if row["kind"] != archive.KIND_ALBUM:
                 continue
             folder = row["member_path"].rpartition("/")[0].rpartition("/")[2] or None
@@ -781,7 +837,7 @@ class _Ingestor:
         files, never a duplicate write.
         """
         try:
-            rows = self.catalog.takeout_members_all(identity.archive_id)
+            rows = self.catalog.takeout.members_all(identity.archive_id)
             members = [
                 archive.MemberInfo(
                     path=row["member_path"], size=row["size"],
@@ -809,7 +865,7 @@ class _Ingestor:
     def _mark_failed(self, identity: archive.ArchiveIdentity, row: sqlite3.Row, error: str) -> None:
         """Record a member as failed WITHOUT discarding what it already knew.
 
-        `takeout_member_set` is a blind full-row UPDATE, so a failure branch
+        `catalog.takeout.member_set` is a blind full-row UPDATE, so a failure branch
         that passes only `status` and `last_error` nulls `sha256_b64url`,
         `taken_at`, and `sidecar_path`. That matters most for a member the
         second survey pass just reopened: the reopen deliberately carried
@@ -824,7 +880,7 @@ class _Ingestor:
         run appear to succeed while recording nothing. It is stated here
         because the abort would otherwise look accidental.
         """
-        self.catalog.takeout_member_set(
+        self.catalog.takeout.member_set(
             identity.archive_id,
             row["member_path"],
             status=_FAILED,
@@ -904,7 +960,7 @@ class _Ingestor:
         # the sole arbiter of truth and takeout_members can only lag it.
         # `last_error` is deliberately omitted: this member just succeeded,
         # so clearing any error from a previous attempt is correct.
-        self.catalog.takeout_member_set(
+        self.catalog.takeout.member_set(
             identity.archive_id,
             member_path,
             status=status,
@@ -1039,7 +1095,7 @@ class _Ingestor:
                 self.stats.missing_metadata += 1
             # `last_error` is deliberately omitted: this member just succeeded,
             # so clearing any error from a previous attempt is correct.
-            self.catalog.takeout_member_set(
+            self.catalog.takeout.member_set(
                 identity.archive_id,
                 member_path,
                 status=_DEFERRED,
@@ -1065,7 +1121,7 @@ class _Ingestor:
         # the zip still needs to be opened once so `_preserve_provenance` can
         # rebuild a missing/incomplete room. `images`/`videos` stay empty in
         # that case, so the loops below do nothing either way.
-        pending = self.catalog.takeout_members_pending(identity.archive_id)
+        pending = self.catalog.takeout.members_pending(identity.archive_id)
         images = [r for r in pending if r["kind"] == archive.KIND_IMAGE]
         videos = [r for r in pending if r["kind"] == archive.KIND_VIDEO]
 
@@ -1078,7 +1134,7 @@ class _Ingestor:
         except (zipfile.BadZipFile, OSError) as exc:
             logger.error("Archive %s failed mid-ingest: %s", identity.path.name, exc)
             self.stats.archives_corrupt += 1
-            self.catalog.takeout_archive_set_status(
+            self.catalog.takeout.archive_set_status(
                 identity.archive_id, "corrupt", str(exc)
             )
             return
@@ -1086,8 +1142,8 @@ class _Ingestor:
         for row in videos:
             self._defer_video(identity, row)
 
-        if not self.catalog.takeout_members_pending(identity.archive_id):
-            self.catalog.takeout_archive_set_status(identity.archive_id, "complete")
+        if not self.catalog.takeout.members_pending(identity.archive_id):
+            self.catalog.takeout.archive_set_status(identity.archive_id, "complete")
 
         self.stats.per_archive.append(
             {"archive": identity.path.name, "members": len(images) + len(videos)}

@@ -141,7 +141,7 @@ Module responsibilities:
   late-sidecar-discovery case described above, and orphan detection needs the
   whole-batch pairing index, which isn't finished building until `_survey`
   returns; `_ingest_archive` is the point where a zip handle for that specific
-  archive is already open for the work it's about to do anyway. Seven
+  archive is already open for the work it's about to do anyway. Eight
   modules: `metadata.py` (pure Google-JSON parser, never raises; timestamp
   parsing uses epoch + timedelta arithmetic instead of `datetime.fromtimestamp`
   to remain platform-independent for pre-1970 dates — the latter raises `OSError`
@@ -153,9 +153,12 @@ Module responsibilities:
   (preserves non-media members verbatim, described below), `survey.py` (read-only
   measurement of an archive set -- two passes: central directories to build the
   whole-batch pairing index, then a reopen to sniff members whose extension is
-  unrecognized and read per-media sidecars), and `report.py` (pure: turns a
+  unrecognized and read per-media sidecars), `report.py` (pure: turns a
   collected inventory into the report document, split from `survey.py` for the
-  same reason `projections.py` is split from `stats.py`).
+  same reason `projections.py` is split from `stats.py`), and `store.py`
+  (`TakeoutStore` — the `takeout_archives`/`takeout_members` read/write
+  methods, extracted from `Catalog` in R5 onto the same shared connection and
+  lock; see `catalog.py`'s bullet above for how it is composed).
 - **`takeout/provenance.py`** — preserves every archive member that is **not**
   an image or video, verbatim, under
   `<organized_dir>/.takeout-provenance/<archive_id>/` (keyed by the SHA-256 of
@@ -267,7 +270,15 @@ Module responsibilities:
   primary_subject)` with a fixed top-level class and **no `sub_parent`**, so in
   practice the taxonomy is effectively **two levels** (fixed class →
   `primary_subject` sub-category); the `sub_parent`/`~N`-under-a-leaf machinery
-  still exists but its call sites are currently unused.
+  still exists but its call sites are currently unused. **R5:** the module also
+  now holds `class TaxonomyStore`, the `taxonomy` table's read/write methods
+  extracted from `Catalog` — co-located here rather than in a new module
+  because `Taxonomy` is its only real consumer, the same reasoning that keeps
+  `sidecar_schema.py` and `sidecar.py` split rather than merged in the other
+  direction. `Taxonomy.__init__` grabs `self._store = catalog.taxonomy_store`
+  once and uses it for every read/write; its own external signature is
+  unchanged (still takes the `catalog`). See `catalog.py`'s bullet above for
+  how `TaxonomyStore` is composed onto the shared connection/lock.
 - **`ai_classifier.py`** — perception only. `AIClassifier` ABC with two
   implementations chosen by the `--ai` flag: `StubClassifier` (default;
   deterministic, no network — derives a subject/tags from filename keywords, used
@@ -344,7 +355,17 @@ Module responsibilities:
   and three `sources` rows (`record_source`, `sources_for`); `photos.original_path`
   is retained as the *first* source seen, for backward compatibility. A `taxonomy`
   table persists the self-extending PCS registry (`code`, `parent_code`, `label`,
-  `folder_name`, `aliases`, `alias_of`, `active`), backing `taxonomy.py`. A
+  `folder_name`, `aliases`, `alias_of`, `active`), backing `taxonomy.py`. **R5:**
+  the read/write methods over this table no longer live on `Catalog` — they
+  were extracted (2026-09-13) into `TaxonomyStore` (co-located in
+  `imageharbor/taxonomy.py`, its only real consumer), composed onto the same
+  connection and lock as `self.taxonomy_store = TaxonomyStore(conn=self._conn,
+  lock=self.lock)` in `Catalog.__init__` (constructed via a local import to
+  avoid a cycle with `taxonomy.py`'s own `from .catalog import Catalog`). SQL
+  and docstrings moved verbatim; call sites are
+  `catalog.taxonomy_store.<method>(...)` (e.g.
+  `catalog.taxonomy_store.set_aliases(...)`) — there is no bare
+  `catalog.taxonomy_*` left anywhere in the codebase. A
   `learned_concepts` table (`subject`, `class_code`, `hits`, timestamps) is the
   self-learning store behind `concept_map.py`'s
   `learned_concept_get`/`learned_concept_remember`. A `failed_files` table
@@ -364,7 +385,15 @@ Module responsibilities:
   `deferred`/`parsed`/`ignored`/`skipped_trash` and non-terminal `pending`/
   `failed`) back Takeout ingestion's four idempotency layers. Both are purely
   additive, so `SCHEMA_VERSION` stays `"2"` and an existing catalog upgrades in
-  place.
+  place. **R5:** the read/write methods over these two tables no longer live
+  on `Catalog` — they were extracted (2026-09-13) into `TakeoutStore`
+  (`imageharbor/takeout/store.py`), composed onto the same connection and
+  lock as `self.takeout = TakeoutStore(conn=self._conn, lock=self.lock)` in
+  `Catalog.__init__` (constructed via a local import to avoid a cycle with
+  `takeout/ingest.py`'s `from ..catalog import Catalog`). SQL and docstrings
+  moved verbatim; call sites are `catalog.takeout.<method>(...)` (e.g.
+  `catalog.takeout.member_set(...)`, `catalog.takeout.status_counts()`) —
+  there is no bare `catalog.takeout_*` left anywhere in the codebase.
   Two more additive tables back the operational dashboard (`dashboard/`,
   below), also without bumping `SCHEMA_VERSION`: a `runs` table (`id`, `kind`
   'facts'|'enrich', `started_at`, `ended_at` NULL while a pass is in flight or
@@ -388,9 +417,21 @@ Module responsibilities:
   for the watcher) was considered and rejected: `ControlPlane` is read from
   *both* threads, so splitting the connection would still leave that seam
   unguarded — the lock is the smaller change that actually closes the gap.
-  `dashboard/stats.py`'s three sections that run aggregate SQL directly
-  against `catalog._conn` (no `Catalog` wrapper method covers them) acquire
-  this same lock around their query blocks.
+  `dashboard/stats.py`'s three sections and `dashboard/people.py`'s four
+  functions (`review_queue`, `merge`, `split`, `crop_bytes`) that run
+  aggregate SQL no `Catalog`/`FaceStore`
+  wrapper method covers go through **`run_select(sql, params=())`** (Task
+  3, R5) — a guarded, SELECT-only read door defined identically on both
+  `Catalog` and `FaceStore` that takes `self.lock` internally per call and
+  raises `ValueError` for anything not starting with `SELECT`. A block whose
+  several `run_select` calls need one consistent snapshot (e.g.
+  `stats._library_section`'s complementary enriched/unenriched partition,
+  `people.review_queue`'s cluster/person correlation, `people.crop_bytes`'s
+  digest-then-kept-ids lookup) additionally wraps them in one outer
+  `with catalog.lock:`/`with store.lock:` — safe because the lock is
+  reentrant — while a block with no such cross-query dependency (e.g.
+  `stats._evidence_section`'s two independent tier distributions) lets each
+  `run_select` call take and release the lock on its own.
 
   **Corrected 2026-08-19** (this section previously described a
   two-connection architecture — "the dashboard writes settings rows from its
@@ -605,17 +646,29 @@ Module responsibilities:
     with `dict(row)` at the catalog boundary before rows reach `projections`
     or the JSON document — do the same at any new call site that crosses
     from a `sqlite3.Row` into code that expects a `Mapping`.
-  - **The projections module conflates readability with meaning — a known,
-    not-yet-fixed gap.** Across three review rounds, eight defects were found
-    in `projections.py`, every one an unreadable or implausible input (an
-    unparseable timestamp, a negative backlog, a sub-second pass duration, a
-    timezone-naive/aware mismatch) treated as if it were a valid one, because
-    `None`/`0`/an empty collection each did double duty for "absent",
-    "unreadable", *and* "genuinely zero" at different call sites. An explicit
-    `Unreadable` sentinel at each parse site, distinct from a real `None`
-    and a real `0`, would turn the next such defect into a type error
-    instead of a silent misread — this is a deliberate follow-up, not done
-    here.
+  - **The absent/unreadable/zero conflation is fixed (R5).** Across three
+    review rounds, eight defects were found in `projections.py`, every one
+    an unreadable or implausible input (an unparseable timestamp, a
+    negative backlog, a sub-second pass duration, a timezone-naive/aware
+    mismatch) treated as if it were a valid one, because `None`/`0`/an
+    empty collection each did double duty for "absent", "unreadable", *and*
+    "genuinely zero" at different call sites. `projections.py` now defines
+    a module-level `_UnreadableType` singleton, `UNREADABLE`: a parse site
+    read *something* and could not interpret it, distinct from `None`
+    (nothing was there to read) and a real `0`/`0.0` (a genuine, usable
+    measurement). `_parse_backlog`, `_parse_enriched`, and `_rate` return
+    `T | None | _UnreadableType` and `project()`'s decision points branch on
+    all three explicitly — e.g. a backlog of `None` (the caller's own count
+    query failed) and a backlog of `"abc"` (nonsense) both still report
+    `STATUS_UNKNOWN`, but for a distinguishable reason, while a genuine `0`
+    reports `STATUS_COMPLETE`; a run row's `enriched` field being absent no
+    longer silently reads as a recorded zero (the old `int(x or 0)`), so a
+    pass that never recorded its yield is excluded from the rate sample
+    instead of being counted as a real zero-rate pass. External behavior for
+    well-formed inputs is unchanged — this only replaced *why* a value was
+    excluded with a typed fact, not *whether* it was. See
+    `tests/test_dashboard_projections.py`'s absent/unreadable/zero triple
+    tests for the pinned three-way behavior at each converted site.
 - **`faces/`** — a third pass, independent of facts and enrichment, that
   detects faces, embeds and clusters them, and proposes person names from
   photos Google Photos already tagged. It makes **no AI-backend call and no
@@ -660,7 +713,10 @@ Module responsibilities:
   - **`watch --faces` wiring.** `cli.py` builds one `Detector`/`Embedder`/
     `FaceStore` per run (loading an ONNX session is too expensive to repeat
     every poll) into a `watcher.FacesConfig`, then `watch()`'s third pass —
-    after facts and enrichment — runs `runner.scan` (per-photo, `should_stop`
+    after facts and enrichment, implemented as `watcher._run_faces_pass`
+    (called once per cycle, with its two log-once warning latches owned by
+    `watch()`'s scope via a small `_FacesPassState` so they survive across
+    calls) — runs `runner.scan` (per-photo, `should_stop`
     wired to the same pause check the other two passes use) and
     `runner.propagate_sidecars` every cycle, but calls `runner.build_clusters`
     — a whole-library operation — only when `FaceStore.unclustered_face_

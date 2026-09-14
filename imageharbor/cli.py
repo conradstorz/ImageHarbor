@@ -1036,7 +1036,7 @@ def takeout_ingest(
 def takeout_status(catalog_path: Path) -> None:
     """Report Takeout ingestion progress."""
     with Catalog(catalog_path) as cat:
-        counts = cat.takeout_status_counts()
+        counts = cat.takeout.status_counts()
 
     archives = counts["archives"]
     total = sum(archives.values())
@@ -1357,19 +1357,22 @@ def faces_calibrate(dest: Path, catalog_path: Path | None, target_precision: flo
     _require_onnx()
 
     from .faces import models as face_models
-    from .faces.runner import google_names, measure_threshold
+    from .faces.runner import InsufficientAnchorsError, google_names, measure_threshold
     from .faces.store import FaceStore
 
     catalog_path = _faces_catalog_path(dest, catalog_path)
     photo_names = google_names(dest)
 
     with FaceStore(catalog_path) as store:
-        result = measure_threshold(
-            store,
-            photo_names,
-            embed_model=face_models.DEFAULT_EMBEDDER,
-            target_precision=target_precision,
-        )
+        try:
+            result = measure_threshold(
+                store,
+                photo_names,
+                embed_model=face_models.DEFAULT_EMBEDDER,
+                target_precision=target_precision,
+            )
+        except InsufficientAnchorsError as exc:
+            raise click.ClickException(str(exc)) from exc
 
     click.echo(
         f"threshold={result.threshold:.4f} precision={result.precision:.4f} "

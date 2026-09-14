@@ -22,6 +22,29 @@ def test_slug() -> None:
     assert slug("Christmas Eve!") == "christmas-eve"
 
 
+def test_catalog_composes_a_taxonomy_store_on_the_same_connection(tmp_path: Path) -> None:
+    from imageharbor.taxonomy import TaxonomyStore
+
+    cat = Catalog(tmp_path / "catalog.db")
+    try:
+        assert isinstance(cat.taxonomy_store, TaxonomyStore)
+        # same connection + same lock object -- the single-writer invariant:
+        assert cat.taxonomy_store._conn is cat._conn
+        assert cat.taxonomy_store.lock is cat.lock
+    finally:
+        cat.close()
+
+
+def test_no_taxonomy_methods_remain_on_catalog(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path / "catalog.db")
+    try:
+        assert not [
+            m for m in dir(cat) if m.startswith("taxonomy_") and m != "taxonomy_store"
+        ]
+    finally:
+        cat.close()
+
+
 def test_seed_has_fixed_spine(tax: Taxonomy) -> None:
     tops = [n.code for n in tax.children(None)]
     for c in ("100", "200", "300", "400", "500", "600", "700", "800", "900"):

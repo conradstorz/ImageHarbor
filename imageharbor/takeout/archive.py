@@ -126,7 +126,7 @@ def identify(path: Path, catalog: "Catalog") -> ArchiveIdentity:
     digest, which is what actually keys the archive.
     """
     stat = path.stat()
-    row = catalog.takeout_archive_get_by_stat(str(path), stat.st_size, stat.st_mtime_ns)
+    row = catalog.takeout.archive_get_by_stat(str(path), stat.st_size, stat.st_mtime_ns)
     if row is not None:
         return ArchiveIdentity(
             archive_id=row["archive_id"],

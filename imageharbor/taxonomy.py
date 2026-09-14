@@ -11,17 +11,24 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 from .catalog import Catalog
 from .pcs import PCS_CATEGORIES
+from .util import json_default as _json_default
+from .util import now_iso as _now_iso
 
 logger = logging.getLogger(__name__)
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TOP_RE = re.compile(r"^[1-9]00$")
 _SUB_RE = re.compile(r"^[1-9][1-9]0$")
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
 
 
 def slug(label: str) -> str:
@@ -52,6 +59,79 @@ _DEGENERATE_LABELS = frozenset({
 })
 # Normalized forms too, so punctuation variants ("none!", "unknown.") are caught.
 _DEGENERATE_NORM = frozenset(_normalize_label(x) for x in _DEGENERATE_LABELS)
+
+
+class TaxonomyStore:
+    """PCS taxonomy bookkeeping on the shared catalog connection.
+
+    Composed onto `Catalog`'s existing connection and lock
+    (`Catalog.__init__` builds it as `self.taxonomy_store =
+    TaxonomyStore(conn=self._conn, lock=self.lock)`) rather than opening a
+    second connection -- see the single-connection rationale in `catalog.py`'s
+    `Catalog` docstring. This class holds only the references it is given; it
+    never calls `sqlite3.connect` itself.
+    """
+
+    def __init__(self, *, conn: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._conn = conn
+        self.lock = lock
+
+    def is_empty(self) -> bool:
+        with self.lock:
+            cur = self._conn.execute("SELECT 1 FROM taxonomy LIMIT 1")
+            return cur.fetchone() is None
+
+    def insert(
+        self,
+        code: str,
+        parent_code: str | None,
+        label: str,
+        folder_name: str,
+        aliases: list[str] | None = None,
+        alias_of: str | None = None,
+    ) -> None:
+        with self.lock:
+            self._conn.execute(
+                """
+                INSERT INTO taxonomy (code, parent_code, label, folder_name,
+                                      aliases, alias_of, active, created_at)
+                VALUES (?,?,?,?,?,?,1,?)
+                ON CONFLICT(code) DO NOTHING
+                """,
+                (code, parent_code, label, folder_name, _json(aliases or []), alias_of, _now_iso()),
+            )
+            self._conn.commit()
+
+    def get(self, code: str) -> sqlite3.Row | None:
+        with self.lock:
+            cur = self._conn.execute("SELECT * FROM taxonomy WHERE code=?", (code,))
+            return cur.fetchone()
+
+    def children(self, parent_code: str | None) -> list[sqlite3.Row]:
+        with self.lock:
+            cur = self._conn.execute(
+                "SELECT * FROM taxonomy WHERE parent_code IS ? ORDER BY code", (parent_code,)
+            )
+            return cur.fetchall()
+
+    def all(self) -> list[sqlite3.Row]:
+        with self.lock:
+            cur = self._conn.execute("SELECT * FROM taxonomy WHERE active=1 ORDER BY code")
+            return cur.fetchall()
+
+    def set_alias(self, from_code: str, to_code: str) -> None:
+        with self.lock:
+            self._conn.execute(
+                "UPDATE taxonomy SET alias_of=?, active=0 WHERE code=?", (to_code, from_code)
+            )
+            self._conn.commit()
+
+    def set_aliases(self, code: str, aliases: list[str]) -> None:
+        with self.lock:
+            self._conn.execute(
+                "UPDATE taxonomy SET aliases=? WHERE code=?", (_json(aliases), code)
+            )
+            self._conn.commit()
 
 
 @dataclass
@@ -86,7 +166,7 @@ class Taxonomy:
     """
 
     def __init__(self, catalog: Catalog) -> None:
-        self._cat = catalog
+        self._store = catalog.taxonomy_store
 
     # ------------------------------------------------------------------
     # Seeding
@@ -94,12 +174,12 @@ class Taxonomy:
 
     def ensure_seeded(self) -> None:
         """Seed from the legacy PCS_CATEGORIES on first use."""
-        if not self._cat.taxonomy_is_empty():
+        if not self._store.is_empty():
             return
         # Insert parents first (parent_code None), then children.
         for code, cat in sorted(PCS_CATEGORIES.items()):
             parent = None if cat.parent is None else str(cat.parent)
-            self._cat.taxonomy_insert(
+            self._store.insert(
                 str(code), parent, cat.name, f"{code}-{slug(cat.name)}"
             )
 
@@ -108,11 +188,11 @@ class Taxonomy:
     # ------------------------------------------------------------------
 
     def get(self, code: str) -> TaxonomyNode | None:
-        row = self._cat.taxonomy_get(code)
+        row = self._store.get(code)
         return _node(row) if row else None
 
     def children(self, parent_code: str | None) -> list[TaxonomyNode]:
-        return [_node(r) for r in self._cat.taxonomy_children(parent_code)]
+        return [_node(r) for r in self._store.children(parent_code)]
 
     def resolve_alias(self, code: str) -> str:
         """Follow the alias_of chain to the canonical active code."""
@@ -165,7 +245,7 @@ class Taxonomy:
         return self._create(f"{parent_code}~{n + 1}", parent_code, label)
 
     def _create(self, code: str, parent_code: str, label: str) -> str:
-        self._cat.taxonomy_insert(code, parent_code, label, f"{code}-{slug(label)}")
+        self._store.insert(code, parent_code, label, f"{code}-{slug(label)}")
         return code
 
     # ------------------------------------------------------------------
@@ -242,7 +322,7 @@ class Taxonomy:
                 for k in kids:
                     if k.label == matched:
                         aliases = k.aliases + [label]
-                        self._cat.taxonomy_set_aliases(k.code, aliases)
+                        self._store.set_aliases(k.code, aliases)
                         return self.resolve_alias(k.code)
 
         return self.mint_child(target, label)
@@ -252,5 +332,5 @@ class Taxonomy:
         src = self.get(from_code)
         if target is None or src is None:
             return
-        self._cat.taxonomy_set_aliases(to_code, target.aliases + [src.label])
-        self._cat.taxonomy_set_alias(from_code, to_code)
+        self._store.set_aliases(to_code, target.aliases + [src.label])
+        self._store.set_alias(from_code, to_code)

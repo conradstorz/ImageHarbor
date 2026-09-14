@@ -341,7 +341,9 @@
       <div class="kv"><span class="label">Passes (24h)</span><span class="value" id="hist-passes-24h">—</span></div>
       <div class="kv"><span class="label">Copied (24h)</span><span class="value" id="hist-copied-24h">—</span></div>
       <div class="kv"><span class="label">Errors (24h)</span><span class="value" id="hist-errors-24h">—</span></div>
+      <div class="kv"><span class="label">Enrich failed (24h)</span><span class="value" id="hist-enrich-failed-24h">—</span></div>
       <div class="kv"><span class="label">Passes (30d)</span><span class="value" id="hist-passes-30d">—</span></div>
+      <div class="kv"><span class="label">Enrich failed (30d)</span><span class="value" id="hist-enrich-failed-30d">—</span></div>
     </div>
   </section>
 
@@ -438,6 +440,19 @@
     return fmtSeconds(seconds) + " (~" + when.toLocaleString() + ")";
   }
 
+  // `total` is the plain enrich-failed count; `ai`/`io` are the AI-perception
+  // vs. local-I/O subset (R3 Task 6). Pre-upgrade `runs` rows carry neither
+  // key, and a healthy pass carries both as 0 -- either way this must
+  // degrade to the plain total exactly as it rendered before the split
+  // existed, only growing a "(ai A / io B)" parenthetical once there is
+  // something to say.
+  function fmtFailedSplit(total, ai, io) {
+    if (total == null) return "—";
+    const a = ai || 0;
+    const i = io || 0;
+    return (a || i) ? (total + " (ai " + a + " / io " + i + ")") : String(total);
+  }
+
   function showError(msg) {
     const el = $("error-banner");
     if (msg) {
@@ -483,7 +498,11 @@
       lastRunEl.textContent =
         "last pass (" + r.kind + "): " + (r.copied || 0) + " copied · " +
         (r.duplicates || 0) + " duplicates · " + (r.errors || 0) + " errors · " +
-        (r.enriched || 0) + " enriched";
+        (r.enriched || 0) + " enriched" +
+        // A facts row structurally has no enrichment -- suppress the
+        // "N enrich failed" segment rather than report a meaningless 0.
+        (r.kind === "facts" ? "" :
+          " · " + fmtFailedSplit(r.enrich_failed ?? 0, r.enrich_ai_failed, r.enrich_io_failed) + " enrich failed");
     } else {
       lastRunEl.textContent = "no completed pass yet";
     }
@@ -544,7 +563,8 @@
 
   function renderHistory(history) {
     if (!history) {
-      ["hist-passes-24h", "hist-copied-24h", "hist-errors-24h", "hist-passes-30d"].forEach((id) => { $(id).textContent = "unavailable"; });
+      ["hist-passes-24h", "hist-copied-24h", "hist-errors-24h", "hist-enrich-failed-24h",
+       "hist-passes-30d", "hist-enrich-failed-30d"].forEach((id) => { $(id).textContent = "unavailable"; });
       return;
     }
     const d = history.last_24h || {};
@@ -552,7 +572,9 @@
     $("hist-passes-24h").textContent = d.passes ?? "—";
     $("hist-copied-24h").textContent = d.copied ?? "—";
     $("hist-errors-24h").textContent = d.errors ?? "—";
+    $("hist-enrich-failed-24h").textContent = fmtFailedSplit(d.enrich_failed, d.enrich_ai_failed, d.enrich_io_failed);
     $("hist-passes-30d").textContent = d30.passes ?? "—";
+    $("hist-enrich-failed-30d").textContent = fmtFailedSplit(d30.enrich_failed, d30.enrich_ai_failed, d30.enrich_io_failed);
   }
 
   function renderProjection(projection) {

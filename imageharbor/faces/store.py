@@ -900,6 +900,23 @@ class FaceStore:
             }
 
     # ------------------------------------------------------------------
+    # Guarded read door
+    # ------------------------------------------------------------------
+
+    def run_select(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        """Execute a read-only SELECT under the store's lock.
+
+        The dashboard's aggregate queries are bespoke enough that wrapping
+        each as a named method would just re-bloat the store; this is the
+        sanctioned read-side door -- see `dashboard/people.py`, the only
+        current caller. SELECT-only is enforced, not assumed.
+        """
+        if not sql.lstrip().upper().startswith("SELECT"):
+            raise ValueError("run_select only runs SELECT statements")
+        with self.lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
