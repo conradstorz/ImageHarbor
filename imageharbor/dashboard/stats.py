@@ -35,19 +35,18 @@ opposite verdicts -- read both before touching either.)
    `sqlite3.Connection`. `check_same_thread=False` *permits* concurrent
    access to it from multiple threads; it does not make that access safe.
    Measured under realistic concurrent load (dashboard polling + watcher
-   writing, 25s): 55 exceptions out of the writer -- `cannot commit - no
-   transaction is active`, `SystemError: error return without exception
-   set` out of `Catalog.run_finish` -- and a file copied and verified but
-   never catalogued. `_library_section`, `_evidence_section`, and
-   `_queues_section` below run ad hoc aggregate SQL that has no `Catalog`
+   writing, 25s) without a lock: 55 exceptions out of the writer --
+   `cannot commit - no transaction is active`, `SystemError: error return
+   without exception set` out of `Catalog.run_finish` -- and a file copied
+   and verified but never catalogued. `_library_section`, `_evidence_section`,
+   and `_queues_section` below run ad hoc aggregate SQL that has no `Catalog`
    wrapper method; each call now goes through `catalog.run_select` (Task 3),
    which takes `catalog.lock` internally per call -- the same
    `threading.RLock` every other guarded `Catalog` method takes. Do not
    bypass `run_select` to reach the raw connection directly again; doing so
    reintroduces the defect measured above. See `catalog.py`'s class
-   docstring (CRITICAL finding #2, 2026-08-19 whole-branch review) for the
-   full account of the underlying defect, and `run_select`'s own docstring
-   for the guarded read door itself.
+   docstring for the full account of why this lock exists, and
+   `run_select`'s own docstring for the guarded read door itself.
 
    `run_select`'s per-call lock is not the transaction/snapshot described in
    point 1, and solves a different problem: it only serializes *access to

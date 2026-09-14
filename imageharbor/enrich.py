@@ -171,30 +171,28 @@ def _apply_enrichment(
                         return "aborted"
                 return "failed_continue"
 
-            # Recorded here -- once every backend call this row needed
-            # (describe, and now pick_class) has actually succeeded --
-            # and deliberately BEFORE concept_map.remember() just below
-            # (R3 review Minor #5): record_success() keys purely to
-            # backend evidence, so a later remember() failure (local
-            # SQLite I/O, handled as io_failed by the outer except
-            # below) can never suppress recording backend success that
-            # already happened.
-            if breaker is not None:
-                breaker.record_success()
-            concept_map.remember(catalog, content.primary_subject, cls)
+            learned_new_class = True
         else:
-            # The concept map already knew this subject -- no backend
-            # call beyond describe() was needed for this row -- so
-            # success is recorded here instead, on the identical
-            # evidence rule: purely backend, before any further local
-            # work. (Recording success right after describe() instead
-            # of here would reset the breaker's consecutive-failure
-            # counter on every row even when that row's pick_class call
-            # then fails, making a run of pick_class-only failures
-            # unable to ever reach trip_threshold -- which is why this
-            # isn't hoisted up to right after describe() either.)
-            if breaker is not None:
-                breaker.record_success()
+            learned_new_class = False
+
+        # Every backend call this row needed (describe, and now pick_class
+        # if the concept map missed) has now actually succeeded, so success
+        # is recorded here -- once, regardless of which branch above ran --
+        # on the identical evidence rule: purely backend, before any further
+        # local work. (Recording success right after describe() instead of
+        # here would reset the breaker's consecutive-failure counter on
+        # every row even when that row's pick_class call then fails, making
+        # a run of pick_class-only failures unable to ever reach
+        # trip_threshold -- which is why this isn't hoisted up to right
+        # after describe() either.)
+        if breaker is not None:
+            breaker.record_success()
+        if learned_new_class:
+            # Deliberately AFTER record_success(): remember() is local
+            # SQLite I/O, and record_success() must never be at the mercy of
+            # a later local failure suppressing evidence that the backend
+            # call already succeeded.
+            concept_map.remember(catalog, content.primary_subject, cls)
 
         pcs_code = taxonomy.resolve_or_create(
             cls, content.primary_subject, adjudicator=classifier.adjudicate

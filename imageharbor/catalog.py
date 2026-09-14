@@ -222,15 +222,15 @@ class Catalog:
 
     ``self.lock`` (a ``threading.RLock``, public and reentrant on purpose) is
     the single guard around every touch of ``self._conn`` from any thread.
-    CRITICAL finding #2 (2026-08-19 whole-branch review, pre-merge): the
-    operational dashboard's HTTP server (``imageharbor/dashboard/server.py``,
+    The operational dashboard's HTTP server (``imageharbor/dashboard/server.py``,
     ``daemon_threads = True``) and the watcher loop both reach this same
     ``sqlite3.Connection`` concurrently -- ``check_same_thread=False``
-    *permits* that, it does not make it *safe*. Measured under realistic
-    load (4 pollers at 5 Hz + pause POSTs, 25s): 55 exceptions out of the
-    writer, including ``cannot commit - no transaction is active``, ``cannot
-    start a transaction within a transaction``, ``another row available``,
-    and ``SystemError: error return without exception set`` out of
+    *permits* that, it does not make it *safe* -- so every access must go
+    through this lock. Measured under realistic load (4 pollers at 5 Hz +
+    pause POSTs, 25s) without it: 55 exceptions out of the writer, including
+    ``cannot commit - no transaction is active``, ``cannot start a
+    transaction within a transaction``, ``another row available``, and
+    ``SystemError: error return without exception set`` out of
     ``run_finish``. The lock serializes every access, and it is `RLock`
     rather than a plain `Lock` because several methods below call other
     guarded methods on the same object from the same thread (e.g. `upsert`

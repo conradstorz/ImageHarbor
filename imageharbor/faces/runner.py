@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
-import click
 import numpy as np
 from PIL import Image
 
@@ -31,6 +30,15 @@ from .interfaces import DetectorLike, EmbedderLike
 from .store import FaceStore, ScannedFace
 
 logger = logging.getLogger(__name__)
+
+
+class ModelsUnavailableError(RuntimeError):
+    """Raised when a faces operation can't proceed with the data on hand.
+
+    This is a domain exception, not a CLI concern -- `runner.py` has no
+    business importing `click`. `cli.py` is the only place that translates
+    this into a `click.ClickException` for the terminal.
+    """
 
 # On a 12 MP JPEG, Image.draft(...) before Image.load() downscales in the DCT
 # domain and skips most of the decode -- decode, not inference, dominates this
@@ -238,7 +246,7 @@ def measure_threshold(
         # only after trying to np.stack an anchor list that may have zero or
         # one rows -- a much less legible failure for a CLI user than a
         # message that names the actual shortfall.
-        raise click.ClickException(
+        raise ModelsUnavailableError(
             "calibration needs anchor photos (exactly one detected face, "
             "exactly one Google-tagged name) for at least two distinct "
             f"people; found {len(distinct_names)}. Tag more photos in "
