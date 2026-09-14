@@ -1195,3 +1195,46 @@ def test_concurrent_reads_and_writes_from_multiple_threads_raise_nothing(tmp_pat
         )
     finally:
         cat.close()
+
+
+# ---------------------------------------------------------------------------
+# run_select -- Task 3: the sanctioned guarded read door for the dashboard's
+# ad hoc aggregate SQL, retiring the `catalog._conn` reach-ins.
+# ---------------------------------------------------------------------------
+
+
+def test_run_select_returns_rows(catalog: Catalog) -> None:
+    digest = _fake_digest(1)
+    catalog.upsert(
+        sha256_b64url=digest,
+        original_path="/photos/beach.jpg",
+        organized_path="/organized/beach.jpg",
+    )
+    rows = catalog.run_select(
+        "SELECT sha256_b64url AS digest FROM photos WHERE sha256_b64url = ?",
+        (digest,),
+    )
+    assert [dict(r)["digest"] for r in rows] == [digest]
+
+
+def test_run_select_rejects_update(catalog: Catalog) -> None:
+    with pytest.raises(ValueError):
+        catalog.run_select("UPDATE photos SET organized_path = NULL")
+
+
+def test_run_select_rejects_pragma(catalog: Catalog) -> None:
+    with pytest.raises(ValueError):
+        catalog.run_select("PRAGMA table_info(photos)")
+
+
+def test_run_select_accepts_leading_whitespace_and_lowercase_select(
+    catalog: Catalog,
+) -> None:
+    rows = catalog.run_select("  select 1 as n")
+    assert rows[0]["n"] == 1
+
+
+def test_run_select_works_reentrantly_inside_catalog_lock(catalog: Catalog) -> None:
+    with catalog.lock:
+        rows = catalog.run_select("select 1 as n")
+    assert rows[0]["n"] == 1

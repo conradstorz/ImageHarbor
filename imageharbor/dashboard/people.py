@@ -15,12 +15,18 @@ via `FaceStore.iter_pending_sidecars()` -- a 340-photo cluster's sidecar
 merges (minutes, over a CIFS mount) must never happen inside this HTTP
 handler.
 
-`review_queue` and `crop_bytes` reach `store._conn`/`store.lock` directly for
-queries `FaceStore` has no wrapper method for (per-cluster face ids, person
-names/aggregates, a face id's digest). This is the same pattern
-`dashboard/stats.py` already uses against `Catalog._conn` (see that module's
-docstring, CRITICAL finding #2): no method exists for the query, so it runs
-here, guarded by the same lock every `FaceStore` method takes internally.
+`review_queue`, `merge`, `split`, and `crop_bytes` run queries `FaceStore` has
+no wrapper method for (per-cluster face ids, person names/aggregates, a
+person id's existence, a cluster's face membership, a face id's digest)
+through `store.run_select` -- the same guarded read door `dashboard/stats.py`
+uses for `Catalog` (Task 3; see that module's docstring, CRITICAL finding
+#2): no method exists for the query, so it runs here, guarded by the same
+lock every `FaceStore` method takes internally. `review_queue` and
+`crop_bytes` each wrap several `run_select` calls in one outer
+`with store.lock:` because those particular queries are correlated with
+each other (see each function's own docstring); `merge` and `split` each
+make exactly one `run_select` call, so no outer lock is needed beyond what
+`run_select` already takes internally.
 """
 
 from __future__ import annotations
@@ -72,12 +78,27 @@ def review_queue(store: FaceStore, *, include_singletons: bool = False) -> dict[
     Shown clusters are ordered by `face_count` descending (confirming the
     biggest cluster first names the most photos per click), `cluster_id`
     ascending only as a deterministic tiebreaker.
+
+    Snapshot-consistency judgment (Task 3): every query below runs under one
+    outer `with store.lock:` (RLock reentrancy makes that safe, including
+    the reentrant call into `store.proposals_for`/`store.known_names`/
+    `store.stats` further down). This is a genuine cross-query dependency,
+    not just cosmetic: `cluster_ids_by_person` is built from a *separate*
+    query against `clusters` than the one that produced `people_rows`, and
+    is then correlated back onto `people_rows` by `person_id` -- if a
+    cluster's `person_id` changed between those two queries (a `confirm` or
+    a recluster landing mid-render), a person's reported `cluster_ids` could
+    disagree with `cluster_count`/`photo_count` computed a moment earlier,
+    or a cluster could transiently vanish from both the unreviewed list and
+    the confirmed roster's ids for one page load. The whole point of this
+    endpoint is one coherent, correlated view of clusters/people/proposals,
+    so it is kept as one snapshot rather than split into independently
+    locked calls.
     """
     with store.lock:
-        conn = store._conn
         cluster_rows = [
             dict(r)
-            for r in conn.execute(
+            for r in store.run_select(
                 "SELECT id, face_count, person_id FROM clusters ORDER BY id"
             )
         ]
@@ -91,7 +112,7 @@ def review_queue(store: FaceStore, *, include_singletons: bool = False) -> dict[
         # not NULL.
         people_rows = [
             dict(r)
-            for r in conn.execute(
+            for r in store.run_select(
                 """
                 SELECT p.id AS person_id, p.name AS name,
                        COUNT(DISTINCT c.id) AS cluster_count,
@@ -114,10 +135,12 @@ def review_queue(store: FaceStore, *, include_singletons: bool = False) -> dict[
         # is the same ambiguity this is trying to avoid. Ids only, no
         # per-cluster detail the page doesn't use.
         cluster_ids_by_person: dict[int, list[int]] = {}
-        for row in conn.execute(
+        for cluster_row in store.run_select(
             "SELECT id, person_id FROM clusters WHERE person_id IS NOT NULL ORDER BY person_id, id"
         ):
-            cluster_ids_by_person.setdefault(row["person_id"], []).append(row["id"])
+            cluster_ids_by_person.setdefault(cluster_row["person_id"], []).append(
+                cluster_row["id"]
+            )
         for row in people_rows:
             row["cluster_ids"] = cluster_ids_by_person.get(row["person_id"], [])
 
@@ -131,7 +154,7 @@ def review_queue(store: FaceStore, *, include_singletons: bool = False) -> dict[
         for r in shown:
             sample_face_ids = [
                 row["id"]
-                for row in conn.execute(
+                for row in store.run_select(
                     "SELECT id FROM faces WHERE cluster_id=? ORDER BY id LIMIT 9",
                     (r["id"],),
                 )
@@ -239,11 +262,10 @@ def merge(store: FaceStore, person_id: int, cluster_ids: list[int]) -> dict[str,
     """
     if not cluster_ids:
         raise ValueError("cluster_ids must not be empty")
-    with store.lock:
-        row = store._conn.execute(
-            "SELECT 1 FROM people WHERE id=?", (person_id,)
-        ).fetchone()
-    if row is None:
+    # Single query -- no outer lock needed beyond what `run_select` already
+    # takes internally (see the module docstring's snapshot-consistency note).
+    rows = store.run_select("SELECT 1 FROM people WHERE id=?", (person_id,))
+    if not rows:
         raise ValueError(f"unknown person: {person_id!r}")
     unknown = [cid for cid in cluster_ids if not _cluster_exists(store, cid)]
     if unknown:
@@ -272,13 +294,14 @@ def split(store: FaceStore, cluster_id: int, face_ids: list[int]) -> dict[str, A
         raise ValueError(f"unknown cluster: {cluster_id!r}")
     if not face_ids:
         raise ValueError("face_ids must not be empty")
-    with store.lock:
-        owned = {
-            row["id"]
-            for row in store._conn.execute(
-                "SELECT id FROM faces WHERE cluster_id=?", (cluster_id,)
-            )
-        }
+    # Single query -- no outer lock needed beyond what `run_select` already
+    # takes internally (see the module docstring's snapshot-consistency note).
+    owned = {
+        row["id"]
+        for row in store.run_select(
+            "SELECT id FROM faces WHERE cluster_id=?", (cluster_id,)
+        )
+    }
     foreign = sorted(set(face_ids) - owned)
     if foreign:
         raise ValueError(
@@ -311,20 +334,31 @@ def crop_bytes(crop_dir: Path, face_id: int, *, store: FaceStore | None = None) 
     derived index for the rank -- which is why `store` exists as a parameter
     here at all despite the produced interface being framed as
     `(crop_dir, face_id)`: a face id alone is not a path.
+
+    Snapshot-consistency judgment (Task 3): the two queries below ARE kept
+    under one outer `with store.lock:` (RLock reentrancy makes that safe).
+    This is a genuine dependency, not cosmetic: the second query's parameter
+    (`digest`) comes directly from the first query's result, and `kept_ids`'
+    order is what turns `face_id` into the on-disk index used to build
+    `path` below -- if another face for the same digest were rejected or
+    inserted between the two queries, `kept_ids` could shift and `index`
+    would then point at the wrong crop file for a *different* face. Letting
+    the two race would risk silently serving the wrong photo's crop, not
+    just a cosmetically stale count.
     """
     if store is None:
         return None
     with store.lock:
-        row = store._conn.execute(
+        rows = store.run_select(
             "SELECT sha256_b64url FROM faces WHERE id=? AND rejected IS NULL",
             (face_id,),
-        ).fetchone()
-        if row is None:
+        )
+        if not rows:
             return None
-        digest = row["sha256_b64url"]
+        digest = rows[0]["sha256_b64url"]
         kept_ids = [
             r["id"]
-            for r in store._conn.execute(
+            for r in store.run_select(
                 "SELECT id FROM faces WHERE sha256_b64url=? AND rejected IS NULL ORDER BY id",
                 (digest,),
             )

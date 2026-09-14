@@ -417,9 +417,20 @@ Module responsibilities:
   for the watcher) was considered and rejected: `ControlPlane` is read from
   *both* threads, so splitting the connection would still leave that seam
   unguarded — the lock is the smaller change that actually closes the gap.
-  `dashboard/stats.py`'s three sections that run aggregate SQL directly
-  against `catalog._conn` (no `Catalog` wrapper method covers them) acquire
-  this same lock around their query blocks.
+  `dashboard/stats.py`'s three sections and `dashboard/people.py`'s four
+  reach-in call sites that run aggregate SQL no `Catalog`/`FaceStore`
+  wrapper method covers go through **`run_select(sql, params=())`** (Task
+  3, R5) — a guarded, SELECT-only read door defined identically on both
+  `Catalog` and `FaceStore` that takes `self.lock` internally per call and
+  raises `ValueError` for anything not starting with `SELECT`. A block whose
+  several `run_select` calls need one consistent snapshot (e.g.
+  `stats._library_section`'s complementary enriched/unenriched partition,
+  `people.review_queue`'s cluster/person correlation, `people.crop_bytes`'s
+  digest-then-kept-ids lookup) additionally wraps them in one outer
+  `with catalog.lock:`/`with store.lock:` — safe because the lock is
+  reentrant — while a block with no such cross-query dependency (e.g.
+  `stats._evidence_section`'s two independent tier distributions) lets each
+  `run_select` call take and release the lock on its own.
 
   **Corrected 2026-08-19** (this section previously described a
   two-connection architecture — "the dashboard writes settings rows from its

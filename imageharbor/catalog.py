@@ -7,7 +7,7 @@ import logging
 import sqlite3
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from .util import json_default as _json_default
 from .util import now_iso as _now_iso
@@ -1022,6 +1022,24 @@ class Catalog:
                 "DELETE FROM failed_files WHERE source_path=?", (source_path,)
             )
             self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Guarded read door
+    # ------------------------------------------------------------------
+
+    def run_select(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        """Execute a read-only SELECT under the store's lock.
+
+        The dashboard's aggregate queries are bespoke enough that wrapping
+        each as a named method would just re-bloat the store; this is the
+        sanctioned read-side door -- see `dashboard/stats.py` and
+        `dashboard/people.py`, the only current callers. SELECT-only is
+        enforced, not assumed.
+        """
+        if not sql.lstrip().upper().startswith("SELECT"):
+            raise ValueError("run_select only runs SELECT statements")
+        with self.lock:
+            return self._conn.execute(sql, params).fetchall()
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -39,27 +39,37 @@ opposite verdicts -- read both before touching either.)
    transaction is active`, `SystemError: error return without exception
    set` out of `Catalog.run_finish` -- and a file copied and verified but
    never catalogued. `_library_section`, `_evidence_section`, and
-   `_queues_section` below run ad hoc aggregate SQL directly against
-   `catalog._conn` (there is no `Catalog` wrapper method for that query),
-   so each acquires `catalog.lock` -- the same `threading.RLock` every
-   other guarded `Catalog` method takes internally -- around its query
-   block. **Do not remove these `with catalog.lock:` blocks**; doing so
+   `_queues_section` below run ad hoc aggregate SQL that has no `Catalog`
+   wrapper method; each call now goes through `catalog.run_select` (Task 3),
+   which takes `catalog.lock` internally per call -- the same
+   `threading.RLock` every other guarded `Catalog` method takes. Do not
+   bypass `run_select` to reach the raw connection directly again; doing so
    reintroduces the defect measured above. See `catalog.py`'s class
    docstring (CRITICAL finding #2, 2026-08-19 whole-branch review) for the
-   full account.
+   full account of the underlying defect, and `run_select`'s own docstring
+   for the guarded read door itself.
 
-   This lock is not the transaction/snapshot described in point 1, and
-   solves a different problem: it only serializes *access to the
-   connection object* for the duration of one section's queries -- it does
-   not hold the writer off for the whole page render, and it creates no
-   consistent view across sections (`_library_section` and
-   `_evidence_section` each take and release the lock separately, so the
-   watcher is free to write between them). A future maintainer who notices
-   the lock and reads it as "oh, so we DO serialize for consistency after
-   all, let me extend it to a snapshot" would be making the same mistake as
-   the maintainer who would have removed it -- both come from merging
-   these two properties into one. They are not one property. Keep them
-   separate: no transaction (point 1), but yes lock (point 2).
+   `run_select`'s per-call lock is not the transaction/snapshot described in
+   point 1, and solves a different problem: it only serializes *access to
+   the connection object* for the duration of one query -- it does not hold
+   the writer off for the whole page render. `_library_section` and
+   `_queues_section` additionally wrap several `run_select` calls in one
+   outer `with catalog.lock:` (RLock reentrancy makes that safe) because
+   those particular queries are complementary partitions of the same
+   population that would look wrong if they raced each other -- see each
+   section's own docstring for its specific reasoning. `_evidence_section`
+   does not: its two distributions don't need to agree with each other, so
+   each `run_select` call there takes and releases the lock on its own, and
+   the watcher is free to write between them. This creates no consistent
+   view *across sections* either way (`_library_section` and
+   `_evidence_section` never share a lock hold with each other). A future
+   maintainer who notices a lock and reads it as "oh, so we DO serialize for
+   consistency after all, let me extend it to a cross-section snapshot"
+   would be making the same mistake as the maintainer who would have
+   removed it entirely -- both come from merging these two properties into
+   one. They are not one property. Keep them separate: no cross-section
+   transaction (point 1), but yes per-query-or-per-block lock as each
+   section's own judgment call requires (point 2).
 
 A failing section must not fail the document
 ----------------------------------------------
@@ -275,20 +285,33 @@ def _library_section(catalog: Catalog) -> dict:
     so ``MIN(size)`` per digest reads the library's actual (deduplicated)
     byte total, not a sum across duplicate copies.
 
-    CRITICAL finding #2 (2026-08-19 whole-branch review): this section
-    reaches ``catalog._conn`` directly for aggregate SQL that has no
-    ``Catalog`` wrapper method, so the whole block runs under
-    ``catalog.lock`` -- the same lock every guarded ``Catalog`` method takes
-    -- rather than racing the watcher's writes on the shared connection.
-    ``catalog.count()`` below is itself lock-guarded; ``catalog.lock`` is an
-    ``RLock`` precisely so a guarded method can be called from inside a
-    block that already holds it, from the same thread, without deadlocking.
+    CRITICAL finding #2 (2026-08-19 whole-branch review): this section used
+    to reach the catalog's raw connection directly for aggregate SQL that
+    has no ``Catalog`` wrapper method; it now goes through
+    ``catalog.run_select`` (Task 3), which takes ``catalog.lock`` internally
+    for each call.
+
+    Snapshot-consistency judgment (Task 3): this section's several queries
+    ARE kept under one outer ``with catalog.lock:`` around all the
+    `run_select` calls below (RLock reentrancy makes that safe, the same way
+    it always has for `catalog.count()`) rather than let each acquire and
+    release the lock independently. Reason: `enriched_count` and
+    `unenriched_count` are two separately-queried, mutually exclusive
+    partitions of the exact same `organized_path IS NOT NULL` population
+    (`enriched_at IS NOT NULL` vs. `IS NULL`) -- if the watcher marks a row
+    enriched between the two queries, letting them race would let a row
+    briefly vanish from both counts (undercounting the library by one for
+    that poll), and the same population also backs `undated_count` and
+    `total_photos`/`catalog.count()` in this same section. This whole
+    section reads as one coherent "current state of the library" panel, so
+    one shared snapshot is worth the trivial serialization cost. Contrast
+    `_evidence_section` below, whose two distributions don't need to agree
+    with each other and are queried independently.
     """
     with catalog.lock:
-        conn = catalog._conn
         total_photos = catalog.count()
 
-        rows = conn.execute(
+        rows = catalog.run_select(
             """
             SELECT p.sha256_b64url AS digest, COUNT(s.source_path) AS n, MIN(s.size) AS sz
             FROM photos p
@@ -296,34 +319,34 @@ def _library_section(catalog: Catalog) -> dict:
             WHERE p.organized_path IS NOT NULL
             GROUP BY p.sha256_b64url
             """
-        ).fetchall()
+        )
         total_bytes = sum((r["sz"] or 0) for r in rows)
         duplicates_collapsed = sum(max(0, r["n"] - 1) for r in rows)
         bytes_saved = sum(max(0, r["n"] - 1) * (r["sz"] or 0) for r in rows)
 
-        distinct_source_paths = conn.execute(
+        distinct_source_paths = catalog.run_select(
             "SELECT COUNT(DISTINCT source_path) AS n FROM sources"
-        ).fetchone()["n"]
+        )[0]["n"]
 
-        date_range = conn.execute(
+        date_range = catalog.run_select(
             "SELECT MIN(date_value) AS mn, MAX(date_value) AS mx FROM photos "
             "WHERE organized_path IS NOT NULL AND date_value IS NOT NULL"
-        ).fetchone()
+        )[0]
 
-        undated_count = conn.execute(
+        undated_count = catalog.run_select(
             "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
             "AND date_tier = ?",
             (tiers.DATE_NONE,),
-        ).fetchone()["n"]
+        )[0]["n"]
 
-        enriched_count = conn.execute(
+        enriched_count = catalog.run_select(
             "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
             "AND enriched_at IS NOT NULL"
-        ).fetchone()["n"]
-        unenriched_count = conn.execute(
+        )[0]["n"]
+        unenriched_count = catalog.run_select(
             "SELECT COUNT(*) AS n FROM photos WHERE organized_path IS NOT NULL "
             "AND enriched_at IS NULL"
-        ).fetchone()["n"]
+        )[0]["n"]
 
     return {
         "total_photos": total_photos,
@@ -353,26 +376,35 @@ def _evidence_section(catalog: Catalog) -> dict:
     be queried", which `collect()` already represents a different way (the
     whole section is `None`).
 
-    CRITICAL finding #2: raw ``catalog._conn`` access, same as
-    `_library_section` above -- guarded by ``catalog.lock`` for the same
-    reason.
+    Migrated (Task 3) from raw connection access to ``catalog.run_select``,
+    which takes ``catalog.lock`` internally per call.
+
+    Snapshot-consistency judgment (Task 3): NOT wrapped in an outer
+    `catalog.lock` -- each `run_select` call below takes and releases the
+    lock on its own. The two GROUP BY queries are each already internally
+    consistent (a single SQL statement is atomic on its own), and unlike
+    `_library_section`'s `enriched_count`/`unenriched_count` pair, nothing
+    here combines the date-tier distribution and the descriptor-tier
+    distribution against each other or against some shared total -- they
+    are two independent breakdowns rendered as two separate tables. A photo
+    added or changed between these two queries is exactly the same class of
+    harmless one-poll drift the module docstring already accepts across
+    sections, so there is no genuine cross-query dependency to protect here.
     """
-    with catalog.lock:
-        conn = catalog._conn
-        date_counts = {
-            row["date_tier"]: row["n"]
-            for row in conn.execute(
-                "SELECT date_tier, COUNT(*) AS n FROM photos "
-                "WHERE organized_path IS NOT NULL GROUP BY date_tier"
-            )
-        }
-        descriptor_counts = {
-            row["descriptor_tier"]: row["n"]
-            for row in conn.execute(
-                "SELECT descriptor_tier, COUNT(*) AS n FROM photos "
-                "WHERE organized_path IS NOT NULL GROUP BY descriptor_tier"
-            )
-        }
+    date_counts = {
+        row["date_tier"]: row["n"]
+        for row in catalog.run_select(
+            "SELECT date_tier, COUNT(*) AS n FROM photos "
+            "WHERE organized_path IS NOT NULL GROUP BY date_tier"
+        )
+    }
+    descriptor_counts = {
+        row["descriptor_tier"]: row["n"]
+        for row in catalog.run_select(
+            "SELECT descriptor_tier, COUNT(*) AS n FROM photos "
+            "WHERE organized_path IS NOT NULL GROUP BY descriptor_tier"
+        )
+    }
 
     date_tiers = [
         {"tier": t, "source": tiers.DATE_SOURCE_NAMES[t], "count": date_counts.get(t, 0)}
@@ -406,26 +438,30 @@ def _queues_section(catalog: Catalog, unenriched_count: int | None) -> dict:
     `_projection_section`'s identical call) and why the value can be `None`
     (the precomputing call itself failed) rather than crashing this section.
 
-    This module's raw-SQL queries below acquire ``catalog.lock`` around the
-    whole block (see CRITICAL finding #2): `dashboard/stats.py` reaches
-    `catalog._conn` directly for aggregate SQL that has no `Catalog` wrapper
-    method, so it must take the same lock every guarded `Catalog` method
-    takes internally, or these queries would race the watcher's writes on
-    the shared connection exactly like the wrapped methods used to before
-    the lock existed.
+    Migrated (Task 3) from raw connection access to ``catalog.run_select``.
+
+    Snapshot-consistency judgment (Task 3): the two queries below ARE kept
+    under one outer ``with catalog.lock:`` (RLock reentrancy makes that
+    safe). `quarantined` (``quarantined = 1``) and `failed_active`
+    (``quarantined = 0``) are a complementary partition of `failed_files` --
+    letting them race would allow a row whose `quarantined` flag flips
+    between the two reads to show up in BOTH lists for one poll (listed as
+    quarantined and still-active at once), which is a materially confusing
+    display, not just a harmless one-row undercount. That is worse than the
+    class of drift `_evidence_section` tolerates, so the shared snapshot is
+    kept here.
     """
     with catalog.lock:
-        conn = catalog._conn
-        quarantined_rows = conn.execute(
+        quarantined_rows = catalog.run_select(
             "SELECT source_path, last_error, fail_count, first_failed_at, last_failed_at "
             "FROM failed_files WHERE quarantined = 1 ORDER BY last_failed_at DESC"
-        ).fetchall()
+        )
         quarantined = [dict(r) for r in quarantined_rows]
 
-        failed_active_rows = conn.execute(
+        failed_active_rows = catalog.run_select(
             "SELECT source_path, last_error, fail_count, first_failed_at, last_failed_at "
             "FROM failed_files WHERE quarantined = 0 ORDER BY last_failed_at DESC"
-        ).fetchall()
+        )
         failed_active = [dict(r) for r in failed_active_rows]
 
     takeout = catalog.takeout.status_counts()
