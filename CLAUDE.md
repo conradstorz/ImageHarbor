@@ -418,7 +418,8 @@ Module responsibilities:
   *both* threads, so splitting the connection would still leave that seam
   unguarded — the lock is the smaller change that actually closes the gap.
   `dashboard/stats.py`'s three sections and `dashboard/people.py`'s four
-  reach-in call sites that run aggregate SQL no `Catalog`/`FaceStore`
+  functions (`review_queue`, `merge`, `split`, `crop_bytes`) that run
+  aggregate SQL no `Catalog`/`FaceStore`
   wrapper method covers go through **`run_select(sql, params=())`** (Task
   3, R5) — a guarded, SELECT-only read door defined identically on both
   `Catalog` and `FaceStore` that takes `self.lock` internally per call and

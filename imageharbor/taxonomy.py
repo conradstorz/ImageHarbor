@@ -166,7 +166,6 @@ class Taxonomy:
     """
 
     def __init__(self, catalog: Catalog) -> None:
-        self._cat = catalog
         self._store = catalog.taxonomy_store
 
     # ------------------------------------------------------------------

@@ -30,6 +30,8 @@ detail.
 
 ## Release 1 — v1.0.0 "Foundation" (CI/CD, versioning, cleanups)
 
+Shipped: v1.0.0 / v1.0.1 (2026-09-13)
+
 The first official release. v1.0.0 rather than v0.2.0: the tool is in daily
 production use on hpz440 and the review graded the engineering A− — the
 0.1.0 label was the fiction, not the maturity.
@@ -109,6 +111,8 @@ merge after it auto-tags `v1.0.1` with no human action.
 
 ## Release 2 — Security hardening (High + Med-High findings)
 
+Shipped: v1.1.0
+
 - **Dashboard exposure (High).** Bind `127.0.0.1` by default; add
   `--dashboard-host` / `IMAGEHARBOR_DASHBOARD_HOST` (compose sets it to
   `0.0.0.0` explicitly, inside a container that publishes to the tailnet
@@ -132,6 +136,8 @@ in a test that fails on the old code.
 ---
 
 ## Release 3 — Integrity & failure-handling corrections
+
+Shipped: v1.2.0
 
 - **`pick_class` breaker leak.** Wrap `classifier.pick_class()` (and audit
   `adjudicate`'s path) in `enrich.py` so a backend failure there is
@@ -159,6 +165,8 @@ in a test that fails on the old code.
 
 ## Release 4 — Test-debt paydown
 
+Shipped: v1.2.1
+
 - Add `tests/conftest.py`; consolidate the duplicated fixtures (`catalog`
   ×14, `organized_dir` ×7, `store`/`source_dir`/`face_store` ×4) and
   remove the cross-module fixture imports.
@@ -180,6 +188,8 @@ in a test that fails on the old code.
 ---
 
 ## Release 5 — Structural debt
+
+Shipping as v1.3.0
 
 Largest-risk refactors last, behind the CI gate the earlier releases built.
 

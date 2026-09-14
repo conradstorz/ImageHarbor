@@ -188,6 +188,8 @@ def _rate(parsed: _ParsedRun) -> float | None | _UnreadableType:
         return UNREADABLE
     hours = seconds / 3600.0
     if hours <= 0:
+        # Unreachable while MIN_PASS_SECONDS >= 1.0; kept as a floor in case
+        # that constant moves.
         return UNREADABLE
     enriched = _parse_enriched(parsed.enriched_raw)
     if enriched is None:

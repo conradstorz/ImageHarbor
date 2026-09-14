@@ -247,12 +247,21 @@ class Catalog:
     remains available later as a pure optimization rather than a
     correctness requirement.
 
-    `dashboard/stats.py`'s three sections that run ad hoc aggregate SQL
-    directly against `catalog._conn` (`_library_section`, `_evidence_section`,
-    `_queues_section`) acquire this same `self.lock` around their query
-    blocks rather than going through a wrapped method -- see that module's
-    comments at each call site. Every other section reaches the catalog only
-    through the guarded public methods below.
+    `dashboard/stats.py`'s three sections that run ad hoc aggregate SQL with
+    no dedicated `Catalog` wrapper method (`_library_section`,
+    `_evidence_section`, `_queues_section`) do not reach `self._conn`
+    directly -- they go through **`run_select(sql, params=())`**, a guarded,
+    SELECT-only read door that takes `self.lock` internally per call and
+    raises `ValueError` for anything not starting with `SELECT`. A block
+    whose several `run_select` calls need one consistent snapshot (e.g.
+    `_library_section`'s complementary enriched/unenriched partition)
+    additionally wraps them in one outer `with self.lock:` -- safe because
+    the lock is reentrant -- while a block with no such cross-query
+    dependency (e.g. `_evidence_section`'s two independent tier
+    distributions) lets each `run_select` call take and release the lock on
+    its own. See that module's docstring for the full reasoning. Every other
+    section reaches the catalog only through the guarded public methods
+    below.
     """
 
     def __init__(self, db_path: Path) -> None:

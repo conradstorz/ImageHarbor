@@ -498,8 +498,11 @@
       lastRunEl.textContent =
         "last pass (" + r.kind + "): " + (r.copied || 0) + " copied · " +
         (r.duplicates || 0) + " duplicates · " + (r.errors || 0) + " errors · " +
-        (r.enriched || 0) + " enriched · " +
-        fmtFailedSplit(r.enrich_failed ?? 0, r.enrich_ai_failed, r.enrich_io_failed) + " enrich failed";
+        (r.enriched || 0) + " enriched" +
+        // A facts row structurally has no enrichment -- suppress the
+        // "N enrich failed" segment rather than report a meaningless 0.
+        (r.kind === "facts" ? "" :
+          " · " + fmtFailedSplit(r.enrich_failed ?? 0, r.enrich_ai_failed, r.enrich_io_failed) + " enrich failed");
     } else {
       lastRunEl.textContent = "no completed pass yet";
     }

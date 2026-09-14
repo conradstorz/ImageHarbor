@@ -32,7 +32,7 @@ from .store import FaceStore, ScannedFace
 logger = logging.getLogger(__name__)
 
 
-class ModelsUnavailableError(RuntimeError):
+class InsufficientAnchorsError(RuntimeError):
     """Raised when a faces operation can't proceed with the data on hand.
 
     This is a domain exception, not a CLI concern -- `runner.py` has no
@@ -246,7 +246,7 @@ def measure_threshold(
         # only after trying to np.stack an anchor list that may have zero or
         # one rows -- a much less legible failure for a CLI user than a
         # message that names the actual shortfall.
-        raise ModelsUnavailableError(
+        raise InsufficientAnchorsError(
             "calibration needs anchor photos (exactly one detected face, "
             "exactly one Google-tagged name) for at least two distinct "
             f"people; found {len(distinct_names)}. Tag more photos in "
