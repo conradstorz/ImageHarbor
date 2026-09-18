@@ -43,6 +43,22 @@ logger = logging.getLogger(__name__)
 RowOutcome = Literal["ok", "failed_continue", "aborted"]
 
 
+@dataclass(frozen=True)
+class EnrichFailure:
+    """One failed row, with WHY it failed.
+
+    ``reason`` is "AI" (a classifier backend call raised -- the same evidence
+    that feeds the breaker and poison quarantine) or "IO" (local work after
+    perception, or a missing organized file). ``organized_path`` is None when
+    the file could not be located at all.
+    """
+
+    digest: str
+    organized_path: Path | None
+    reason: str
+    detail: str
+
+
 @dataclass
 class EnrichStats:
     """Aggregated statistics for an enrichment pass."""
@@ -61,6 +77,10 @@ class EnrichStats:
     # never count toward quarantining that original.
     ai_failed: list[str] = field(default_factory=list)
     io_failed: list[str] = field(default_factory=list)
+    # Every failure above, with its path and reason, for report consumers
+    # (`api.EnrichReport`). Additive: ai_failed/io_failed are unchanged and
+    # remain what the watcher's poison accounting reads.
+    failures: list[EnrichFailure] = field(default_factory=list)
 
 
 def _describe_row(
@@ -86,6 +106,7 @@ def _describe_row(
         logger.warning("Enrichment failed for %s: %s", actual.name, exc)
         stats.errors += 1
         stats.ai_failed.append(digest)
+        stats.failures.append(EnrichFailure(digest, actual, "AI", str(exc)))
         if breaker is not None:
             breaker.record_failure()
             if breaker.is_open():
@@ -161,6 +182,7 @@ def _apply_enrichment(
                 )
                 stats.errors += 1
                 stats.ai_failed.append(digest)
+                stats.failures.append(EnrichFailure(digest, actual, "AI", str(exc)))
                 if breaker is not None:
                     breaker.record_failure()
                     if breaker.is_open():
@@ -314,6 +336,7 @@ def _apply_enrichment(
         )
         stats.errors += 1
         stats.io_failed.append(digest)
+        stats.failures.append(EnrichFailure(digest, actual, "IO", str(exc)))
         return "failed_continue"
 
     return "ok"
@@ -381,6 +404,9 @@ def enrich_library(
             logger.error("Organized file missing for %s (%s)", digest, recorded)
             stats.errors += 1
             stats.io_failed.append(digest)
+            stats.failures.append(
+                EnrichFailure(digest, None, "IO", f"Organized file missing: {recorded}")
+            )
             continue
 
         outcome, content = _describe_row(
