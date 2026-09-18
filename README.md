@@ -148,6 +148,82 @@ image's JSON sidecar, not in the path or filename.
 
 Run `imageharbor --help` (or `<command> --help`) for the full flag list.
 
+## Calling from Python
+
+ImageHarbor is importable. Install it from git:
+
+```bash
+uv add git+https://github.com/conradstorz/ImageHarbor
+```
+
+```python
+from imageharbor import process, enrich, verify, stats, AIConfig, ImageHarborError, Aborted, ERROR
+
+try:
+    report = process("/photos/incoming", "/photos/organized")
+    if not report.ok:
+        for row in report.rows:
+            if row.outcome == ERROR:
+                print("failed:", row.source_path, row.detail)
+    enriched = enrich("/photos/organized", ai=AIConfig(backend="openai", base_url="http://jetson:11434/v1", model="llava"))
+except Aborted as exc:          # breaker tripped; exc.report is the partial report
+    print("backend down after", exc.report.counts)
+except ImageHarborError as exc:  # ConfigError: bad paths, unknown backend, missing extra
+    raise SystemExit(str(exc))
+
+print(verify("/photos/organized").counts)
+print(stats("/photos/organized/catalog.db")["library"])
+```
+
+Every call opens and closes its own catalog, blocks for the pass, and never
+raises for a single bad file — that becomes an `ERROR` row. `report.to_dict()`
+is the same document `--json` prints. `stats()` returns the dashboard's
+`/api/stats` document without a running `watch`.
+
+Only these names are promised: `process`, `enrich`, `verify`, `stats`,
+`AIConfig`, the three `*Report` and three `*Row` types, the outcome constants,
+and `ImageHarborError`/`ConfigError`/`Aborted`. Everything else in the package
+is importable but may change.
+
+**Licence note.** ImageHarbor is AGPL-3.0-or-later. Importing it in-process
+places the importing program under the AGPL; running it as a subprocess (below)
+does not.
+
+## Calling as a subprocess
+
+`process`, `enrich`, and `verify` take `--json`: stdout is exactly one JSON
+document (the report's `to_dict()`), diagnostics go to stderr, and the exit
+code follows nas-ingest's convention:
+
+| exit | meaning |
+|------|---------|
+| 0 | ok |
+| 1 | finished, but the report has `ERROR` rows (`verify`: `FAILED` rows) |
+| 2 | could not start (config error) or did not finish (breaker abort). A document with an `"error"` key is still printed when a report exists. |
+
+```python
+import json, subprocess
+r = subprocess.run(["imageharbor", "process", "--source", src, "--dest", dest, "--json"],
+                   capture_output=True, text=True)
+if r.returncode in (0, 1):
+    report = json.loads(r.stdout)
+    print(report["counts"])
+```
+
+Report shapes (keys are additive-only from here):
+
+```
+process: {source, dest, catalog, dry_run, started, finished,
+          counts: {COPIED, DUPLICATE, SKIPPED, ERROR, TOTAL},
+          rows: [{source_path, outcome, dest_path, digest, detail}]}
+enrich:  {dest, catalog, ai_backend, started, finished, aborted,
+          counts: {ENRICHED, RENAMED, ERROR, TOTAL},
+          rows: [{digest, dest_path, reason: "AI"|"IO", detail}]}   # failures only
+verify:  {path, started, finished,
+          counts: {OK, FAILED, SKIPPED},
+          rows: [{path, outcome: "OK"|"FAILED", digest}]}
+```
+
 ## Install
 
 Requires Python >= 3.10 and [uv](https://docs.astral.sh/uv/).

@@ -47,6 +47,7 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 | Report Takeout ingestion progress | `uv run imageharbor takeout status --catalog DEST/catalog.db` |
 | Survey an archive set before ingesting (read-only, standalone) | `uv run imageharbor takeout survey --archives DIR --json report.json` |
 | Re-verify integrity | `uv run imageharbor verify DEST` |
+| Same, as one JSON document on stdout (exit 0/1/2) | `uv run imageharbor process … --json` (also `enrich`, `verify`) |
 | Watch a library continuously (both passes) | `uv run imageharbor watch --source SRC --dest DEST` |
 | Build the Docker image | `docker build -t imageharbor:latest .` |
 | Run the watcher (compose) | `docker compose up -d` (see `docs/deploy-docker.md`) |
@@ -537,17 +538,34 @@ Module responsibilities:
   writes at all, including no quarantine of an unparseable existing sidecar —
   it passes `quarantine=False` to `sidecar.read_sidecar` for exactly that
   reason.
-- **`api.py`** — the public library facade (`process`, `enrich`, `verify`,
-  `stats`, report dataclasses, `ImageHarborError`/`ConfigError`/`Aborted`,
-  `AIConfig`). Filled in by the library-API work; see
-  `docs/superpowers/specs/2026-09-18-library-api-design.md`.
+- **`api.py`** — the public library facade and the only promised import
+  surface: `process()`, `enrich()`, `verify()`, `stats()`, frozen
+  `ProcessReport`/`EnrichReport`/`VerifyReport` (+ row types) with
+  `to_dict()`, `AIConfig`, and `ImageHarborError` → `ConfigError` (could not
+  start) / `Aborted` (breaker tripped; carries the partial `EnrichReport` as
+  `.report`). It only *wraps* the orchestrators — no placement, naming,
+  hashing, or catalog logic lives here. A per-file problem is a row, never
+  an exception. `stats()` imports the dashboard package *inside* the
+  function so `import imageharbor` stays light. Re-exported from
+  `imageharbor/__init__.py`; `__all__` there is the contract. Spec:
+  `docs/superpowers/specs/2026-09-18-library-api-design.md`. `from
+  imageharbor import enrich` binds this module's `enrich()` **function** —
+  reach the `imageharbor.enrich` **module** with `from imageharbor.enrich
+  import ...` instead. Because `imageharbor/__init__.py` imports `api.py`
+  eagerly, `import imageharbor.pipeline` now also loads `api`/`enrich`
+  along the way, but the AI classifier module stays off that import path —
+  `api.py`'s and `enrich.py`'s references to `AIClassifier` are
+  `TYPE_CHECKING`-only, so the facts pass still makes no AI-module import.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
   `catalog list/get`, `takeout ingest/status`, `sidecar backfill`, `faces
   scan/cluster/calibrate/status/models download`). `_build_classifier` and
   `_guard_dest_not_inside_source` live in `api.py` (the public facade — see
   its bullet) and raise `api.ConfigError`; `cli.py` converts that to
   `_ConfigFailure` (a `ClickException` with `exit_code = 2`) at each call
-  site. `watch` gains five dashboard flags alongside its existing
+  site. `process`/`enrich`/`verify` are thin renderers over `api.*`:
+  `--json` prints `report.to_dict()` as the only stdout line; exit 0 = ok, 1
+  = ERROR/FAILED rows, 2 = `ConfigError` or `Aborted` (`_ConfigFailure` is
+  `ClickException` with `exit_code = 2`). `watch` gains five dashboard flags alongside its existing
   `--sidecar`-style options:
   `--dashboard-port` (`IMAGEHARBOR_DASHBOARD_PORT`, default `8080`),
   `--no-dashboard` (a bare flag; the dashboard is on by default),
@@ -926,6 +944,11 @@ Module responsibilities:
   without each of them re-normalizing (or worse, one of them forgetting to).
   A stored embedding that somehow isn't unit-length is a bug upstream of
   storage, not something a consumer should silently correct for.
+- **The `--json` document and exit codes are a stable contract.**
+  `organize-my-life` consumes them as a subprocess tool. `to_dict()` keys
+  may be added, never removed or retyped; the outcome constants and the
+  0/1/2 exit mapping do not change. The same goes for every name in
+  `imageharbor.__all__`.
 
 ## Known limitations
 

@@ -7,6 +7,25 @@ the single source of version truth (`setuptools-scm`); per-release notes are
 generated on each GitHub Release. This file curates the human summary for
 notable releases only — not every patch.
 
+## [1.4.0] — unreleased
+
+Library API and `--json` contract, for `organize-my-life`:
+
+- `from imageharbor import process, enrich, verify, stats` — a promised
+  facade over the two passes, returning frozen reports with `to_dict()`.
+  `ImageHarborError` → `ConfigError` / `Aborted` (the latter carries the
+  partial `EnrichReport`). `AIConfig` replaces five loose AI parameters.
+- `--json` on `process`, `enrich`, `verify`: one document on stdout,
+  diagnostics on stderr.
+- Exit codes now follow nas-ingest: 0 ok, 1 ERROR/FAILED rows, 2 could not
+  start or did not finish. **Behaviour change:** config errors (dest inside
+  source, unknown backend, missing `openai` extra), `enrich` on a breaker
+  trip, and `verify` with nothing verifiable all exit 2 (were 1); `enrich`
+  on a dest with no catalog is a config error (exit 2) instead of silently
+  creating an empty catalog.
+- `EnrichStats.failures` records path and AI/IO reason per failed row
+  (additive; `ai_failed`/`io_failed` unchanged).
+
 ## [1.3.0] — 2026-09-13
 
 Structural debt paydown (R5 whole-branch review):
