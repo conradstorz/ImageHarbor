@@ -18,6 +18,8 @@ from typing import Any
 
 from .ai_classifier import AIClassifier
 from .catalog import Catalog
+from .circuit_breaker import CircuitBreaker
+from .enrich import EnrichStats, enrich_library
 from .pipeline import Pipeline, ProcessResult
 from .util import now_iso
 
@@ -53,7 +55,7 @@ class Aborted(ImageHarborError):
     def __init__(
         self,
         message: str,
-        report: "EnrichReport | None" = None,  # type: ignore[name-defined]  # noqa: F821
+        report: "EnrichReport | None" = None,
     ) -> None:
         super().__init__(message)
         self.report = report
@@ -232,3 +234,116 @@ def process(
         dry_run=dry_run, started=started, finished=finished,
         counts=counts, rows=rows,
     )
+
+
+# ---------------------------------------------------------------------------
+# enrich()
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EnrichFailureRow:
+    digest: str
+    dest_path: str | None
+    reason: str           # AI | IO
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclass(frozen=True)
+class EnrichReport:
+    dest: str
+    catalog: str
+    ai_backend: str
+    started: str
+    finished: str
+    aborted: bool
+    counts: dict[str, int]
+    rows: tuple[EnrichFailureRow, ...]   # failures only
+
+    @property
+    def ok(self) -> bool:
+        return not self.aborted and self.counts.get(ERROR, 0) == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dest": self.dest,
+            "catalog": self.catalog,
+            "ai_backend": self.ai_backend,
+            "started": self.started,
+            "finished": self.finished,
+            "aborted": self.aborted,
+            "counts": dict(self.counts),
+            "rows": [r.to_dict() for r in self.rows],
+        }
+
+
+def _enrich_report(
+    stats: EnrichStats, *, dest: Path, catalog: Path, ai_backend: str,
+    started: str, finished: str,
+) -> EnrichReport:
+    rows = tuple(
+        EnrichFailureRow(
+            digest=f.digest, dest_path=_path_str(f.organized_path),
+            reason=f.reason, detail=f.detail,
+        )
+        for f in stats.failures
+    )
+    counts = {
+        ENRICHED: stats.enriched,
+        RENAMED: stats.renamed,
+        ERROR: stats.errors,
+        TOTAL: stats.total,
+    }
+    return EnrichReport(
+        dest=str(dest), catalog=str(catalog), ai_backend=ai_backend,
+        started=started, finished=finished, aborted=stats.aborted,
+        counts=counts, rows=rows,
+    )
+
+
+def enrich(
+    dest: "Path | str",
+    *,
+    catalog: "Path | str | None" = None,
+    ai: AIConfig = AIConfig(),  # noqa: B008 -- AIConfig is frozen/immutable
+    sidecar: bool = True,
+    breaker_threshold: int = 5,
+    limit: int | None = None,
+    reclassify: bool = False,
+) -> EnrichReport:
+    """The enrichment pass over an already-organized library.
+
+    Raises ConfigError if the catalog does not exist or the backend cannot be
+    built; raises Aborted (carrying the partial report) when the circuit
+    breaker trips. ``breaker_threshold=0`` disables the breaker. A per-row
+    failure is a row in ``report.rows``, never an exception.
+    """
+    dest_p = Path(dest)
+    catalog_p = Path(catalog) if catalog is not None else dest_p / "catalog.db"
+    if not catalog_p.is_file():
+        raise ConfigError(f"catalog not found: {catalog_p}")
+    classifier = _build_classifier(ai)
+    breaker = CircuitBreaker(trip_threshold=breaker_threshold, backoff_base=60.0, backoff_cap=900.0)
+
+    started = now_iso()
+    with Catalog(catalog_p) as cat:
+        stats = enrich_library(
+            cat, dest_p, classifier,
+            write_sidecars=sidecar, breaker=breaker, limit=limit, reclassify=reclassify,
+        )
+    finished = now_iso()
+
+    report = _enrich_report(
+        stats, dest=dest_p, catalog=catalog_p, ai_backend=ai.backend.lower(),
+        started=started, finished=finished,
+    )
+    if stats.aborted:
+        raise Aborted(
+            f"AI backend appears down — aborted after {breaker.trip_threshold} "
+            "consecutive failures.",
+            report,
+        )
+    return report

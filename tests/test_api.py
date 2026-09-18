@@ -148,3 +148,84 @@ def test_process_report_to_dict_round_trips_json(tmp_path: Path):
         "source_path": report.rows[0].source_path, "outcome": "COPIED",
         "dest_path": report.rows[0].dest_path, "digest": report.rows[0].digest, "detail": "",
     }
+
+
+class _Boom(StubClassifier):
+    def describe(self, image_path, exif_data):
+        raise RuntimeError("down")
+
+
+def _organized(tmp_path: Path, n: int = 3) -> Path:
+    dest = tmp_path / "org"
+    api.process(_source(tmp_path, n), dest)
+    return dest
+
+
+def test_enrich_happy_path_counts_and_no_rows(tmp_path: Path):
+    dest = _organized(tmp_path, 2)
+    report = api.enrich(dest)
+    assert report.ok and not report.aborted
+    assert report.ai_backend == "stub"
+    assert report.counts[api.ENRICHED] == 2 and report.counts[api.TOTAL] == 2
+    assert report.counts[api.ERROR] == 0 and api.RENAMED in report.counts
+    assert report.rows == ()
+    assert report.catalog == str(dest / "catalog.db")
+
+
+def test_enrich_is_idempotent_second_run_has_nothing_to_do(tmp_path: Path):
+    dest = _organized(tmp_path, 2)
+    api.enrich(dest)
+    again = api.enrich(dest)
+    assert again.ok and again.counts[api.TOTAL] == 0
+
+
+def test_enrich_breaker_trip_raises_aborted_with_partial_report(tmp_path: Path, monkeypatch):
+    dest = _organized(tmp_path, 4)
+    monkeypatch.setattr(api, "_build_classifier", lambda ai: _Boom())
+    with pytest.raises(api.Aborted) as ei:
+        api.enrich(dest, breaker_threshold=2)
+    report = ei.value.report
+    assert report is not None and report.aborted and not report.ok
+    assert report.counts[api.ERROR] == 2
+    assert len(report.rows) == 2
+    assert all(r.reason == api.AI and "down" in r.detail for r in report.rows)
+    assert all(r.dest_path is not None for r in report.rows)
+
+
+def test_enrich_breaker_disabled_runs_every_row_and_returns(tmp_path: Path, monkeypatch):
+    dest = _organized(tmp_path, 3)
+    monkeypatch.setattr(api, "_build_classifier", lambda ai: _Boom())
+    report = api.enrich(dest, breaker_threshold=0)
+    assert not report.aborted and not report.ok
+    assert report.counts[api.ERROR] == 3 and len(report.rows) == 3
+
+
+def test_enrich_missing_organized_file_is_an_io_row(tmp_path: Path):
+    dest = _organized(tmp_path, 1)
+    victim = next(p for p in dest.rglob("*.jpg"))
+    victim.unlink()
+    report = api.enrich(dest)
+    assert not report.ok and not report.aborted
+    assert len(report.rows) == 1
+    row = report.rows[0]
+    assert row.reason == api.IO and row.dest_path is None and "missing" in row.detail.lower()
+
+
+def test_enrich_missing_catalog_is_a_config_error(tmp_path: Path):
+    with pytest.raises(api.ConfigError):
+        api.enrich(tmp_path / "nowhere")
+
+
+def test_enrich_unknown_backend_is_a_config_error(tmp_path: Path):
+    dest = _organized(tmp_path, 1)
+    with pytest.raises(api.ConfigError):
+        api.enrich(dest, ai=api.AIConfig(backend="nope"))
+
+
+def test_enrich_report_to_dict_round_trips_json(tmp_path: Path):
+    dest = _organized(tmp_path, 1)
+    victim = next(p for p in dest.rglob("*.jpg"))
+    victim.unlink()
+    doc = json.loads(json.dumps(api.enrich(dest).to_dict()))
+    assert set(doc) == {"dest", "catalog", "ai_backend", "started", "finished", "aborted", "counts", "rows"}
+    assert doc["rows"][0]["reason"] == "IO" and doc["rows"][0]["dest_path"] is None
