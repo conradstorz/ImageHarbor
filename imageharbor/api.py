@@ -423,3 +423,28 @@ def verify(path: "Path | str") -> VerifyReport:
     }
     return VerifyReport(path=str(target), started=started, finished=finished,
                         counts=counts, rows=tuple(rows))
+
+
+# ---------------------------------------------------------------------------
+# stats()
+# ---------------------------------------------------------------------------
+
+
+def stats(catalog: "Path | str") -> dict[str, Any]:
+    """The dashboard's ``/api/stats`` document for a library, without a
+    running `watch`.
+
+    Sections that need a live process (breaker state, the current run) read
+    as they would for an idle watcher. A failing section is ``None`` in the
+    document, never an exception -- `dashboard.stats.collect`'s own posture.
+    Raises ConfigError if the catalog file does not exist.
+    """
+    from .dashboard.control import ControlPlane
+    from .dashboard.stats import collect
+
+    catalog_p = Path(catalog)
+    if not catalog_p.is_file():
+        raise ConfigError(f"catalog not found: {catalog_p}")
+    with Catalog(catalog_p) as cat:
+        control = ControlPlane(cat, env_interval=0.0, env_enrich=False)
+        return collect(cat, control)

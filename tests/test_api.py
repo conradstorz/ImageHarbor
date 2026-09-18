@@ -284,3 +284,24 @@ def test_verify_report_to_dict_round_trips_json(tmp_path: Path):
     doc = json.loads(json.dumps(api.verify(_organized(tmp_path, 1)).to_dict()))
     assert set(doc) == {"path", "started", "finished", "counts", "rows"}
     assert doc["rows"][0]["outcome"] == "OK"
+
+
+def test_stats_returns_the_dashboard_document(tmp_path: Path):
+    dest = _organized(tmp_path, 2)
+    doc = api.stats(dest / "catalog.db")
+    assert {"now", "library", "evidence", "queues", "history", "projection"} <= set(doc)
+    assert doc["library"] is not None
+    json.dumps(doc)   # must be serialisable as-is
+
+
+def test_stats_accepts_str_and_reflects_the_library(tmp_path: Path):
+    dest = _organized(tmp_path, 3)
+    before = api.stats(str(dest / "catalog.db"))
+    api.enrich(dest)
+    after = api.stats(str(dest / "catalog.db"))
+    assert before != after   # enrichment changed at least one section
+
+
+def test_stats_missing_catalog_is_a_config_error(tmp_path: Path):
+    with pytest.raises(api.ConfigError):
+        api.stats(tmp_path / "nope.db")
