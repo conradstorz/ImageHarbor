@@ -175,8 +175,10 @@ print(verify("/photos/organized").counts)
 print(stats("/photos/organized/catalog.db")["library"])
 ```
 
-Every call opens and closes its own catalog, blocks for the pass, and never
-raises for a single bad file — that becomes an `ERROR` row. `report.to_dict()`
+`process`, `enrich`, and `stats` each open and close their own catalog
+(`verify` needs none — it checks each file against the digest in its own
+name). Every call blocks for the pass and never raises for a single bad
+file — that becomes an `ERROR` row. `report.to_dict()`
 is the same document `--json` prints. `stats()` returns the dashboard's
 `/api/stats` document without a running `watch`.
 
@@ -199,7 +201,7 @@ code follows nas-ingest's convention:
 |------|---------|
 | 0 | ok |
 | 1 | finished, but the report has `ERROR` rows (`verify`: `FAILED` rows) |
-| 2 | could not start (config error) or did not finish (breaker abort). A document with an `"error"` key is still printed when a report exists. |
+| 2 | could not start (config error), did not finish (breaker abort), or `verify` found nothing verifiable. A document with an `"error"` key is still printed when a report exists. |
 
 ```python
 import json, subprocess
