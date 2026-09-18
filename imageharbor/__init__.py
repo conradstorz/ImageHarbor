@@ -27,3 +27,42 @@ except PackageNotFoundError:  # source tree with no installed dist
     # branch is unreachable under the documented `uv run` workflow (the dist is
     # always installed). Do not "fix" this to look like a real version.
     __version__ = "unknown+uninstalled"
+
+from .api import (  # noqa: E402  -- __version__ must resolve first
+    AI,
+    COPIED,
+    DUPLICATE,
+    ENRICHED,
+    ERROR,
+    FAILED,
+    IO,
+    OK,
+    RENAMED,
+    SKIPPED,
+    TOTAL,
+    Aborted,
+    AIConfig,
+    ConfigError,
+    EnrichFailureRow,
+    EnrichReport,
+    ImageHarborError,
+    ProcessReport,
+    ProcessRow,
+    VerifyReport,
+    VerifyRow,
+    enrich,
+    process,
+    stats,
+    verify,
+)
+
+__all__ = [
+    "process", "enrich", "verify", "stats",
+    "AIConfig",
+    "ProcessReport", "EnrichReport", "VerifyReport",
+    "ProcessRow", "EnrichFailureRow", "VerifyRow",
+    "COPIED", "DUPLICATE", "SKIPPED", "ERROR", "ENRICHED", "RENAMED", "TOTAL",
+    "AI", "IO", "OK", "FAILED",
+    "ImageHarborError", "ConfigError", "Aborted",
+    "__version__",
+]

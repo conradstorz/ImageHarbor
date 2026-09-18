@@ -32,6 +32,7 @@ pyproject.toml, which makes inclusion independent of git metadata.
 from __future__ import annotations
 
 import ast
+import os
 import re
 import shutil
 import subprocess
@@ -234,3 +235,41 @@ def test_the_documented_dev_install_covers_every_module_scope_test_import():
         "in pyproject.toml, or reach it through pytest.importorskip so the "
         "test skips instead of erroring."
     )
+
+
+# -- the documented public library API must resolve from the package --------
+
+PUBLIC_API = [
+    "process", "enrich", "verify", "stats",
+    "AIConfig",
+    "ProcessReport", "EnrichReport", "VerifyReport",
+    "ProcessRow", "EnrichFailureRow", "VerifyRow",
+    "COPIED", "DUPLICATE", "SKIPPED", "ERROR", "ENRICHED", "RENAMED", "TOTAL",
+    "AI", "IO", "OK", "FAILED",
+    "ImageHarborError", "ConfigError", "Aborted",
+    "__version__",
+]
+
+
+def test_the_package_exports_the_documented_public_api():
+    import imageharbor
+
+    assert set(imageharbor.__all__) == set(PUBLIC_API)
+    for name in PUBLIC_API:
+        assert hasattr(imageharbor, name), name
+
+
+def test_the_public_api_imports_from_the_built_wheel(wheel_built_without_git: Path, tmp_path: Path):
+    """The wheel, installed into a scratch venv with no dev extras, must
+    expose every public name -- what `uv add git+…` gives a consumer."""
+    venv = tmp_path / "venv"
+    subprocess.run(["uv", "venv", str(venv)], check=True, capture_output=True, text=True, timeout=120)
+    subprocess.run(
+        ["uv", "pip", "install", "--python", str(venv), str(wheel_built_without_git)],
+        check=True, capture_output=True, text=True, timeout=600,
+    )
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    code = "import imageharbor as ih; " + "; ".join(f"ih.{n}" for n in PUBLIC_API) + "; print('ok')"
+    proc = subprocess.run([str(python), "-c", code], capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "ok"

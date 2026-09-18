@@ -14,9 +14,8 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .ai_classifier import AIClassifier
 from .catalog import Catalog
 from .circuit_breaker import CircuitBreaker
 from .discovery import SUPPORTED_EXTENSIONS
@@ -24,6 +23,14 @@ from .enrich import EnrichStats, enrich_library
 from .hashing import extract_digest_from_stem, verify_pcs_file
 from .pipeline import Pipeline, ProcessResult
 from .util import now_iso
+
+if TYPE_CHECKING:
+    # Type-only: `imageharbor/__init__.py` imports this module eagerly, and
+    # `imageharbor.pipeline` must remain importable without pulling in
+    # `imageharbor.ai_classifier` (see test_facts_pass_makes_no_ai_call) --
+    # the facts pass makes no AI call, so nothing on its import path may
+    # require an AI backend module at runtime.
+    from .ai_classifier import AIClassifier
 
 # Outcome and reason constants -- their own names, so a JSON consumer and a
 # Python consumer read the same string.

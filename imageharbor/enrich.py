@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal
 
 from . import concept_map, tiers
-from .ai_classifier import AIClassifier, ContentDescription
 from .catalog import Catalog
 from .date_resolver import date_from_row
 from .filename import normalize_descriptor
@@ -29,6 +28,11 @@ from .sidecar import merge_sidecar, sidecar_path_for
 from .taxonomy import Taxonomy
 
 if TYPE_CHECKING:
+    # Type-only, same reasoning as api.py: `imageharbor/__init__.py` imports
+    # `.api` -> `.enrich` eagerly, and `imageharbor.pipeline` must remain
+    # importable without pulling in `imageharbor.ai_classifier` (see
+    # test_facts_pass_makes_no_ai_call).
+    from .ai_classifier import AIClassifier, ContentDescription
     from .circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
