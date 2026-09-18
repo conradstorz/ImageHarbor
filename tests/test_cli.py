@@ -391,9 +391,14 @@ def test_enrich_command_exists_and_reports(tmp_path):
 
 
 def test_enrich_accepts_limit_and_reclassify(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
     dest = tmp_path / "dest"
-    dest.mkdir()
-    result = CliRunner().invoke(
+
+    runner = CliRunner()
+    runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    result = runner.invoke(
         main,
         ["enrich", "--dest", str(dest), "--ai", "stub", "--limit", "1", "--reclassify"],
     )
@@ -445,7 +450,7 @@ def test_verify_non_pcs_file_skipped(runner: CliRunner, tmp_path: Path) -> None:
 
     result = runner.invoke(main, ["verify", str(plain)])
     # Nothing was actually verified -> non-zero exit with a clear warning.
-    assert result.exit_code != 0, result.output
+    assert result.exit_code == 2, result.output
     # No per-file FAIL line (the summary word "FAILED" does not count).
     assert not any(ln.startswith("FAIL ") for ln in result.output.splitlines())
     assert "0 OK, 0 FAILED" in result.output
@@ -1254,7 +1259,7 @@ def test_enrich_command_aborts_and_reports_when_backend_down(tmp_path, monkeypat
         main,
         ["enrich", "--dest", str(dest), "--breaker-threshold", "2"],
     )
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "backend appears down" in result.output.lower()
 
 
