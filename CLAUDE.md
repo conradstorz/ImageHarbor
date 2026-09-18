@@ -537,10 +537,18 @@ Module responsibilities:
   writes at all, including no quarantine of an unparseable existing sidecar —
   it passes `quarantine=False` to `sidecar.read_sidecar` for exactly that
   reason.
+- **`api.py`** — the public library facade (`process`, `enrich`, `verify`,
+  `stats`, report dataclasses, `ImageHarborError`/`ConfigError`/`Aborted`,
+  `AIConfig`). Filled in by the library-API work; see
+  `docs/superpowers/specs/2026-09-18-library-api-design.md`.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
   `catalog list/get`, `takeout ingest/status`, `sidecar backfill`, `faces
-  scan/cluster/calibrate/status/models download`). `watch` gains five
-  dashboard flags alongside its existing `--sidecar`-style options:
+  scan/cluster/calibrate/status/models download`). `_build_classifier` and
+  `_guard_dest_not_inside_source` live in `api.py` (the public facade — see
+  its bullet) and raise `api.ConfigError`; `cli.py` converts that to
+  `_ConfigFailure` (a `ClickException` with `exit_code = 2`) at each call
+  site. `watch` gains five dashboard flags alongside its existing
+  `--sidecar`-style options:
   `--dashboard-port` (`IMAGEHARBOR_DASHBOARD_PORT`, default `8080`),
   `--no-dashboard` (a bare flag; the dashboard is on by default),
   `--dashboard-host` (`IMAGEHARBOR_DASHBOARD_HOST`, default `127.0.0.1` —

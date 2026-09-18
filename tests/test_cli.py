@@ -653,9 +653,9 @@ def test_enrich_ai_openai_without_package_fails_gracefully(
 
 def test_build_classifier_stub_default() -> None:
     from imageharbor.ai_classifier import StubClassifier
-    from imageharbor.cli import _build_classifier
+    from imageharbor.api import AIConfig, _build_classifier
 
-    clf = _build_classifier("stub", None, None, "gpt-4o-mini", 60.0)
+    clf = _build_classifier(AIConfig())
     assert isinstance(clf, StubClassifier)
 
 

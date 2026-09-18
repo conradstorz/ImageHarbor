@@ -10,6 +10,7 @@ from pathlib import Path
 import click
 
 from . import __version__
+from .api import AIConfig, ConfigError, _build_classifier, _guard_dest_not_inside_source
 from .catalog import Catalog
 from .enrich import enrich_library
 from .hashing import extract_digest_from_stem, verify_pcs_file
@@ -45,27 +46,11 @@ def main(log_level: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_classifier(
-    ai_backend: str,
-    api_key: str | None,
-    base_url: str | None,
-    model: str,
-    timeout: float,
-):
-    """Construct the AI classifier for the chosen backend. Raises a clean
-    ClickException if the optional 'openai' package is missing."""
-    if ai_backend == "openai":
-        from .ai_classifier import OpenAIClassifier
+class _ConfigFailure(click.ClickException):
+    """An api.ConfigError at the CLI edge: same message format, exit code 2
+    (nas-ingest's convention -- the run could not start)."""
 
-        try:
-            return OpenAIClassifier(
-                api_key=api_key, model=model, base_url=base_url, timeout=timeout
-            )
-        except ImportError as exc:
-            raise click.ClickException(str(exc)) from exc
-    from .ai_classifier import StubClassifier
-
-    return StubClassifier()
+    exit_code = 2
 
 
 def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
@@ -74,28 +59,6 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     return CircuitBreaker(
         trip_threshold=threshold, backoff_base=backoff, backoff_cap=backoff_cap
     )
-
-
-def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
-    """Refuse to run with --dest nested inside --source.
-
-    `enrich` and the duplicate-upgrade path (`pipeline._maybe_upgrade_from_
-    duplicate`) RENAME files under --dest. If --dest is a subdirectory of
-    --source, those renames would write into the source tree -- directly
-    violating "originals are read-only", the invariant the whole project is
-    built on. Only meaningful when --source is a directory; a single source
-    FILE cannot contain a --dest directory.
-    """
-    if not source.is_dir():
-        return
-    source_resolved = source.resolve()
-    dest_resolved = dest.resolve()
-    if dest_resolved == source_resolved or source_resolved in dest_resolved.parents:
-        raise click.ClickException(
-            f"--dest ({dest}) is inside --source ({source}). Renames performed "
-            "by enrich/watch would then write into the read-only source tree. "
-            "Choose a --dest that is not nested inside --source."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +126,10 @@ def process(
     to be configured. Run `enrich` afterwards to describe and classify the
     organized copies.
     """
-    _guard_dest_not_inside_source(source, dest)
+    try:
+        _guard_dest_not_inside_source(source, dest)
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
 
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
@@ -306,7 +272,13 @@ def enrich(
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
 
-    classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
+    try:
+        classifier = _build_classifier(
+            AIConfig(backend=ai_backend, base_url=ai_base_url, model=ai_model,
+                     timeout=ai_timeout, api_key=openai_key)
+        )
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
     breaker = _build_breaker(breaker_threshold, 60.0, 900.0)
 
     with Catalog(catalog_path) as catalog:
@@ -594,12 +566,21 @@ def watch(
     from .dashboard import server as dashboard_server
     from .dashboard.control import ControlPlane
 
-    _guard_dest_not_inside_source(source, dest)
+    try:
+        _guard_dest_not_inside_source(source, dest)
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
 
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
 
-    classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
+    try:
+        classifier = _build_classifier(
+            AIConfig(backend=ai_backend, base_url=ai_base_url, model=ai_model,
+                     timeout=ai_timeout, api_key=openai_key)
+        )
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
     dest.mkdir(parents=True, exist_ok=True)
     parsed_face_threshold = _parse_face_threshold(face_threshold)
 
@@ -941,7 +922,10 @@ def takeout_ingest(
     This is a facts pass: it makes no AI calls and requires no AI backend. Run
     `enrich` afterwards to describe and classify the organized copies.
     """
-    _guard_dest_not_inside_source(archives_dir, dest)
+    try:
+        _guard_dest_not_inside_source(archives_dir, dest)
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
 
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
