@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -58,7 +59,7 @@ class _ConfigFailure(click.ClickException):
     exit_code = 2
 
 
-def _emit_json(doc: dict) -> None:
+def _emit_json(doc: dict[str, Any]) -> None:
     """Under --json, stdout is exactly one document; everything else is stderr."""
     click.echo(json.dumps(doc))
 
@@ -126,9 +127,21 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     "as_json",
     is_flag=True,
     default=False,
-    help="Print the run report as one JSON document on stdout (exit 0 ok, 1 error rows, 2 aborted/config).",
+    help=(
+        "Print the run report as one JSON document on stdout "
+        "(exit 0 ok, 1 error rows, 2 aborted/config)."
+    ),
 )
-def process(source, dest, catalog_path, duplicates_dir, sidecar, dry_run, no_recursive, as_json) -> None:
+def process(
+    source: Path,
+    dest: Path,
+    catalog_path: Path | None,
+    duplicates_dir: Path | None,
+    sidecar: bool,
+    dry_run: bool,
+    no_recursive: bool,
+    as_json: bool,
+) -> None:
     """Discover, hash, copy and catalog photos from SOURCE to DEST.
 
     This is the facts pass: it makes no AI calls and requires no AI backend
@@ -247,10 +260,25 @@ def process(source, dest, catalog_path, duplicates_dir, sidecar, dry_run, no_rec
     "as_json",
     is_flag=True,
     default=False,
-    help="Print the run report as one JSON document on stdout (exit 0 ok, 1 error rows, 2 aborted/config).",
+    help=(
+        "Print the run report as one JSON document on stdout "
+        "(exit 0 ok, 1 error rows, 2 aborted/config)."
+    ),
 )
-def enrich(dest, catalog_path, sidecar, ai_backend, ai_base_url, ai_model, ai_timeout,
-           openai_key, breaker_threshold, limit, reclassify, as_json) -> None:
+def enrich(
+    dest: Path,
+    catalog_path: Path | None,
+    sidecar: bool,
+    ai_backend: str,
+    ai_base_url: str | None,
+    ai_model: str,
+    ai_timeout: float,
+    openai_key: str | None,
+    breaker_threshold: int,
+    limit: int | None,
+    reclassify: bool,
+    as_json: bool,
+) -> None:
     """Describe and classify already-organized images in DEST.
 
     Reads the organized copies, so the original source volume need not be
@@ -737,7 +765,10 @@ def watch(
     "as_json",
     is_flag=True,
     default=False,
-    help="Print the run report as one JSON document on stdout (exit 0 ok, 1 error rows, 2 aborted/config).",
+    help=(
+        "Print the run report as one JSON document on stdout "
+        "(exit 0 ok, 1 error rows, 2 aborted/config)."
+    ),
 )
 def verify(path: Path, as_json: bool) -> None:
     """Verify organized-file integrity for PATH (file or directory).

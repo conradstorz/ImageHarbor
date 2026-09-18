@@ -81,6 +81,20 @@ def test_process_prose_is_unchanged_without_json(runner, tmp_path):
     assert result.stdout.startswith("Done. Total=2  Copied=2  Duplicates=0  Errors=0")
 
 
+def test_process_json_dry_run_prints_document_not_banner(runner, tmp_path):
+    src = _source(tmp_path)
+    dest = tmp_path / "org"
+    result = runner.invoke(
+        main, ["process", "--source", str(src), "--dest", str(dest), "--dry-run", "--json"]
+    )
+    assert result.exit_code == 0, result.stderr
+    doc = _doc(result)
+    assert doc["dry_run"] is True
+    assert doc["counts"]["TOTAL"] == 2
+    assert "[DRY-RUN]" not in result.stdout
+    assert not dest.exists()
+
+
 # --- enrich ------------------------------------------------------------------
 
 def test_enrich_json_is_the_report_to_dict(runner, tmp_path):
@@ -127,6 +141,15 @@ def test_enrich_prose_breaker_trip_now_exits_2(runner, tmp_path, monkeypatch):
     result = runner.invoke(main, ["enrich", "--dest", str(dest), "--breaker-threshold", "2"])
     assert result.exit_code == 2
     assert "backend appears down" in result.stderr.lower()
+
+
+def test_enrich_json_missing_catalog_exits_2_with_no_document(runner, tmp_path):
+    dest = tmp_path / "org"
+    dest.mkdir()
+    result = runner.invoke(main, ["enrich", "--dest", str(dest), "--json"])
+    assert result.exit_code == 2
+    assert result.stdout.strip() == ""
+    assert "catalog" in result.stderr.lower()
 
 
 # --- verify ------------------------------------------------------------------
