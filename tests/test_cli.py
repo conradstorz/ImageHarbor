@@ -275,7 +275,7 @@ def test_process_missing_source_errors(runner: CliRunner, tmp_path: Path) -> Non
         ["process", "--source", str(tmp_path / "nope"), "--dest", str(dest)],
     )
     # Click validates existence of --source (exists=True) -> usage error.
-    assert result.exit_code != 0
+    assert result.exit_code == 2
 
 
 def test_process_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -> None:
@@ -287,7 +287,7 @@ def test_process_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -
 
     result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "--dest" in result.output and "--source" in result.output
     assert not dest.exists()  # must fail before writing anything
 
@@ -298,7 +298,7 @@ def test_process_rejects_dest_equal_to_source(runner: CliRunner, tmp_path: Path)
 
     result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(src)])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
 
 
 def test_process_rejects_dest_inside_source_across_relative_and_absolute(
@@ -317,7 +317,7 @@ def test_process_rejects_dest_inside_source_across_relative_and_absolute(
 
     result = runner.invoke(main, ["process", "--source", "source", "--dest", str(dest)])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "--dest" in result.output and "--source" in result.output
     assert not dest.exists()
 
@@ -342,7 +342,7 @@ def test_watch_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -> 
     # watch loop is ever entered, so this invocation must return promptly.
     result = runner.invoke(main, ["watch", "--source", str(src), "--dest", str(dest)])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "--dest" in result.output and "--source" in result.output
     assert not dest.exists()
 
@@ -353,7 +353,7 @@ def test_process_no_longer_accepts_ai_flags(tmp_path):
     result = CliRunner().invoke(
         main, ["process", "--source", str(src), "--dest", str(tmp_path / "d"), "--ai", "stub"]
     )
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "no such option" in result.output.lower()
 
 
@@ -442,6 +442,24 @@ def test_verify_corrupted_file_fails(runner: CliRunner, tmp_path: Path) -> None:
     assert result.exit_code == 1, result.output
     assert "FAIL" in result.output
     assert "1 FAILED" in result.output
+
+
+def test_verify_prose_prints_each_line_exactly_once(runner: CliRunner, tmp_path: Path) -> None:
+    """Regression: `verify` used to stream via `on_row` AND loop over
+    `report.rows` afterwards, printing every line twice."""
+    src = _source_with_two_jpegs(tmp_path)
+    dest = tmp_path / "organized"
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
+
+    victim = next(dest.rglob("*.jpg"))
+    victim.write_bytes(b"\xff\xd8corrupt\xff\xd9")
+
+    result = runner.invoke(main, ["verify", str(dest)])
+    assert result.exit_code == 1, result.output
+    lines = result.output.splitlines()
+    assert sum(1 for ln in lines if ln.startswith("OK   ")) == 1
+    assert sum(1 for ln in lines if ln.startswith("FAIL ")) == 1
 
 
 def test_verify_non_pcs_file_skipped(runner: CliRunner, tmp_path: Path) -> None:
@@ -648,7 +666,7 @@ def test_enrich_ai_openai_without_package_fails_gracefully(
     # to assert about failure, so guard the assertion.
     if result.exit_code == 0:
         pytest.skip("openai backend is available in this environment")
-    assert result.exit_code != 0
+    assert result.exit_code == 2
 
 
 # ---------------------------------------------------------------------------

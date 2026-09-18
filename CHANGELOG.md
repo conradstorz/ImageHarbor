@@ -22,7 +22,9 @@ Library API and `--json` contract, for `organize-my-life`:
   source, unknown backend, missing `openai` extra), `enrich` on a breaker
   trip, and `verify` with nothing verifiable all exit 2 (were 1); `enrich`
   on a dest with no catalog is a config error (exit 2) instead of silently
-  creating an empty catalog.
+  creating an empty catalog. `watch` and `takeout ingest` both exit 2 on the
+  dest-inside-source guard, and `watch` exits 2 on a missing `openai` extra
+  (all were 1).
 - `EnrichStats.failures` records path and AI/IO reason per failed row
   (additive; `ai_failed`/`io_failed` unchanged).
 

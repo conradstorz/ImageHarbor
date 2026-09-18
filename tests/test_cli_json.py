@@ -162,7 +162,7 @@ def test_verify_json_is_the_report_to_dict(runner, tmp_path):
     doc = _doc(result)
     assert set(doc) == {"path", "started", "finished", "counts", "rows"}
     assert doc["counts"]["OK"] == 2 and doc["counts"]["FAILED"] == 0
-    assert set(doc["counts"]) == {"OK", "FAILED", "SKIPPED"}
+    assert set(doc["counts"]) == {"OK", "FAILED", "SKIPPED", "TOTAL"}
     assert not result.stdout.startswith("OK ")
 
 

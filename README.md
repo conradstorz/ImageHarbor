@@ -179,8 +179,11 @@ print(stats("/photos/organized/catalog.db")["library"])
 (`verify` needs none — it checks each file against the digest in its own
 name). Every call blocks for the pass and never raises for a single bad
 file — that becomes an `ERROR` row. `report.to_dict()`
-is the same document `--json` prints. `stats()` returns the dashboard's
-`/api/stats` document without a running `watch`.
+is the same document `--json` prints. `stats()` opens the catalog (running
+its idempotent schema setup, exactly as `catalog list` does) and returns the
+same document `watch` serves at `/api/stats`; its `now` section describes the
+calling process, not a running watcher — `state`/`interval`/
+`next_pass_seconds` are not meaningful there.
 
 Only these names are promised: `process`, `enrich`, `verify`, `stats`,
 `AIConfig`, the three `*Report` and three `*Row` types, the outcome constants,
@@ -207,10 +210,14 @@ code follows nas-ingest's convention:
 import json, subprocess
 r = subprocess.run(["imageharbor", "process", "--source", src, "--dest", dest, "--json"],
                    capture_output=True, text=True)
-if r.returncode in (0, 1):
+if r.stdout.strip():
     report = json.loads(r.stdout)
     print(report["counts"])
 ```
+
+Exit 2 may still carry a document with an `"error"` key (an aborted `enrich`,
+or `verify` with nothing verifiable) — parse on non-empty stdout, not on exit
+code.
 
 Report shapes (keys are additive-only from here):
 
@@ -222,9 +229,12 @@ enrich:  {dest, catalog, ai_backend, started, finished, aborted,
           counts: {ENRICHED, RENAMED, ERROR, TOTAL},
           rows: [{digest, dest_path, reason: "AI"|"IO", detail}]}   # failures only
 verify:  {path, started, finished,
-          counts: {OK, FAILED, SKIPPED},
+          counts: {OK, FAILED, SKIPPED, TOTAL},
           rows: [{path, outcome: "OK"|"FAILED", digest}]}
 ```
+
+Under `dry_run: true`, `process`'s `catalog` is the path that *would* have
+been used; no file is created there.
 
 ## Install
 

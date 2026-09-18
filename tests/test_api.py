@@ -240,10 +240,20 @@ def test_verify_organized_dir_all_ok(tmp_path: Path):
     report = api.verify(dest)
     assert report.ok
     assert report.counts[api.OK] == 2 and report.counts[api.FAILED] == 0
-    assert sum(report.counts.values()) == total_files
+    assert report.counts[api.TOTAL] == total_files
     assert len(report.rows) == 2 and {r.outcome for r in report.rows} == {api.OK}
     assert all(len(r.digest) == 43 for r in report.rows)
     assert report.path == str(dest)
+
+
+def test_verify_on_row_receives_every_checked_row_in_order_none_for_skipped(tmp_path: Path):
+    dest = _organized(tmp_path, 2)
+    (dest / "not_an_image.txt").write_text("hi")  # unsupported ext -> skipped
+    seen: list[api.VerifyRow] = []
+    report = api.verify(dest, on_row=seen.append)
+    assert len(seen) == len(report.rows) == 2
+    assert seen == list(report.rows)
+    assert all(r.outcome in (api.OK, api.FAILED) for r in seen)
 
 
 def test_verify_corrupted_file_is_a_failed_row(tmp_path: Path):
@@ -264,7 +274,7 @@ def test_verify_skips_non_image_and_undigested_files(tmp_path: Path):
     (d / "notes.txt").write_text("hi")      # unsupported ext
     report = api.verify(d)
     assert not report.ok                    # nothing verifiable
-    assert report.counts == {api.OK: 0, api.FAILED: 0, api.SKIPPED: 2}
+    assert report.counts == {api.OK: 0, api.FAILED: 0, api.SKIPPED: 2, api.TOTAL: 2}
     assert report.rows == ()
 
 
@@ -289,7 +299,10 @@ def test_verify_report_to_dict_round_trips_json(tmp_path: Path):
 def test_stats_returns_the_dashboard_document(tmp_path: Path):
     dest = _organized(tmp_path, 2)
     doc = api.stats(dest / "catalog.db")
-    assert {"now", "library", "evidence", "queues", "history", "projection"} <= set(doc)
+    assert set(doc) == {
+        "now", "library", "evidence", "queues", "history", "projection",
+        "overrides", "faces",
+    }
     assert doc["library"] is not None
     json.dumps(doc)   # must be serialisable as-is
 
@@ -299,7 +312,7 @@ def test_stats_accepts_str_and_reflects_the_library(tmp_path: Path):
     before = api.stats(str(dest / "catalog.db"))
     api.enrich(dest)
     after = api.stats(str(dest / "catalog.db"))
-    assert before != after   # enrichment changed at least one section
+    assert before["library"] != after["library"]   # enrichment changed the library section
 
 
 def test_stats_missing_catalog_is_a_config_error(tmp_path: Path):

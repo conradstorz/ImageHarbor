@@ -14,7 +14,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from .catalog import Catalog
 from .circuit_breaker import CircuitBreaker
@@ -119,6 +119,10 @@ def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
     source_resolved = source.resolve()
     dest_resolved = dest.resolve()
     if dest_resolved == source_resolved or source_resolved in dest_resolved.parents:
+        # Deliberately worded with the CLI flags (--dest/--source), even
+        # though this is a library function a Python caller may invoke with
+        # keyword arguments of the same names -- the CLI's error message
+        # must stay byte-identical, and tests pin this wording.
         raise ConfigError(
             f"--dest ({dest}) is inside --source ({source}). Renames performed "
             "by enrich/watch would then write into the read-only source tree. "
@@ -211,6 +215,10 @@ def process(
     source_p = Path(source)
     dest_p = Path(dest)
     if not source_p.exists():
+        # Deliberately worded with the CLI flag (--source), even though this
+        # is a library function a Python caller may invoke with a keyword
+        # argument of the same name -- the CLI's error message must stay
+        # byte-identical, and tests pin this wording.
         raise ConfigError(f"--source ({source_p}) does not exist")
     _guard_dest_not_inside_source(source_p, dest_p)
     catalog_p = Path(catalog) if catalog is not None else dest_p / "catalog.db"
@@ -220,7 +228,7 @@ def process(
         dest_p.mkdir(parents=True, exist_ok=True)
     catalog_target = Path(":memory:") if dry_run else catalog_p
     with Catalog(catalog_target) as cat:
-        stats = Pipeline(
+        pipeline_stats = Pipeline(
             source_dir=source_p,
             organized_dir=dest_p,
             catalog=cat,
@@ -230,13 +238,13 @@ def process(
         ).run(recursive=recursive)
     finished = now_iso()
 
-    rows = tuple(ProcessRow.from_result(r) for r in stats.results)
+    rows = tuple(ProcessRow.from_result(r) for r in pipeline_stats.results)
     counts = {
-        COPIED: stats.copied,
-        DUPLICATE: stats.duplicates,
-        SKIPPED: stats.skipped,
-        ERROR: stats.errors,
-        TOTAL: stats.total,
+        COPIED: pipeline_stats.copied,
+        DUPLICATE: pipeline_stats.duplicates,
+        SKIPPED: pipeline_stats.skipped,
+        ERROR: pipeline_stats.errors,
+        TOTAL: pipeline_stats.total,
     }
     return ProcessReport(
         source=str(source_p), dest=str(dest_p), catalog=str(catalog_p),
@@ -339,17 +347,17 @@ def enrich(
 
     started = now_iso()
     with Catalog(catalog_p) as cat:
-        stats = enrich_library(
+        enrich_stats = enrich_library(
             cat, dest_p, classifier,
             write_sidecars=sidecar, breaker=breaker, limit=limit, reclassify=reclassify,
         )
     finished = now_iso()
 
     report = _enrich_report(
-        stats, dest=dest_p, catalog=catalog_p, ai_backend=ai.backend.lower(),
+        enrich_stats, dest=dest_p, catalog=catalog_p, ai_backend=ai.backend.lower(),
         started=started, finished=finished,
     )
-    if stats.aborted:
+    if enrich_stats.aborted:
         raise Aborted(
             f"AI backend appears down — aborted after {breaker.trip_threshold} "
             "consecutive failures.",
@@ -396,13 +404,24 @@ class VerifyReport:
         }
 
 
-def verify(path: "Path | str") -> VerifyReport:
+def verify(
+    path: "Path | str",
+    *,
+    on_row: "Callable[[VerifyRow], None] | None" = None,
+) -> VerifyReport:
     """Re-hash every organized image under ``path`` (a file or directory)
     and compare it with the digest embedded in its own filename.
 
     Files with an unsupported extension or no extractable digest are
     SKIPPED, not checked. ``report.ok`` is False when nothing was checked.
     Raises ConfigError if ``path`` does not exist.
+
+    ``on_row``, when given, is called with each :class:`VerifyRow` right
+    after it is appended -- only for checked files, never for SKIPPED ones.
+    It exists so a streaming caller (the CLI's prose mode) can render a line
+    per file as verification proceeds, rather than waiting for the whole
+    report; see the design spec's Non-goals section for why this is the one
+    deliberate exception to "no progress callbacks".
     """
     target = Path(path)
     if not target.exists():
@@ -421,13 +440,17 @@ def verify(path: "Path | str") -> VerifyReport:
         if digest is None:
             skipped += 1
             continue
-        rows.append(VerifyRow(path=str(p), outcome=OK if verify_pcs_file(p) else FAILED, digest=digest))
+        row = VerifyRow(path=str(p), outcome=OK if verify_pcs_file(p) else FAILED, digest=digest)
+        rows.append(row)
+        if on_row is not None:
+            on_row(row)
     finished = now_iso()
     counts = {
         OK: sum(1 for r in rows if r.outcome == OK),
         FAILED: sum(1 for r in rows if r.outcome == FAILED),
         SKIPPED: skipped,
     }
+    counts[TOTAL] = counts[OK] + counts[FAILED] + counts[SKIPPED]
     return VerifyReport(path=str(target), started=started, finished=finished,
                         counts=counts, rows=tuple(rows))
 
@@ -438,13 +461,16 @@ def verify(path: "Path | str") -> VerifyReport:
 
 
 def stats(catalog: "Path | str") -> dict[str, Any]:
-    """The dashboard's ``/api/stats`` document for a library, without a
-    running `watch`.
+    """Opens the catalog (running its idempotent schema setup, exactly as
+    `catalog list` does), builds the same document `watch` serves at
+    `/api/stats`, and returns it. The `now` section describes the process
+    that opened the catalog, not a running watcher: `state`/`interval`/
+    `next_pass_seconds` are not meaningful here; `library`, `evidence`,
+    `queues`, `history`, and `projection` are.
 
-    Sections that need a live process (breaker state, the current run) read
-    as they would for an idle watcher. A failing section is ``None`` in the
-    document, never an exception -- `dashboard.stats.collect`'s own posture.
-    Raises ConfigError if the catalog file does not exist.
+    A failing section is ``None`` in the document, never an exception --
+    `dashboard.stats.collect`'s own posture. Raises ConfigError if the
+    catalog file does not exist.
     """
     from .dashboard.control import ControlPlane
     from .dashboard.stats import collect

@@ -87,7 +87,7 @@ def stats(catalog) -> dict
   today.
 - `verify` walks a file or directory the way the CLI command does now: only
   `SUPPORTED_EXTENSIONS`, only stems with an extractable digest.
-- `stats(catalog)` opens the catalog read-only for the call, builds a
+- `stats(catalog)` opens the catalog for the call, builds a
   `ControlPlane` over it, and returns `dashboard.stats.collect(...)` with no
   breaker and no face store — the same document `watch` serves at
   `/api/stats`, minus the sections that need a live process. It is
@@ -286,7 +286,12 @@ exits 2.
 
 - No async API, no progress callbacks, no cancellation. `organize-my-life`'s
   job cancellation is its own undesigned slice and depends on what a safe
-  stop means per tool.
+  stop means per tool. `verify`'s `on_row` keyword is the single, deliberate
+  exception: it exists only so the CLI can render its own per-file `OK`/
+  `FAIL` lines as verification proceeds instead of buffering the whole
+  report first. It changes no report shape (`VerifyReport`/`VerifyRow` are
+  unaffected), carries no cancellation semantics, and is not a general
+  progress API — `process` and `enrich` have no equivalent hook.
 - No configuration file. ImageHarbor's inputs are flags and env vars today;
   `AIConfig` is the only grouping introduced.
 - `to_dict()` is additive-only from here: new keys may appear, existing keys

@@ -64,6 +64,15 @@ def _emit_json(doc: dict[str, Any]) -> None:
     click.echo(json.dumps(doc))
 
 
+def _echo_verify_row(row: "api.VerifyRow") -> None:
+    """`api.verify`'s `on_row` hook for prose mode: render one line as each
+    file is checked, instead of waiting for the whole report."""
+    if row.outcome == api.OK:
+        click.echo(f"OK   {row.path}")
+    else:
+        click.echo(f"FAIL {row.path}", err=True)
+
+
 def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     from .circuit_breaker import CircuitBreaker
 
@@ -129,7 +138,7 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     default=False,
     help=(
         "Print the run report as one JSON document on stdout "
-        "(exit 0 ok, 1 error rows, 2 aborted/config)."
+        "(exit 0 ok, 1 error rows, 2 could not start or did not finish)."
     ),
 )
 def process(
@@ -262,7 +271,7 @@ def process(
     default=False,
     help=(
         "Print the run report as one JSON document on stdout "
-        "(exit 0 ok, 1 error rows, 2 aborted/config)."
+        "(exit 0 ok, 1 error rows, 2 could not start or did not finish)."
     ),
 )
 def enrich(
@@ -767,7 +776,7 @@ def watch(
     default=False,
     help=(
         "Print the run report as one JSON document on stdout "
-        "(exit 0 ok, 1 error rows, 2 aborted/config)."
+        "(exit 0 ok, 1 error rows, 2 could not start or did not finish)."
     ),
 )
 def verify(path: Path, as_json: bool) -> None:
@@ -778,7 +787,7 @@ def verify(path: Path, as_json: bool) -> None:
     content and confirms it still matches the digest embedded in its name.
     """
     try:
-        report = api.verify(path)
+        report = api.verify(path, on_row=None if as_json else _echo_verify_row)
     except ConfigError as exc:
         raise _ConfigFailure(str(exc)) from exc
 
@@ -792,11 +801,6 @@ def verify(path: Path, as_json: bool) -> None:
             doc["error"] = nothing_msg
         _emit_json(doc)
     else:
-        for row in report.rows:
-            if row.outcome == api.OK:
-                click.echo(f"OK   {row.path}")
-            else:
-                click.echo(f"FAIL {row.path}", err=True)
         click.echo(
             f"\nVerified {checked} organized image(s) "
             f"({c[api.SKIPPED]} non-image/no-digest skipped): {c[api.OK]} OK, {c[api.FAILED]} FAILED"
