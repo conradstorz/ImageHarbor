@@ -19,7 +19,9 @@ from typing import Any
 from .ai_classifier import AIClassifier
 from .catalog import Catalog
 from .circuit_breaker import CircuitBreaker
+from .discovery import SUPPORTED_EXTENSIONS
 from .enrich import EnrichStats, enrich_library
+from .hashing import extract_digest_from_stem, verify_pcs_file
 from .pipeline import Pipeline, ProcessResult
 from .util import now_iso
 
@@ -347,3 +349,77 @@ def enrich(
             report,
         )
     return report
+
+
+# ---------------------------------------------------------------------------
+# verify()
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VerifyRow:
+    path: str
+    outcome: str          # OK | FAILED
+    digest: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclass(frozen=True)
+class VerifyReport:
+    path: str
+    started: str
+    finished: str
+    counts: dict[str, int]
+    rows: tuple[VerifyRow, ...]   # every file actually checked
+
+    @property
+    def ok(self) -> bool:
+        checked = self.counts.get(OK, 0) + self.counts.get(FAILED, 0)
+        return self.counts.get(FAILED, 0) == 0 and checked > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "started": self.started,
+            "finished": self.finished,
+            "counts": dict(self.counts),
+            "rows": [r.to_dict() for r in self.rows],
+        }
+
+
+def verify(path: "Path | str") -> VerifyReport:
+    """Re-hash every organized image under ``path`` (a file or directory)
+    and compare it with the digest embedded in its own filename.
+
+    Files with an unsupported extension or no extractable digest are
+    SKIPPED, not checked. ``report.ok`` is False when nothing was checked.
+    Raises ConfigError if ``path`` does not exist.
+    """
+    target = Path(path)
+    if not target.exists():
+        raise ConfigError(f"path does not exist: {target}")
+    started = now_iso()
+    candidates = [target] if target.is_file() else sorted(
+        p for p in target.rglob("*") if p.is_file()
+    )
+    rows: list[VerifyRow] = []
+    skipped = 0
+    for p in candidates:
+        if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            skipped += 1
+            continue
+        digest = extract_digest_from_stem(p.stem)
+        if digest is None:
+            skipped += 1
+            continue
+        rows.append(VerifyRow(path=str(p), outcome=OK if verify_pcs_file(p) else FAILED, digest=digest))
+    finished = now_iso()
+    counts = {
+        OK: sum(1 for r in rows if r.outcome == OK),
+        FAILED: sum(1 for r in rows if r.outcome == FAILED),
+        SKIPPED: skipped,
+    }
+    return VerifyReport(path=str(target), started=started, finished=finished,
+                        counts=counts, rows=tuple(rows))

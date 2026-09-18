@@ -229,3 +229,58 @@ def test_enrich_report_to_dict_round_trips_json(tmp_path: Path):
     doc = json.loads(json.dumps(api.enrich(dest).to_dict()))
     assert set(doc) == {"dest", "catalog", "ai_backend", "started", "finished", "aborted", "counts", "rows"}
     assert doc["rows"][0]["reason"] == "IO" and doc["rows"][0]["dest_path"] is None
+
+
+def test_verify_organized_dir_all_ok(tmp_path: Path):
+    # process() writes a sidecar per photo plus catalog.db by default, so the
+    # organized dir also holds non-image files -- those must land as SKIPPED,
+    # not counted against OK/FAILED.
+    dest = _organized(tmp_path, 2)
+    total_files = sum(1 for p in dest.rglob("*") if p.is_file())
+    report = api.verify(dest)
+    assert report.ok
+    assert report.counts[api.OK] == 2 and report.counts[api.FAILED] == 0
+    assert sum(report.counts.values()) == total_files
+    assert len(report.rows) == 2 and {r.outcome for r in report.rows} == {api.OK}
+    assert all(len(r.digest) == 43 for r in report.rows)
+    assert report.path == str(dest)
+
+
+def test_verify_corrupted_file_is_a_failed_row(tmp_path: Path):
+    dest = _organized(tmp_path, 2)
+    victim = next(p for p in dest.rglob("*.jpg"))
+    victim.write_bytes(b"\xff\xd8corrupt\xff\xd9")
+    report = api.verify(dest)
+    assert not report.ok
+    assert report.counts[api.FAILED] == 1 and report.counts[api.OK] == 1
+    bad = [r for r in report.rows if r.outcome == api.FAILED]
+    assert bad[0].path == str(victim)
+
+
+def test_verify_skips_non_image_and_undigested_files(tmp_path: Path):
+    d = tmp_path / "d"
+    d.mkdir()
+    _jpeg(d / "just_a_photo.jpg")           # supported ext, no digest
+    (d / "notes.txt").write_text("hi")      # unsupported ext
+    report = api.verify(d)
+    assert not report.ok                    # nothing verifiable
+    assert report.counts == {api.OK: 0, api.FAILED: 0, api.SKIPPED: 2}
+    assert report.rows == ()
+
+
+def test_verify_single_file(tmp_path: Path):
+    dest = _organized(tmp_path, 1)
+    f = next(p for p in dest.rglob("*.jpg"))
+    report = api.verify(str(f))
+    assert report.ok and report.counts[api.OK] == 1 and report.rows[0].path == str(f)
+
+
+def test_verify_missing_path_is_a_config_error(tmp_path: Path):
+    with pytest.raises(api.ConfigError):
+        api.verify(tmp_path / "nope")
+
+
+def test_verify_report_to_dict_round_trips_json(tmp_path: Path):
+    doc = json.loads(json.dumps(api.verify(_organized(tmp_path, 1)).to_dict()))
+    assert set(doc) == {"path", "started", "finished", "counts", "rows"}
+    assert doc["rows"][0]["outcome"] == "OK"
