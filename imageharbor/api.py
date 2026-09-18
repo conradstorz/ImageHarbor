@@ -11,10 +11,15 @@ means it did not finish.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .ai_classifier import AIClassifier
+from .catalog import Catalog
+from .pipeline import Pipeline, ProcessResult
+from .util import now_iso
 
 # Outcome and reason constants -- their own names, so a JSON consumer and a
 # Python consumer read the same string.
@@ -108,3 +113,122 @@ def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
             "by enrich/watch would then write into the read-only source tree. "
             "Choose a --dest that is not nested inside --source."
         )
+
+
+# ---------------------------------------------------------------------------
+# process()
+# ---------------------------------------------------------------------------
+
+
+def _path_str(p: "Path | str | None") -> str | None:
+    return None if p is None else str(p)
+
+
+_PROCESS_OUTCOMES = {"copied": COPIED, "duplicate": DUPLICATE, "skipped": SKIPPED, "error": ERROR}
+
+
+@dataclass(frozen=True)
+class ProcessRow:
+    """One row of a :class:`ProcessReport`: the outcome for a single file."""
+
+    source_path: str
+    outcome: str          # COPIED | DUPLICATE | SKIPPED | ERROR
+    dest_path: str | None
+    digest: str
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_result(cls, r: ProcessResult) -> "ProcessRow":
+        return cls(
+            source_path=str(r.source_path),
+            outcome=_PROCESS_OUTCOMES.get(r.status, ERROR),
+            dest_path=_path_str(r.organized_path),
+            digest=r.sha256_b64url,
+            detail=r.error,
+        )
+
+
+@dataclass(frozen=True)
+class ProcessReport:
+    """Result of one :func:`process` call: one row per discovered file."""
+
+    source: str
+    dest: str
+    catalog: str
+    dry_run: bool
+    started: str
+    finished: str
+    counts: dict[str, int]
+    rows: tuple[ProcessRow, ...]
+
+    @property
+    def ok(self) -> bool:
+        return self.counts.get(ERROR, 0) == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "dest": self.dest,
+            "catalog": self.catalog,
+            "dry_run": self.dry_run,
+            "started": self.started,
+            "finished": self.finished,
+            "counts": dict(self.counts),
+            "rows": [r.to_dict() for r in self.rows],
+        }
+
+
+def process(
+    source: "Path | str",
+    dest: "Path | str",
+    *,
+    catalog: "Path | str | None" = None,
+    duplicates_dir: "Path | str | None" = None,
+    sidecar: bool = True,
+    recursive: bool = True,
+    dry_run: bool = False,
+) -> ProcessReport:
+    """The facts pass: hash, dedup, EXIF, place, copy, verify, catalog.
+
+    No AI call, no network. Raises ConfigError before touching disk if
+    ``source`` does not exist or ``dest`` is inside ``source``. A per-file
+    problem is an ERROR row, never an exception.
+    """
+    source_p = Path(source)
+    dest_p = Path(dest)
+    if not source_p.exists():
+        raise ConfigError(f"--source ({source_p}) does not exist")
+    _guard_dest_not_inside_source(source_p, dest_p)
+    catalog_p = Path(catalog) if catalog is not None else dest_p / "catalog.db"
+
+    started = now_iso()
+    if not dry_run:
+        dest_p.mkdir(parents=True, exist_ok=True)
+    catalog_target = Path(":memory:") if dry_run else catalog_p
+    with Catalog(catalog_target) as cat:
+        stats = Pipeline(
+            source_dir=source_p,
+            organized_dir=dest_p,
+            catalog=cat,
+            duplicates_dir=Path(duplicates_dir) if duplicates_dir is not None else None,
+            write_sidecars=sidecar,
+            dry_run=dry_run,
+        ).run(recursive=recursive)
+    finished = now_iso()
+
+    rows = tuple(ProcessRow.from_result(r) for r in stats.results)
+    counts = {
+        COPIED: stats.copied,
+        DUPLICATE: stats.duplicates,
+        SKIPPED: stats.skipped,
+        ERROR: stats.errors,
+        TOTAL: stats.total,
+    }
+    return ProcessReport(
+        source=str(source_p), dest=str(dest_p), catalog=str(catalog_p),
+        dry_run=dry_run, started=started, finished=finished,
+        counts=counts, rows=rows,
+    )

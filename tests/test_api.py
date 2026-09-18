@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from imageharbor import api
 from imageharbor.ai_classifier import StubClassifier
+from imageharbor.hashing import compute_sha256_b64url
 
 
 def test_exception_hierarchy():
@@ -50,3 +52,99 @@ def test_guard_allows_sibling_dest(tmp_path: Path):
     src = tmp_path / "s"
     src.mkdir()
     api._guard_dest_not_inside_source(src, tmp_path / "d")  # no raise
+
+
+def _jpeg(path: Path, fill: int = 0) -> Path:
+    path.write_bytes(b"\xff\xd8\xff\xe0" + bytes([fill]) * 16 + b"\xff\xd9")
+    return path
+
+
+def _source(tmp_path: Path, n: int = 2) -> Path:
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(n):
+        _jpeg(src / f"img_{i}.jpg", i)
+    return src
+
+
+def test_process_reports_one_row_per_file_and_copies(tmp_path: Path):
+    src = _source(tmp_path)
+    report = api.process(src, tmp_path / "org")
+    assert report.ok
+    assert report.counts == {api.COPIED: 2, api.DUPLICATE: 0, api.SKIPPED: 0, api.ERROR: 0, api.TOTAL: 2}
+    assert len(report.rows) == 2
+    for row in report.rows:
+        assert row.outcome == api.COPIED
+        assert row.dest_path is not None and Path(row.dest_path).exists()
+        assert row.digest == compute_sha256_b64url(Path(row.source_path))
+        assert row.detail == ""
+    assert report.catalog == str(tmp_path / "org" / "catalog.db")
+    assert report.dry_run is False
+    assert report.started <= report.finished
+
+
+def test_process_second_run_reports_duplicates(tmp_path: Path):
+    src = _source(tmp_path)
+    api.process(src, tmp_path / "org")
+    report = api.process(src, tmp_path / "org")
+    assert report.ok
+    assert report.counts[api.DUPLICATE] == 2 and report.counts[api.COPIED] == 0
+    assert {r.outcome for r in report.rows} == {api.DUPLICATE}
+
+
+def test_process_unreadable_file_is_an_error_row_not_an_exception(tmp_path: Path, monkeypatch):
+    src = _source(tmp_path, n=2)
+    from imageharbor import pipeline as pipeline_mod
+
+    real = pipeline_mod.compute_sha256_b64url
+
+    def _boom(path):
+        if path.name == "img_1.jpg":
+            raise OSError("unreadable")
+        return real(path)
+
+    monkeypatch.setattr(pipeline_mod, "compute_sha256_b64url", _boom)
+    report = api.process(src, tmp_path / "org")
+    assert not report.ok
+    assert report.counts[api.ERROR] == 1 and report.counts[api.COPIED] == 1
+    bad = [r for r in report.rows if r.outcome == api.ERROR]
+    assert len(bad) == 1 and "unreadable" in bad[0].detail and bad[0].dest_path is None
+
+
+def test_process_dry_run_writes_nothing(tmp_path: Path):
+    src = _source(tmp_path)
+    dest = tmp_path / "org"
+    report = api.process(src, dest, dry_run=True)
+    assert report.dry_run is True
+    assert not dest.exists()
+    assert report.counts[api.TOTAL] == 2
+
+
+def test_process_dest_inside_source_is_a_config_error(tmp_path: Path):
+    src = _source(tmp_path)
+    with pytest.raises(api.ConfigError):
+        api.process(src, src / "org")
+    assert not (src / "org").exists()
+
+
+def test_process_missing_source_is_a_config_error(tmp_path: Path):
+    with pytest.raises(api.ConfigError):
+        api.process(tmp_path / "nope", tmp_path / "org")
+
+
+def test_process_accepts_str_paths_and_custom_catalog(tmp_path: Path):
+    src = _source(tmp_path)
+    cat = tmp_path / "elsewhere" / "cat.db"
+    report = api.process(str(src), str(tmp_path / "org"), catalog=str(cat))
+    assert report.ok and cat.exists() and report.catalog == str(cat)
+
+
+def test_process_report_to_dict_round_trips_json(tmp_path: Path):
+    report = api.process(_source(tmp_path), tmp_path / "org")
+    doc = json.loads(json.dumps(report.to_dict()))
+    assert set(doc) == {"source", "dest", "catalog", "dry_run", "started", "finished", "counts", "rows"}
+    assert doc["counts"] == report.counts
+    assert doc["rows"][0] == {
+        "source_path": report.rows[0].source_path, "outcome": "COPIED",
+        "dest_path": report.rows[0].dest_path, "digest": report.rows[0].digest, "detail": "",
+    }
