@@ -261,15 +261,56 @@ def test_the_package_exports_the_documented_public_api():
 
 def test_the_public_api_imports_from_the_built_wheel(wheel_built_without_git: Path, tmp_path: Path):
     """The wheel, installed into a scratch venv with no dev extras, must
-    expose every public name -- what `uv add git+…` gives a consumer."""
+    expose every public name -- what `uv add git+…` gives a consumer.
+
+    Requires `uv` on PATH and index access to resolve the wheel's runtime
+    deps (Pillow, click) unless they are already cached -- per this module's
+    philosophy (see the module docstring and `wheel_built_without_git`'s own
+    docstring), this test fails rather than skips when offline.
+    """
     venv = tmp_path / "venv"
-    subprocess.run(["uv", "venv", str(venv)], check=True, capture_output=True, text=True, timeout=120)
-    subprocess.run(
+    proc = subprocess.run(["uv", "venv", str(venv)], capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        pytest.fail("`uv venv` failed:\n" + proc.stdout + "\n" + proc.stderr)
+    proc = subprocess.run(
         ["uv", "pip", "install", "--python", str(venv), str(wheel_built_without_git)],
-        check=True, capture_output=True, text=True, timeout=600,
+        capture_output=True, text=True, timeout=600,
     )
+    if proc.returncode != 0:
+        pytest.fail("`uv pip install` failed:\n" + proc.stdout + "\n" + proc.stderr)
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    code = "import imageharbor as ih; " + "; ".join(f"ih.{n}" for n in PUBLIC_API) + "; print('ok')"
-    proc = subprocess.run([str(python), "-c", code], capture_output=True, text=True, timeout=120)
+    # cwd=tmp_path (not the project root) and PYTHONSAFEPATH=1 keep `-c`'s
+    # sys.path[0] out of the checkout -- without both, `import imageharbor`
+    # can silently resolve to `imageharbor/` in this project's own working
+    # directory instead of the venv the wheel was just installed into, which
+    # would make this test pass even when the wheel itself is broken.
+    code = (
+        "import sys, pathlib; "
+        "import imageharbor as ih; "
+        + "; ".join(f"ih.{n}" for n in PUBLIC_API)
+        + "; assert pathlib.Path(ih.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()), ih.__file__; "
+        "print('ok')"
+    )
+    proc = subprocess.run(
+        [str(python), "-c", code],
+        cwd=str(tmp_path),
+        env={**os.environ, "PYTHONSAFEPATH": "1"},
+        capture_output=True, text=True, timeout=120,
+    )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "ok"
+
+
+def test_enrich_attribute_is_the_facade_function_not_the_submodule():
+    """`from imageharbor import enrich` is the public facade function; the
+    `imageharbor.enrich` MODULE is still importable by dotted path and via
+    `from imageharbor.enrich import ...`, but never via `from . import enrich`."""
+    import importlib
+    import sys
+
+    import imageharbor
+    assert callable(imageharbor.enrich)
+    mod = importlib.import_module("imageharbor.enrich")
+    assert mod is sys.modules["imageharbor.enrich"]
+    assert hasattr(mod, "enrich_library")
+    assert imageharbor.enrich is not mod

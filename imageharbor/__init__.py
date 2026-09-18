@@ -28,7 +28,10 @@ except PackageNotFoundError:  # source tree with no installed dist
     # always installed). Do not "fix" this to look like a real version.
     __version__ = "unknown+uninstalled"
 
-from .api import (  # noqa: E402  -- __version__ must resolve first
+# This import is kept below the licence header + __version__ block so the two
+# stay together at the top of the file (E402 -- module level import not at
+# top of file -- is selected via "E4" in pyproject.toml's ruff config).
+from .api import (  # noqa: E402
     AI,
     COPIED,
     DUPLICATE,
@@ -50,7 +53,11 @@ from .api import (  # noqa: E402  -- __version__ must resolve first
     ProcessRow,
     VerifyReport,
     VerifyRow,
-    enrich,
+    enrich,  # NOTE: `enrich` here is the facade FUNCTION (api.enrich), which
+    # shadows the `imageharbor.enrich` submodule as a package attribute.
+    # Reach the module with `from .enrich import ...` (or
+    # `importlib.import_module("imageharbor.enrich")`), never via
+    # `from . import enrich` -- that now binds the function, not the module.
     process,
     stats,
     verify,

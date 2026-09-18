@@ -388,7 +388,7 @@ def test_pipeline_sidecar_failure_run_counts_no_errors(
 
 
 def test_facts_pass_makes_no_ai_call() -> None:
-    """`imageharbor.pipeline` must not import a classifier at all.
+    """`imageharbor.pipeline`'s own import path must not pull in a classifier.
 
     A previous version of this test patched `StubClassifier.describe` and
     asserted it was never called -- but `Pipeline` never constructs a
@@ -401,6 +401,24 @@ def test_facts_pass_makes_no_ai_call() -> None:
     because within the same test process `ai_classifier` is typically
     already imported by other tests/fixtures, which would make an in-process
     check pass or fail for the wrong reason.
+
+    What this pins precisely: no AI classifier *module* (`ai_classifier.py`)
+    and no AI SDK (e.g. `openai`) ever lands in `sys.modules` on the facts
+    pass's import path. What it does NOT claim: that `imageharbor.pipeline`
+    only imports `pipeline.py`'s own direct dependencies. Since Task 8,
+    `import imageharbor.pipeline` first runs the package `imageharbor/__init__.py`,
+    which eagerly imports `imageharbor.api` -- and `api.py` in turn imports
+    `.enrich`, `.concept_map`, `.taxonomy`, and `.circuit_breaker` (the
+    enrichment orchestrator and its dependencies). That is fine only because
+    `api.py` and `enrich.py` both reference `AIClassifier`/`ContentDescription`
+    solely inside `if TYPE_CHECKING:` guards (see the guard comments in each
+    file) -- under `from __future__ import annotations`, those references are
+    never evaluated at runtime, so importing either module never touches
+    `ai_classifier.py`. A runtime (non-annotation) use of `AIClassifier` in
+    `enrich.py` would raise `NameError` under that future-annotations import
+    and fail every enrich test outright, so this import-boundary test is not
+    the only net guarding that guard -- but it is the one that specifically
+    pins the facts pass's own import surface.
     """
     import subprocess
     import sys
