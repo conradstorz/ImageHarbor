@@ -159,7 +159,7 @@ EnrichFailureRow
 
 VerifyReport
   path: str   started, finished: str
-  counts: {OK, FAILED, SKIPPED}
+  counts: {OK, FAILED, SKIPPED, TOTAL}
   rows: list[VerifyRow]           every file that was actually checked
   ok = counts[FAILED] == 0 and counts[OK] + counts[FAILED] > 0
 

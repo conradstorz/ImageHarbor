@@ -465,8 +465,10 @@ def stats(catalog: "Path | str") -> dict[str, Any]:
     `catalog list` does), builds the same document `watch` serves at
     `/api/stats`, and returns it. The `now` section describes the process
     that opened the catalog, not a running watcher: `state`/`interval`/
-    `next_pass_seconds` are not meaningful here; `library`, `evidence`,
-    `queues`, `history`, and `projection` are.
+    `next_pass_seconds` are not meaningful here, and neither is
+    `overrides` (computed against the synthetic interval/enrich settings this
+    function supplies) nor `faces` (always ``None``: no FaceStore is wired
+    in); `library`, `evidence`, `queues`, `history`, and `projection` are.
 
     A failing section is ``None`` in the document, never an exception --
     `dashboard.stats.collect`'s own posture. Raises ConfigError if the
