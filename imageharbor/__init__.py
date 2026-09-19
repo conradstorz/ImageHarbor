@@ -53,11 +53,9 @@ from .api import (  # noqa: E402
     ProcessRow,
     VerifyReport,
     VerifyRow,
-    enrich,  # NOTE: `enrich` here is the facade FUNCTION (api.enrich), which
-    # shadows the `imageharbor.enrich` submodule as a package attribute.
-    # Reach the module with `from .enrich import ...` (or
-    # `importlib.import_module("imageharbor.enrich")`), never via
-    # `from . import enrich` -- that now binds the function, not the module.
+    enrich,  # the facade FUNCTION (api.enrich). The enrichment-pass module is
+    # `imageharbor.enrichment` -- named so precisely to avoid a submodule
+    # called `enrich` being shadowed by this attribute.
     process,
     stats,
     verify,

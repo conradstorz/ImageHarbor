@@ -23,7 +23,7 @@ from .ai_classifier import AIClassifier
 from .catalog import Catalog
 from .circuit_breaker import CircuitBreaker
 from .discovery import discover_images
-from .enrich import EnrichStats, enrich_library
+from .enrichment import EnrichStats, enrich_library
 from .pipeline import Pipeline
 
 if TYPE_CHECKING:
@@ -655,7 +655,7 @@ def run_once(
                 # AI-perception and post-perception failure this pass hit
                 # (`EnrichStats.errors`, which already sums `ai_failed` +
                 # `io_failed`, plus the crash-in-flight count) -- see
-                # `EnrichStats`'s own fields in enrich.py. Never pass
+                # `EnrichStats`'s own fields in enrichment.py. Never pass
                 # `row_errors` into both `errors` and `enrich_failed`: the
                 # dashboard history panel's 24h error figure sums `errors`
                 # across runs (`dashboard/stats.py`'s `_window_summary`), and

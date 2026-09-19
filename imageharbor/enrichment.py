@@ -29,7 +29,7 @@ from .taxonomy import Taxonomy
 
 if TYPE_CHECKING:
     # Type-only, same reasoning as api.py: `imageharbor/__init__.py` imports
-    # `.api` -> `.enrich` eagerly, and `imageharbor.pipeline` must remain
+    # `.api` -> `.enrichment` eagerly, and `imageharbor.pipeline` must remain
     # importable without pulling in `imageharbor.ai_classifier` (see
     # test_facts_pass_makes_no_ai_call).
     from .ai_classifier import AIClassifier, ContentDescription

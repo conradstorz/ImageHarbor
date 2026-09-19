@@ -301,16 +301,17 @@ def test_the_public_api_imports_from_the_built_wheel(wheel_built_without_git: Pa
     assert proc.stdout.strip() == "ok"
 
 
-def test_enrich_attribute_is_the_facade_function_not_the_submodule():
-    """`from imageharbor import enrich` is the public facade function; the
-    `imageharbor.enrich` MODULE is still importable by dotted path and via
-    `from imageharbor.enrich import ...`, but never via `from . import enrich`."""
+def test_enrich_attribute_is_the_facade_function_and_no_submodule_collides():
+    """`from imageharbor import enrich` is the public facade function. The
+    enrichment-pass module is `imageharbor.enrichment`; there must be no
+    `imageharbor.enrich` submodule for the attribute to shadow."""
     import importlib
-    import sys
 
     import imageharbor
-    assert callable(imageharbor.enrich)
-    mod = importlib.import_module("imageharbor.enrich")
-    assert mod is sys.modules["imageharbor.enrich"]
+    from imageharbor import api
+
+    assert imageharbor.enrich is api.enrich
+    mod = importlib.import_module("imageharbor.enrichment")
     assert hasattr(mod, "enrich_library")
-    assert imageharbor.enrich is not mod
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("imageharbor.enrich")

@@ -410,12 +410,12 @@ def test_facts_pass_makes_no_ai_call() -> None:
     which eagerly imports `imageharbor.api` -- and `api.py` in turn imports
     `.enrich`, `.concept_map`, `.taxonomy`, and `.circuit_breaker` (the
     enrichment orchestrator and its dependencies). That is fine only because
-    `api.py` and `enrich.py` both reference `AIClassifier`/`ContentDescription`
+    `api.py` and `enrichment.py` both reference `AIClassifier`/`ContentDescription`
     solely inside `if TYPE_CHECKING:` guards (see the guard comments in each
     file) -- under `from __future__ import annotations`, those references are
     never evaluated at runtime, so importing either module never touches
     `ai_classifier.py`. A runtime (non-annotation) use of `AIClassifier` in
-    `enrich.py` would raise `NameError` under that future-annotations import
+    `enrichment.py` would raise `NameError` under that future-annotations import
     and fail every enrich test outright, so this import-boundary test is not
     the only net guarding that guard -- but it is the one that specifically
     pins the facts pass's own import surface.

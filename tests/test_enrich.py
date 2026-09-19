@@ -3,7 +3,7 @@
 from imageharbor import concept_map, tiers
 from imageharbor.ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from imageharbor.catalog import Catalog
-from imageharbor.enrich import enrich_library
+from imageharbor.enrichment import enrich_library
 from imageharbor.pipeline import Pipeline
 
 

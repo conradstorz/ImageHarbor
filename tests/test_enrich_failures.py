@@ -7,7 +7,7 @@ from pathlib import Path
 
 from imageharbor.ai_classifier import StubClassifier
 from imageharbor.catalog import Catalog
-from imageharbor.enrich import EnrichFailure, enrich_library
+from imageharbor.enrichment import EnrichFailure, enrich_library
 from imageharbor.pipeline import Pipeline
 
 

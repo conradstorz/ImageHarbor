@@ -27,6 +27,10 @@ Library API and `--json` contract, for `organize-my-life`:
   (all were 1).
 - `EnrichStats.failures` records path and AI/IO reason per failed row
   (additive; `ai_failed`/`io_failed` unchanged).
+- Module `imageharbor/enrich.py` renamed to `imageharbor/enrichment.py` so
+  the new public `imageharbor.enrich` function cannot shadow a submodule of
+  the same name. Import `enrich_library`/`EnrichStats` from
+  `imageharbor.enrichment`.
 
 ## [1.3.0] — 2026-09-13
 

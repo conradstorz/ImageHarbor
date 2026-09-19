@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from .catalog import Catalog
 from .circuit_breaker import CircuitBreaker
 from .discovery import SUPPORTED_EXTENSIONS
-from .enrich import EnrichStats, enrich_library
+from .enrichment import EnrichStats, enrich_library
 from .hashing import extract_digest_from_stem, verify_pcs_file
 from .pipeline import Pipeline, ProcessResult
 from .util import now_iso
