@@ -26,18 +26,23 @@ services:
       IMAGEHARBOR_FACE_THRESHOLD: ""     # set from `faces calibrate` output
       # Dashboard exposure (R2): inside the container the server must bind
       # 0.0.0.0 for the published port to work; exposure is bounded by the
-      # host's port publish (tailnet-only on hpz440). The token gates every
-      # mutating request; the allowlist is the DNS-rebinding defense and
-      # must name every host/IP the dashboard is browsed as.
+      # host's own network access (Traefik on hpz440, see the traefik.*
+      # labels below). The token gates every mutating request; the allowlist
+      # is the DNS-rebinding defense and must name every hostname the
+      # dashboard is reached as, including the Traefik route -- a request
+      # forwarded by Traefik still carries the original Host header, so the
+      # allowlist sees "images.hpz440.ohr3023.org", not Traefik's own name.
       IMAGEHARBOR_DASHBOARD_HOST: 0.0.0.0
       IMAGEHARBOR_DASHBOARD_TOKEN: ""          # REQUIRED: set a long random string before `up`
-      IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS: ""  # e.g. "100.69.239.123,hpz440"
-    ports:
-      # Host 8087, not 8080: GTE's console already owns 8080 on this host.
-      # A collision here is SILENT -- `serve()` logs the bind failure and the
-      # watcher keeps organizing without a dashboard -- so the port is chosen
-      # deliberately rather than discovered by its absence.
-      - "8087:8080"     # operational dashboard (see docs/superpowers/specs/2026-08-19-dashboard-design.md)
+      IMAGEHARBOR_DASHBOARD_ALLOWED_HOSTS: ""  # e.g. "100.69.239.123,hpz440,images.hpz440.ohr3023.org"
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.images.rule: Host(`images.hpz440.ohr3023.org`)
+      traefik.http.services.images.loadbalancer.server.port: "8080"
+      harbor.description: "ImageHarbor"
+    networks:
+      - harbor
+      - default
     volumes:
       - /mnt/nas/photos:/data/source:ro          # read-only source
       - /mnt/nas/photos-organized:/data/dest     # read-write organized library
@@ -59,6 +64,10 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+networks:
+  harbor:
+    external: true
 
 volumes:
   imageharbor-catalog:
