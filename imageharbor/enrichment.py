@@ -169,6 +169,9 @@ def _apply_enrichment(
     should simply move on to the next row, or ``"aborted"`` once a
     ``pick_class`` failure trips *breaker* (the caller must `break`).
     """
+    # Tracks where the file currently lives so a failure AFTER a tier-gated
+    # rename records the new path, not the pre-rename one.
+    final_path = actual
     try:
         cls = concept_map.class_for(
             content.primary_subject, content.objects, content.scene, catalog
@@ -243,8 +246,6 @@ def _apply_enrichment(
         date = date_from_row(row)
         old = (date.tier, row["descriptor_tier"] or tiers.DESC_NONE)
         new = (date.tier, tiers.DESC_AI_SUBJECT)
-        final_path = actual
-
         if tiers.is_upgrade(old, new):
             descriptor = normalize_descriptor(content.primary_subject)
             proposed = target_path(
@@ -255,6 +256,9 @@ def _apply_enrichment(
                 # Filesystem first, catalog second: a crash in between is
                 # recovered by digest lookup on the next pass.
                 apply_relocation(actual, proposed)
+                # The bytes have moved: from here on, any failure record must
+                # name the new path, so update it BEFORE the catalog write.
+                final_path = proposed
                 catalog.set_placement(
                     digest,
                     organized_path=str(proposed),
@@ -265,7 +269,6 @@ def _apply_enrichment(
                     descriptor_tier=tiers.DESC_AI_SUBJECT,
                     descriptor_source=tiers.DESC_SOURCE_NAMES[tiers.DESC_AI_SUBJECT],
                 )
-                final_path = proposed
                 stats.renamed += 1
             except OSError as exc:
                 logger.warning("Rename failed for %s: %s", actual.name, exc)
@@ -340,7 +343,7 @@ def _apply_enrichment(
         )
         stats.errors += 1
         stats.io_failed.append(digest)
-        stats.failures.append(EnrichFailure(digest, actual, "IO", str(exc)))
+        stats.failures.append(EnrichFailure(digest, final_path, "IO", str(exc)))
         return "failed_continue"
 
     return "ok"

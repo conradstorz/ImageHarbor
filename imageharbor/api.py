@@ -12,6 +12,7 @@ means it did not finish.
 from __future__ import annotations
 
 import dataclasses
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -135,6 +136,21 @@ def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _open_catalog(path: Path) -> Catalog:
+    """Open (or create) the catalog, turning an open failure into ConfigError.
+
+    A catalog that cannot be created or opened -- a permissions error, a
+    directory that cannot be made, a file that is not SQLite -- is "could not
+    start", which the contract maps to ConfigError / exit 2. Only the OPEN is
+    wrapped: an sqlite error raised later, inside a pass, is a bug and must
+    surface as one.
+    """
+    try:
+        return Catalog(path)
+    except (OSError, sqlite3.Error) as exc:
+        raise ConfigError(f"cannot open catalog {path}: {exc}") from exc
+
+
 def _path_str(p: "Path | str | None") -> str | None:
     return None if p is None else str(p)
 
@@ -227,7 +243,7 @@ def process(
     if not dry_run:
         dest_p.mkdir(parents=True, exist_ok=True)
     catalog_target = Path(":memory:") if dry_run else catalog_p
-    with Catalog(catalog_target) as cat:
+    with _open_catalog(catalog_target) as cat:
         pipeline_stats = Pipeline(
             source_dir=source_p,
             organized_dir=dest_p,
@@ -346,7 +362,7 @@ def enrich(
     breaker = CircuitBreaker(trip_threshold=breaker_threshold, backoff_base=60.0, backoff_cap=900.0)
 
     started = now_iso()
-    with Catalog(catalog_p) as cat:
+    with _open_catalog(catalog_p) as cat:
         enrich_stats = enrich_library(
             cat, dest_p, classifier,
             write_sidecars=sidecar, breaker=breaker, limit=limit, reclassify=reclassify,
@@ -376,6 +392,9 @@ class VerifyRow:
     path: str
     outcome: str          # OK | FAILED
     digest: str
+    # Empty on OK and on a plain digest mismatch; the OS error text when the
+    # file could not be read at all (deleted or unreadable mid-walk).
+    detail: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -440,7 +459,14 @@ def verify(
         if digest is None:
             skipped += 1
             continue
-        row = VerifyRow(path=str(p), outcome=OK if verify_pcs_file(p) else FAILED, digest=digest)
+        try:
+            outcome = OK if verify_pcs_file(p) else FAILED
+            detail = ""
+        except OSError as exc:
+            # A file that vanished or became unreadable between the walk and
+            # the hash is a per-file problem: a FAILED row, never an exception.
+            outcome, detail = FAILED, str(exc)
+        row = VerifyRow(path=str(p), outcome=outcome, digest=digest, detail=detail)
         rows.append(row)
         if on_row is not None:
             on_row(row)
@@ -480,6 +506,6 @@ def stats(catalog: "Path | str") -> dict[str, Any]:
     catalog_p = Path(catalog)
     if not catalog_p.is_file():
         raise ConfigError(f"catalog not found: {catalog_p}")
-    with Catalog(catalog_p) as cat:
+    with _open_catalog(catalog_p) as cat:
         control = ControlPlane(cat, env_interval=0.0, env_enrich=False)
         return collect(cat, control)

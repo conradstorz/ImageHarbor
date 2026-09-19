@@ -1,7 +1,7 @@
 # Library API and `--json` contract
 
 **Date:** 2026-09-18
-**Status:** approved design, not yet implemented.
+**Status:** implemented on `feat/library-api` (PR #30, 2026-09-18).
 Sibling of nas-ingest's `library-api` work (its PR #1, merged 2026-09-17),
 built for the same consumer: `organize-my-life`, whose spec
 (`docs/superpowers/specs/2026-09-17-organize-my-life-design.md` in that repo)
@@ -70,7 +70,7 @@ def process(source, dest, *, catalog=None, duplicates_dir=None,
 def enrich(dest, *, catalog=None, ai=AIConfig(), sidecar=True,
            breaker_threshold=5, limit=None, reclassify=False) -> EnrichReport
 
-def verify(path) -> VerifyReport
+def verify(path, *, on_row=None) -> VerifyReport   # on_row: Callable[[VerifyRow], None]
 
 def stats(catalog) -> dict
 ```
@@ -140,7 +140,7 @@ ProcessReport
   source, dest, catalog: str      dry_run: bool
   started, finished: str
   counts: {COPIED, DUPLICATE, SKIPPED, ERROR, TOTAL}
-  rows: list[ProcessRow]          one per discovered file
+  rows: tuple[ProcessRow, ...]    one per discovered file
   ok = counts[ERROR] == 0
 
 ProcessRow
@@ -151,7 +151,7 @@ EnrichReport
   dest, catalog, ai_backend: str
   started, finished: str          aborted: bool
   counts: {ENRICHED, RENAMED, ERROR, TOTAL}
-  rows: list[EnrichFailureRow]    failures only
+  rows: tuple[EnrichFailureRow, ...]   failures only
   ok = not aborted and counts[ERROR] == 0
 
 EnrichFailureRow
@@ -160,11 +160,12 @@ EnrichFailureRow
 VerifyReport
   path: str   started, finished: str
   counts: {OK, FAILED, SKIPPED, TOTAL}
-  rows: list[VerifyRow]           every file that was actually checked
+  rows: tuple[VerifyRow, ...]     every file that was actually checked
   ok = counts[FAILED] == 0 and counts[OK] + counts[FAILED] > 0
 
 VerifyRow
   path: str   outcome: OK|FAILED   digest: str
+  detail: str   "" unless the file could not be read at all (OS error text)
 ```
 
 `ProcessRow` is built from the existing `pipeline.ProcessResult`

@@ -230,7 +230,7 @@ enrich:  {dest, catalog, ai_backend, started, finished, aborted,
           rows: [{digest, dest_path, reason: "AI"|"IO", detail}]}   # failures only
 verify:  {path, started, finished,
           counts: {OK, FAILED, SKIPPED, TOTAL},
-          rows: [{path, outcome: "OK"|"FAILED", digest}]}
+          rows: [{path, outcome: "OK"|"FAILED", digest, detail}]}   # detail: "" unless unreadable
 ```
 
 Under `dry_run: true`, `process`'s `catalog` is the path that *would* have

@@ -318,3 +318,42 @@ def test_stats_accepts_str_and_reflects_the_library(tmp_path: Path):
 def test_stats_missing_catalog_is_a_config_error(tmp_path: Path):
     with pytest.raises(api.ConfigError):
         api.stats(tmp_path / "nope.db")
+
+
+def test_verify_unreadable_file_is_a_failed_row_not_an_exception(tmp_path: Path, monkeypatch):
+    """A file that vanishes or becomes unreadable between the walk and the
+    hash is a per-file problem: a FAILED row carrying the OS error, never a
+    raised exception (the facade's contract)."""
+    dest = _organized(tmp_path, 2)
+    victim = next(p for p in dest.rglob("*.jpg"))
+    real = api.verify_pcs_file
+
+    def _boom(path):
+        if path == victim:
+            raise OSError("unreadable mid-walk")
+        return real(path)
+
+    monkeypatch.setattr(api, "verify_pcs_file", _boom)
+    report = api.verify(dest)
+    assert not report.ok
+    assert report.counts[api.FAILED] == 1 and report.counts[api.OK] == 1
+    bad = [r for r in report.rows if r.outcome == api.FAILED]
+    assert bad[0].path == str(victim) and "unreadable mid-walk" in bad[0].detail
+    assert all(r.detail == "" for r in report.rows if r.outcome == api.OK)
+    assert "detail" in bad[0].to_dict()
+
+
+def test_catalog_that_cannot_be_opened_is_a_config_error(tmp_path: Path):
+    """A catalog path that is not SQLite (enrich/stats) or cannot be created
+    (process) is 'could not start' -> ConfigError, not a raw sqlite3/OSError."""
+    dest = _organized(tmp_path, 1)
+    (dest / "catalog.db").write_bytes(b"this is not a sqlite database at all " * 4)
+    with pytest.raises(api.ConfigError):
+        api.enrich(dest)
+    with pytest.raises(api.ConfigError):
+        api.stats(dest / "catalog.db")
+    # process: a catalog whose parent cannot be a directory (it is a file).
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    with pytest.raises(api.ConfigError):
+        api.process(tmp_path / "src", tmp_path / "org2", catalog=blocker / "cat.db")

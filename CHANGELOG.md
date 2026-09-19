@@ -27,6 +27,10 @@ Library API and `--json` contract, for `organize-my-life`:
   (all were 1).
 - `EnrichStats.failures` records path and AI/IO reason per failed row
   (additive; `ai_failed`/`io_failed` unchanged).
+- `verify` reports a file that vanished or became unreadable mid-walk as a
+  `FAILED` row with the OS error in a new `detail` field, instead of raising.
+- A catalog that cannot be created or opened is a config error (exit 2) for
+  `process`, `enrich`, and `stats()`, instead of a raw sqlite/OS error.
 - Module `imageharbor/enrich.py` renamed to `imageharbor/enrichment.py` so
   the new public `imageharbor.enrich` function cannot shadow a submodule of
   the same name. Import `enrich_library`/`EnrichStats` from

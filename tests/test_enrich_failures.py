@@ -62,3 +62,25 @@ def test_failures_and_digest_lists_stay_in_lockstep(tmp_path):
         stats = enrich_library(catalog, dest, _Boom())
     assert [f.digest for f in stats.failures] == stats.ai_failed + stats.io_failed
     assert stats.errors == len(stats.failures)
+
+
+def test_io_failure_after_a_rename_records_the_new_path(tmp_path, monkeypatch):
+    """A post-perception failure that happens AFTER the tier-gated rename must
+    record where the file now lives, not its pre-rename path."""
+    _, dest = _organize(tmp_path, n=1)
+    before = next(p for p in dest.rglob("*.jpg"))
+
+    def _boom_set_placement(*args, **kwargs):
+        raise RuntimeError("catalog down after rename")
+
+    with Catalog(dest / "catalog.db") as catalog:
+        # set_placement is only reached on the rename branch, i.e. after the
+        # file has already been moved on disk.
+        monkeypatch.setattr(catalog, "set_placement", _boom_set_placement)
+        stats = enrich_library(catalog, dest, StubClassifier())
+    assert stats.io_failed and len(stats.failures) == 1
+    f = stats.failures[0]
+    assert f.reason == "IO"
+    assert f.organized_path is not None and f.organized_path.exists()
+    assert f.organized_path != before
+    assert not before.exists()

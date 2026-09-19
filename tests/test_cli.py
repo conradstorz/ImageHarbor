@@ -644,8 +644,14 @@ def test_enrich_ai_openai_without_package_fails_gracefully(
     optional package is unavailable or no key), the run must fail, not crash
     silently.  We only assert a non-zero exit and that no crash produced a
     successful summary."""
+    # A real catalog must exist, or `api.enrich` refuses on the missing
+    # catalog (exit 2) before the classifier is ever built and the test
+    # would pass for the wrong reason.
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_jpeg(src / "one.jpg")
     dest = tmp_path / "organized"
-    dest.mkdir()
+    assert runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)]).exit_code == 0
 
     result = runner.invoke(
         main,
