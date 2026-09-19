@@ -275,7 +275,7 @@ def test_process_missing_source_errors(runner: CliRunner, tmp_path: Path) -> Non
         ["process", "--source", str(tmp_path / "nope"), "--dest", str(dest)],
     )
     # Click validates existence of --source (exists=True) -> usage error.
-    assert result.exit_code != 0
+    assert result.exit_code == 2
 
 
 def test_process_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -> None:
@@ -287,7 +287,7 @@ def test_process_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -
 
     result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "--dest" in result.output and "--source" in result.output
     assert not dest.exists()  # must fail before writing anything
 
@@ -298,7 +298,7 @@ def test_process_rejects_dest_equal_to_source(runner: CliRunner, tmp_path: Path)
 
     result = runner.invoke(main, ["process", "--source", str(src), "--dest", str(src)])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
 
 
 def test_process_rejects_dest_inside_source_across_relative_and_absolute(
@@ -317,7 +317,7 @@ def test_process_rejects_dest_inside_source_across_relative_and_absolute(
 
     result = runner.invoke(main, ["process", "--source", "source", "--dest", str(dest)])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "--dest" in result.output and "--source" in result.output
     assert not dest.exists()
 
@@ -342,7 +342,7 @@ def test_watch_rejects_dest_inside_source(runner: CliRunner, tmp_path: Path) -> 
     # watch loop is ever entered, so this invocation must return promptly.
     result = runner.invoke(main, ["watch", "--source", str(src), "--dest", str(dest)])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "--dest" in result.output and "--source" in result.output
     assert not dest.exists()
 
@@ -353,7 +353,7 @@ def test_process_no_longer_accepts_ai_flags(tmp_path):
     result = CliRunner().invoke(
         main, ["process", "--source", str(src), "--dest", str(tmp_path / "d"), "--ai", "stub"]
     )
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "no such option" in result.output.lower()
 
 
@@ -391,9 +391,14 @@ def test_enrich_command_exists_and_reports(tmp_path):
 
 
 def test_enrich_accepts_limit_and_reclassify(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "IMG_20190704_123456.jpg").write_bytes(b"bytes")
     dest = tmp_path / "dest"
-    dest.mkdir()
-    result = CliRunner().invoke(
+
+    runner = CliRunner()
+    runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    result = runner.invoke(
         main,
         ["enrich", "--dest", str(dest), "--ai", "stub", "--limit", "1", "--reclassify"],
     )
@@ -439,13 +444,31 @@ def test_verify_corrupted_file_fails(runner: CliRunner, tmp_path: Path) -> None:
     assert "1 FAILED" in result.output
 
 
+def test_verify_prose_prints_each_line_exactly_once(runner: CliRunner, tmp_path: Path) -> None:
+    """Regression: `verify` used to stream via `on_row` AND loop over
+    `report.rows` afterwards, printing every line twice."""
+    src = _source_with_two_jpegs(tmp_path)
+    dest = tmp_path / "organized"
+    proc = runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)])
+    assert proc.exit_code == 0, proc.output
+
+    victim = next(dest.rglob("*.jpg"))
+    victim.write_bytes(b"\xff\xd8corrupt\xff\xd9")
+
+    result = runner.invoke(main, ["verify", str(dest)])
+    assert result.exit_code == 1, result.output
+    lines = result.output.splitlines()
+    assert sum(1 for ln in lines if ln.startswith("OK   ")) == 1
+    assert sum(1 for ln in lines if ln.startswith("FAIL ")) == 1
+
+
 def test_verify_non_pcs_file_skipped(runner: CliRunner, tmp_path: Path) -> None:
     # A supported-extension image whose name is not in PCS format -> skipped.
     plain = _make_jpeg(tmp_path / "just_a_photo.jpg")
 
     result = runner.invoke(main, ["verify", str(plain)])
     # Nothing was actually verified -> non-zero exit with a clear warning.
-    assert result.exit_code != 0, result.output
+    assert result.exit_code == 2, result.output
     # No per-file FAIL line (the summary word "FAILED" does not count).
     assert not any(ln.startswith("FAIL ") for ln in result.output.splitlines())
     assert "0 OK, 0 FAILED" in result.output
@@ -621,8 +644,14 @@ def test_enrich_ai_openai_without_package_fails_gracefully(
     optional package is unavailable or no key), the run must fail, not crash
     silently.  We only assert a non-zero exit and that no crash produced a
     successful summary."""
+    # A real catalog must exist, or `api.enrich` refuses on the missing
+    # catalog (exit 2) before the classifier is ever built and the test
+    # would pass for the wrong reason.
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_jpeg(src / "one.jpg")
     dest = tmp_path / "organized"
-    dest.mkdir()
+    assert runner.invoke(main, ["process", "--source", str(src), "--dest", str(dest)]).exit_code == 0
 
     result = runner.invoke(
         main,
@@ -643,7 +672,7 @@ def test_enrich_ai_openai_without_package_fails_gracefully(
     # to assert about failure, so guard the assertion.
     if result.exit_code == 0:
         pytest.skip("openai backend is available in this environment")
-    assert result.exit_code != 0
+    assert result.exit_code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -653,9 +682,9 @@ def test_enrich_ai_openai_without_package_fails_gracefully(
 
 def test_build_classifier_stub_default() -> None:
     from imageharbor.ai_classifier import StubClassifier
-    from imageharbor.cli import _build_classifier
+    from imageharbor.api import AIConfig, _build_classifier
 
-    clf = _build_classifier("stub", None, None, "gpt-4o-mini", 60.0)
+    clf = _build_classifier(AIConfig())
     assert isinstance(clf, StubClassifier)
 
 
@@ -1254,7 +1283,7 @@ def test_enrich_command_aborts_and_reports_when_backend_down(tmp_path, monkeypat
         main,
         ["enrich", "--dest", str(dest), "--breaker-threshold", "2"],
     )
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "backend appears down" in result.output.lower()
 
 

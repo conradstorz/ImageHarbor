@@ -4,7 +4,7 @@ from pathlib import Path
 
 from imageharbor.ai_classifier import AIClassifier, ContentDescription, StubClassifier
 from imageharbor.catalog import Catalog
-from imageharbor.enrich import enrich_library
+from imageharbor.enrichment import enrich_library
 from imageharbor.pipeline import Pipeline
 from imageharbor.tiers import (
     DATE_FILENAME_PATTERN,
@@ -221,7 +221,7 @@ def test_a_duplicate_upgrade_re_merges_the_sidecar(tmp_path):
 
     `_maybe_upgrade_from_duplicate` carries the sidecar FILE to the new path
     (a plain rename), but a rename alone doesn't touch its JSON content --
-    unlike enrich.py, which explicitly re-merges after a tier-gated
+    unlike enrichment.py, which explicitly re-merges after a tier-gated
     relocation. Regression test for the equivalent fix on the duplicate-
     upgrade path.
     """

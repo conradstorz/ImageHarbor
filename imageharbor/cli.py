@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
 
-from . import __version__
+from . import __version__, api
+from .api import (
+    Aborted,
+    AIConfig,
+    ConfigError,
+    _build_classifier,
+    _guard_dest_not_inside_source,
+)
 from .catalog import Catalog
-from .enrich import enrich_library
-from .hashing import extract_digest_from_stem, verify_pcs_file
 from .pipeline import Pipeline
 from .takeout import index_reader
 from .takeout.ingest import ingest_archives
@@ -45,27 +52,25 @@ def main(log_level: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_classifier(
-    ai_backend: str,
-    api_key: str | None,
-    base_url: str | None,
-    model: str,
-    timeout: float,
-):
-    """Construct the AI classifier for the chosen backend. Raises a clean
-    ClickException if the optional 'openai' package is missing."""
-    if ai_backend == "openai":
-        from .ai_classifier import OpenAIClassifier
+class _ConfigFailure(click.ClickException):
+    """An api.ConfigError at the CLI edge: same message format, exit code 2
+    (nas-ingest's convention -- the run could not start)."""
 
-        try:
-            return OpenAIClassifier(
-                api_key=api_key, model=model, base_url=base_url, timeout=timeout
-            )
-        except ImportError as exc:
-            raise click.ClickException(str(exc)) from exc
-    from .ai_classifier import StubClassifier
+    exit_code = 2
 
-    return StubClassifier()
+
+def _emit_json(doc: dict[str, Any]) -> None:
+    """Under --json, stdout is exactly one document; everything else is stderr."""
+    click.echo(json.dumps(doc))
+
+
+def _echo_verify_row(row: "api.VerifyRow") -> None:
+    """`api.verify`'s `on_row` hook for prose mode: render one line as each
+    file is checked, instead of waiting for the whole report."""
+    if row.outcome == api.OK:
+        click.echo(f"OK   {row.path}")
+    else:
+        click.echo(f"FAIL {row.path}", err=True)
 
 
 def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
@@ -74,28 +79,6 @@ def _build_breaker(threshold: int, backoff: float, backoff_cap: float):
     return CircuitBreaker(
         trip_threshold=threshold, backoff_base=backoff, backoff_cap=backoff_cap
     )
-
-
-def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
-    """Refuse to run with --dest nested inside --source.
-
-    `enrich` and the duplicate-upgrade path (`pipeline._maybe_upgrade_from_
-    duplicate`) RENAME files under --dest. If --dest is a subdirectory of
-    --source, those renames would write into the source tree -- directly
-    violating "originals are read-only", the invariant the whole project is
-    built on. Only meaningful when --source is a directory; a single source
-    FILE cannot contain a --dest directory.
-    """
-    if not source.is_dir():
-        return
-    source_resolved = source.resolve()
-    dest_resolved = dest.resolve()
-    if dest_resolved == source_resolved or source_resolved in dest_resolved.parents:
-        raise click.ClickException(
-            f"--dest ({dest}) is inside --source ({source}). Renames performed "
-            "by enrich/watch would then write into the read-only source tree. "
-            "Choose a --dest that is not nested inside --source."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +131,16 @@ def _guard_dest_not_inside_source(source: Path, dest: Path) -> None:
     default=False,
     help="Do not recurse into sub-directories.",
 )
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help=(
+        "Print the run report as one JSON document on stdout "
+        "(exit 0 ok, 1 error rows, 2 could not start or did not finish)."
+    ),
+)
 def process(
     source: Path,
     dest: Path,
@@ -156,6 +149,7 @@ def process(
     sidecar: bool,
     dry_run: bool,
     no_recursive: bool,
+    as_json: bool,
 ) -> None:
     """Discover, hash, copy and catalog photos from SOURCE to DEST.
 
@@ -163,39 +157,25 @@ def process(
     to be configured. Run `enrich` afterwards to describe and classify the
     organized copies.
     """
-    _guard_dest_not_inside_source(source, dest)
-
-    if catalog_path is None:
-        catalog_path = dest / "catalog.db"
-
-    # In dry-run mode nothing may touch the disk: skip creating the dest
-    # directory and use an in-memory catalog (sqlite3 ":memory:" creates no
-    # file).  The pipeline performs no upserts in dry-run, so it stays empty.
-    if not dry_run:
-        dest.mkdir(parents=True, exist_ok=True)
-
-    catalog_target = Path(":memory:") if dry_run else catalog_path
-
-    with Catalog(catalog_target) as catalog:
-        pipeline = Pipeline(
-            source_dir=source,
-            organized_dir=dest,
-            catalog=catalog,
-            duplicates_dir=duplicates_dir,
-            write_sidecars=sidecar,
-            dry_run=dry_run,
+    try:
+        report = api.process(
+            source, dest, catalog=catalog_path, duplicates_dir=duplicates_dir,
+            sidecar=sidecar, recursive=not no_recursive, dry_run=dry_run,
         )
-        stats = pipeline.run(recursive=not no_recursive)
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
 
-    # Summary
-    if dry_run:
-        click.echo("[DRY-RUN] No files were written.")
-    click.echo(
-        f"Done. Total={stats.total}  Copied={stats.copied}  "
-        f"Duplicates={stats.duplicates}  Errors={stats.errors}"
-    )
-
-    if stats.errors:
+    if as_json:
+        _emit_json(report.to_dict())
+    else:
+        if dry_run:
+            click.echo("[DRY-RUN] No files were written.")
+        c = report.counts
+        click.echo(
+            f"Done. Total={c[api.TOTAL]}  Copied={c[api.COPIED]}  "
+            f"Duplicates={c[api.DUPLICATE]}  Errors={c[api.ERROR]}"
+        )
+    if not report.ok:
         sys.exit(1)
 
 
@@ -284,6 +264,16 @@ def process(
     default=False,
     help="Re-run classification on already-enriched images.",
 )
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help=(
+        "Print the run report as one JSON document on stdout "
+        "(exit 0 ok, 1 error rows, 2 could not start or did not finish)."
+    ),
+)
 def enrich(
     dest: Path,
     catalog_path: Path | None,
@@ -296,6 +286,7 @@ def enrich(
     breaker_threshold: int,
     limit: int | None,
     reclassify: bool,
+    as_json: bool,
 ) -> None:
     """Describe and classify already-organized images in DEST.
 
@@ -303,37 +294,37 @@ def enrich(
     mounted. Safe to interrupt and re-run: a file is only ever renamed when
     the result is strictly better.
     """
-    if catalog_path is None:
-        catalog_path = dest / "catalog.db"
-
-    classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
-    breaker = _build_breaker(breaker_threshold, 60.0, 900.0)
-
-    with Catalog(catalog_path) as catalog:
-        stats = enrich_library(
-            catalog,
-            dest,
-            classifier,
-            write_sidecars=sidecar,
-            breaker=breaker,
-            limit=limit,
-            reclassify=reclassify,
+    ai = AIConfig(backend=ai_backend, base_url=ai_base_url, model=ai_model,
+                  timeout=ai_timeout, api_key=openai_key)
+    error: str | None = None
+    report: api.EnrichReport | None = None
+    try:
+        report = api.enrich(
+            dest, catalog=catalog_path, ai=ai, sidecar=sidecar,
+            breaker_threshold=breaker_threshold, limit=limit, reclassify=reclassify,
         )
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
+    except Aborted as exc:
+        report = exc.report
+        error = str(exc)
+    assert report is not None  # api.enrich always attaches one on Aborted
 
-    click.echo(
-        f"Enriched={stats.enriched}  Renamed={stats.renamed}  "
-        f"Errors={stats.errors}  Total={stats.total}"
-    )
-
-    if stats.aborted:
+    if as_json:
+        doc = report.to_dict()
+        if error is not None:
+            doc["error"] = error
+        _emit_json(doc)
+    else:
+        c = report.counts
         click.echo(
-            f"AI backend appears down — aborted after {breaker.trip_threshold} "
-            "consecutive failures.",
-            err=True,
+            f"Enriched={c[api.ENRICHED]}  Renamed={c[api.RENAMED]}  "
+            f"Errors={c[api.ERROR]}  Total={c[api.TOTAL]}"
         )
-        sys.exit(1)
-
-    if stats.errors:
+    if error is not None:
+        click.echo(error, err=True)
+        sys.exit(2)
+    if not report.ok:
         sys.exit(1)
 
 
@@ -594,12 +585,21 @@ def watch(
     from .dashboard import server as dashboard_server
     from .dashboard.control import ControlPlane
 
-    _guard_dest_not_inside_source(source, dest)
+    try:
+        _guard_dest_not_inside_source(source, dest)
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
 
     if catalog_path is None:
         catalog_path = dest / "catalog.db"
 
-    classifier = _build_classifier(ai_backend, openai_key, ai_base_url, ai_model, ai_timeout)
+    try:
+        classifier = _build_classifier(
+            AIConfig(backend=ai_backend, base_url=ai_base_url, model=ai_model,
+                     timeout=ai_timeout, api_key=openai_key)
+        )
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
     dest.mkdir(parents=True, exist_ok=True)
     parsed_face_threshold = _parse_face_threshold(face_threshold)
 
@@ -769,49 +769,46 @@ def watch(
     "path",
     type=click.Path(exists=True, path_type=Path),
 )
-def verify(path: Path) -> None:
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help=(
+        "Print the run report as one JSON document on stdout "
+        "(exit 0 ok, 1 error rows, 2 could not start or did not finish)."
+    ),
+)
+def verify(path: Path, as_json: bool) -> None:
     """Verify organized-file integrity for PATH (file or directory).
 
     Every organized file embeds its SHA-256 digest in its filename (the last
     43 characters of the stem, Base64url-encoded); this re-hashes each file's
     content and confirms it still matches the digest embedded in its name.
     """
-    from .discovery import SUPPORTED_EXTENSIONS
+    try:
+        report = api.verify(path, on_row=None if as_json else _echo_verify_row)
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
 
-    targets: list[Path]
-    if path.is_file():
-        targets = [path]
+    c = report.counts
+    checked = c[api.OK] + c[api.FAILED]
+    nothing_msg = "No organized image files (with an embedded digest) found to verify."
+
+    if as_json:
+        doc = report.to_dict()
+        if checked == 0:
+            doc["error"] = nothing_msg
+        _emit_json(doc)
     else:
-        targets = sorted(p for p in path.rglob("*") if p.is_file())
-
-    ok_count = 0
-    fail_count = 0
-    skip_count = 0
-    for target in targets:
-        # Only verify files with supported image extensions
-        if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            skip_count += 1
-            continue
-        digest = extract_digest_from_stem(target.stem)
-        if digest is None:
-            # No embedded digest in this filename; skip silently
-            skip_count += 1
-            continue
-        if verify_pcs_file(target):
-            ok_count += 1
-            click.echo(f"OK   {target}")
-        else:
-            fail_count += 1
-            click.echo(f"FAIL {target}", err=True)
-
-    click.echo(
-        f"\nVerified {ok_count + fail_count} organized image(s) "
-        f"({skip_count} non-image/no-digest skipped): {ok_count} OK, {fail_count} FAILED"
-    )
-    if ok_count + fail_count == 0:
-        click.echo("No organized image files (with an embedded digest) found to verify.", err=True)
-        sys.exit(1)
-    if fail_count:
+        click.echo(
+            f"\nVerified {checked} organized image(s) "
+            f"({c[api.SKIPPED]} non-image/no-digest skipped): {c[api.OK]} OK, {c[api.FAILED]} FAILED"
+        )
+    if checked == 0:
+        click.echo(nothing_msg, err=True)
+        sys.exit(2)
+    if c[api.FAILED]:
         sys.exit(1)
 
 
@@ -941,7 +938,10 @@ def takeout_ingest(
     This is a facts pass: it makes no AI calls and requires no AI backend. Run
     `enrich` afterwards to describe and classify the organized copies.
     """
-    _guard_dest_not_inside_source(archives_dir, dest)
+    try:
+        _guard_dest_not_inside_source(archives_dir, dest)
+    except ConfigError as exc:
+        raise _ConfigFailure(str(exc)) from exc
 
     if catalog_path is None:
         catalog_path = dest / "catalog.db"

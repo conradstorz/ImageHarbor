@@ -27,3 +27,47 @@ except PackageNotFoundError:  # source tree with no installed dist
     # branch is unreachable under the documented `uv run` workflow (the dist is
     # always installed). Do not "fix" this to look like a real version.
     __version__ = "unknown+uninstalled"
+
+# This import is kept below the licence header + __version__ block so the two
+# stay together at the top of the file (E402 -- module level import not at
+# top of file -- is selected via "E4" in pyproject.toml's ruff config).
+from .api import (  # noqa: E402
+    AI,
+    COPIED,
+    DUPLICATE,
+    ENRICHED,
+    ERROR,
+    FAILED,
+    IO,
+    OK,
+    RENAMED,
+    SKIPPED,
+    TOTAL,
+    Aborted,
+    AIConfig,
+    ConfigError,
+    EnrichFailureRow,
+    EnrichReport,
+    ImageHarborError,
+    ProcessReport,
+    ProcessRow,
+    VerifyReport,
+    VerifyRow,
+    enrich,  # the facade FUNCTION (api.enrich). The enrichment-pass module is
+    # `imageharbor.enrichment` -- named so precisely to avoid a submodule
+    # called `enrich` being shadowed by this attribute.
+    process,
+    stats,
+    verify,
+)
+
+__all__ = [
+    "process", "enrich", "verify", "stats",
+    "AIConfig",
+    "ProcessReport", "EnrichReport", "VerifyReport",
+    "ProcessRow", "EnrichFailureRow", "VerifyRow",
+    "COPIED", "DUPLICATE", "SKIPPED", "ERROR", "ENRICHED", "RENAMED", "TOTAL",
+    "AI", "IO", "OK", "FAILED",
+    "ImageHarborError", "ConfigError", "Aborted",
+    "__version__",
+]

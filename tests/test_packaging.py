@@ -32,6 +32,7 @@ pyproject.toml, which makes inclusion independent of git metadata.
 from __future__ import annotations
 
 import ast
+import os
 import re
 import shutil
 import subprocess
@@ -234,3 +235,83 @@ def test_the_documented_dev_install_covers_every_module_scope_test_import():
         "in pyproject.toml, or reach it through pytest.importorskip so the "
         "test skips instead of erroring."
     )
+
+
+# -- the documented public library API must resolve from the package --------
+
+PUBLIC_API = [
+    "process", "enrich", "verify", "stats",
+    "AIConfig",
+    "ProcessReport", "EnrichReport", "VerifyReport",
+    "ProcessRow", "EnrichFailureRow", "VerifyRow",
+    "COPIED", "DUPLICATE", "SKIPPED", "ERROR", "ENRICHED", "RENAMED", "TOTAL",
+    "AI", "IO", "OK", "FAILED",
+    "ImageHarborError", "ConfigError", "Aborted",
+    "__version__",
+]
+
+
+def test_the_package_exports_the_documented_public_api():
+    import imageharbor
+
+    assert set(imageharbor.__all__) == set(PUBLIC_API)
+    for name in PUBLIC_API:
+        assert hasattr(imageharbor, name), name
+
+
+def test_the_public_api_imports_from_the_built_wheel(wheel_built_without_git: Path, tmp_path: Path):
+    """The wheel, installed into a scratch venv with no dev extras, must
+    expose every public name -- what `uv add git+…` gives a consumer.
+
+    Requires `uv` on PATH and index access to resolve the wheel's runtime
+    deps (Pillow, click) unless they are already cached -- per this module's
+    philosophy (see the module docstring and `wheel_built_without_git`'s own
+    docstring), this test fails rather than skips when offline.
+    """
+    venv = tmp_path / "venv"
+    proc = subprocess.run(["uv", "venv", str(venv)], capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        pytest.fail("`uv venv` failed:\n" + proc.stdout + "\n" + proc.stderr)
+    proc = subprocess.run(
+        ["uv", "pip", "install", "--python", str(venv), str(wheel_built_without_git)],
+        capture_output=True, text=True, timeout=600,
+    )
+    if proc.returncode != 0:
+        pytest.fail("`uv pip install` failed:\n" + proc.stdout + "\n" + proc.stderr)
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    # cwd=tmp_path (not the project root) and PYTHONSAFEPATH=1 keep `-c`'s
+    # sys.path[0] out of the checkout -- without both, `import imageharbor`
+    # can silently resolve to `imageharbor/` in this project's own working
+    # directory instead of the venv the wheel was just installed into, which
+    # would make this test pass even when the wheel itself is broken.
+    code = (
+        "import sys, pathlib; "
+        "import imageharbor as ih; "
+        + "; ".join(f"ih.{n}" for n in PUBLIC_API)
+        + "; assert pathlib.Path(ih.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()), ih.__file__; "
+        "print('ok')"
+    )
+    proc = subprocess.run(
+        [str(python), "-c", code],
+        cwd=str(tmp_path),
+        env={**os.environ, "PYTHONSAFEPATH": "1"},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "ok"
+
+
+def test_enrich_attribute_is_the_facade_function_and_no_submodule_collides():
+    """`from imageharbor import enrich` is the public facade function. The
+    enrichment-pass module is `imageharbor.enrichment`; there must be no
+    `imageharbor.enrich` submodule for the attribute to shadow."""
+    import importlib
+
+    import imageharbor
+    from imageharbor import api
+
+    assert imageharbor.enrich is api.enrich
+    mod = importlib.import_module("imageharbor.enrichment")
+    assert hasattr(mod, "enrich_library")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("imageharbor.enrich")

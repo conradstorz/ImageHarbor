@@ -501,7 +501,7 @@ class Pipeline:
         # sidecar or updating the catalog must be logged and swallowed here,
         # not allowed to propagate and turn a correct "duplicate" result into
         # an "error" while leaving the catalog pointing at a path that no
-        # longer exists (mirrors enrich.py's separation of these steps).
+        # longer exists (mirrors enrichment.py's separation of these steps).
         try:
             old_sidecar = sidecar_path_for(actual)
             if old_sidecar.exists():
@@ -533,7 +533,7 @@ class Pipeline:
 
         # The sidecar (if any) was carried to the new path above, but merely
         # renaming it leaves its date/descriptor/sources blocks holding the
-        # PRE-upgrade values -- enrich.py re-merges after a tier-gated
+        # PRE-upgrade values -- enrichment.py re-merges after a tier-gated
         # relocation for the same reason; this is that same step for the
         # duplicate-upgrade path. A failure here must not undo the rename or
         # catalog update already committed, so it is logged and swallowed.

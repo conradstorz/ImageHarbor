@@ -240,7 +240,7 @@ def test_facts_phase_runs_even_when_the_breaker_is_open(tmp_path, monkeypatch):
 
     def fake_enrich(*args, **kwargs):
         calls["enrich"] += 1
-        from imageharbor.enrich import EnrichStats
+        from imageharbor.enrichment import EnrichStats
 
         return EnrichStats()
 

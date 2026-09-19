@@ -1,7 +1,7 @@
 """Two-phase Google Takeout ingestion.
 
 The only module in this package with side effects. Its shape mirrors
-``enrich.enrich_library``: iterate a work queue held in the catalog, do one
+``enrichment.enrich_library``: iterate a work queue held in the catalog, do one
 unit of work, commit the outcome, continue.
 
 Phase 1 surveys every archive by reading central directories only, and builds

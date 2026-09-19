@@ -47,6 +47,7 @@ Python project managed with `uv` (see global CLAUDE.md — do not use pip/venv d
 | Report Takeout ingestion progress | `uv run imageharbor takeout status --catalog DEST/catalog.db` |
 | Survey an archive set before ingesting (read-only, standalone) | `uv run imageharbor takeout survey --archives DIR --json report.json` |
 | Re-verify integrity | `uv run imageharbor verify DEST` |
+| Same, as one JSON document on stdout (exit 0/1/2) | `uv run imageharbor process … --json` (also `enrich`, `verify`) |
 | Watch a library continuously (both passes) | `uv run imageharbor watch --source SRC --dest DEST` |
 | Build the Docker image | `docker build -t imageharbor:latest .` |
 | Run the watcher (compose) | `docker compose up -d` (see `docs/deploy-docker.md`) |
@@ -72,7 +73,7 @@ no AI, no network call:
 `hash → dedup (+ back-pointer, + duplicate upgrade) → EXIF → resolve date →
 resolve descriptor → target path → copy → verify → catalog → sidecar`
 
-**Enrichment pass** (`enrich.enrich_library`, driven by `imageharbor enrich`) —
+**Enrichment pass** (`enrichment.enrich_library`, driven by `imageharbor enrich`) —
 reads the organized copy, resumable, AI-dependent:
 
 `unenriched rows → describe → concept_map/pick_class → taxonomy resolve →
@@ -218,7 +219,7 @@ Module responsibilities:
   catalog) plus digest-based self-healing (`find_by_digest`,
   `resolve_organized_path`) for a stale/missing recorded path — a moved or
   crash-interrupted file is never actually lost because it's content-addressed.
-- **`enrich.py`** — the enrichment-pass orchestrator above (`enrich_library`).
+- **`enrichment.py`** — the enrichment-pass orchestrator above (`enrich_library`).
   Iterates `catalog.iter_unenriched()` (or, with `--reclassify`, every enriched
   row), calls `classifier.describe()`, then the same
   `concept_map.class_for`/`pick_class`/`taxonomy.resolve_or_create` chain the old
@@ -262,11 +263,11 @@ Module responsibilities:
   and reuses the code; otherwise a new code is minted. `merge(from_code, to_code)`
   aliases one code onto another after the fact. `folder_path(code)` still walks
   `parent_code` links to build the slash-joined classification path, but that path
-  **no longer decides where a file lives on disk** — `enrich.py` writes it into
+  **no longer decides where a file lives on disk** — `enrichment.py` writes it into
   the sidecar's `classification.folder_path` field only, as a human-readable
   record of the PCS tree the file was filed under. Actual placement comes from
   `date_resolver.ResolvedDate.folder`. `taxonomy.py` itself was not touched by the
-  facts/enrichment split — `enrich.py` calls `resolve_or_create(class,
+  facts/enrichment split — `enrichment.py` calls `resolve_or_create(class,
   primary_subject)` with a fixed top-level class and **no `sub_parent`**, so in
   practice the taxonomy is effectively **two levels** (fixed class →
   `primary_subject` sub-category); the `sub_parent`/`~N`-under-a-leaf machinery
@@ -288,7 +289,7 @@ Module responsibilities:
   `model_version`) is the only required method — **the classifier never picks a
   class or a PCS code; it only reports what it sees.** `PhotoClassification` and
   `classify()` are gone. Two more ABC methods support the organizer: `pick_class
-  (content, classes) -> str` is a **text-only fallback** `enrich.py` calls only
+  (content, classes) -> str` is a **text-only fallback** `enrichment.py` calls only
   when `concept_map.class_for` misses (default: `"900"`; `OpenAIClassifier` asks
   the model to choose among the 9 fixed classes), and `adjudicate(label,
   candidates) -> str | None` (default: no match) lets a real-model backend decide
@@ -301,13 +302,13 @@ Module responsibilities:
   it — a local/Jetson HTTP backend is an expected future implementation that does not
   exist yet. Keep the classifier decoupled from any specific host or provider.
 - **`concept_map.py`** — decides the top-level **class** (the organizer's job, not
-  the AI's), called from `enrich.py`. `STATIC_SEED` is built once at import time
+  the AI's), called from `enrichment.py`. `STATIC_SEED` is built once at import time
   from `pcs.PCS_CATEGORIES`' sub-category names plus a small curated
   keyword/synonym table, mapping normalized subject/object/scene tokens to one of
   the 9 fixed classes. `class_for(primary_subject, objects, scene, catalog)` checks,
   in order: the catalog's `learned_concepts` store (exact normalized-subject match),
   then the static seed against the subject, then against each object/scene token —
-  returning `None` on a genuine miss. On a miss `enrich.py` falls back to
+  returning `None` on a genuine miss. On a miss `enrichment.py` falls back to
   `classifier.pick_class()` and calls `remember(catalog, primary_subject,
   class_code)` to memoize the decision in `learned_concepts`, so the next photo with
   the same normalized subject is a deterministic, network-free hit.
@@ -537,10 +538,35 @@ Module responsibilities:
   writes at all, including no quarantine of an unparseable existing sidecar —
   it passes `quarantine=False` to `sidecar.read_sidecar` for exactly that
   reason.
+- **`api.py`** — the public library facade and the only promised import
+  surface: `process()`, `enrich()`, `verify()`, `stats()`, frozen
+  `ProcessReport`/`EnrichReport`/`VerifyReport` (+ row types) with
+  `to_dict()`, `AIConfig`, and `ImageHarborError` → `ConfigError` (could not
+  start) / `Aborted` (breaker tripped; carries the partial `EnrichReport` as
+  `.report`). It only *wraps* the orchestrators — no placement, naming,
+  hashing, or catalog logic lives here. A per-file problem is a row, never
+  an exception. `stats()` imports the dashboard package *inside* the
+  function so `import imageharbor` stays light. Re-exported from
+  `imageharbor/__init__.py`; `__all__` there is the contract. Spec:
+  `docs/superpowers/specs/2026-09-18-library-api-design.md`. `from
+  imageharbor import enrich` binds this module's `enrich()` **function**;
+  the enrichment-pass module is `enrichment.py` (renamed from `enrich.py`
+  on 2026-09-18 precisely so no submodule is shadowed by that attribute). Because `imageharbor/__init__.py` imports `api.py`
+  eagerly, `import imageharbor.pipeline` now also loads `api`/`enrich`
+  along the way, but the AI classifier module stays off that import path —
+  `api.py`'s and `enrichment.py`'s references to `AIClassifier` are
+  `TYPE_CHECKING`-only, so the facts pass still makes no AI-module import.
 - **`cli.py`** — Click entry point (`process`, `enrich`, `watch`, `verify`,
   `catalog list/get`, `takeout ingest/status`, `sidecar backfill`, `faces
-  scan/cluster/calibrate/status/models download`). `watch` gains five
-  dashboard flags alongside its existing `--sidecar`-style options:
+  scan/cluster/calibrate/status/models download`). `_build_classifier` and
+  `_guard_dest_not_inside_source` live in `api.py` (the public facade — see
+  its bullet) and raise `api.ConfigError`; `cli.py` converts that to
+  `_ConfigFailure` (a `ClickException` with `exit_code = 2`) at each call
+  site. `process`/`enrich`/`verify` are thin renderers over `api.*`:
+  `--json` prints `report.to_dict()` as the only stdout line; exit 0 = ok, 1
+  = ERROR/FAILED rows, 2 = `ConfigError` or `Aborted` (`_ConfigFailure` is
+  `ClickException` with `exit_code = 2`). `watch` gains five dashboard flags alongside its existing
+  `--sidecar`-style options:
   `--dashboard-port` (`IMAGEHARBOR_DASHBOARD_PORT`, default `8080`),
   `--no-dashboard` (a bare flag; the dashboard is on by default),
   `--dashboard-host` (`IMAGEHARBOR_DASHBOARD_HOST`, default `127.0.0.1` —
@@ -918,6 +944,11 @@ Module responsibilities:
   without each of them re-normalizing (or worse, one of them forgetting to).
   A stored embedding that somehow isn't unit-length is a bug upstream of
   storage, not something a consumer should silently correct for.
+- **The `--json` document and exit codes are a stable contract.**
+  `organize-my-life` consumes them as a subprocess tool. `to_dict()` keys
+  may be added, never removed or retyped; the outcome constants and the
+  0/1/2 exit mapping do not change. The same goes for every name in
+  `imageharbor.__all__`.
 
 ## Known limitations
 
