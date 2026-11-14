@@ -50,6 +50,12 @@ dev = [
     "numpy>=1.24,<2.3",
     "ruff>=0.6",
     "mypy>=1.11",
+    # Conformance tests (tests/test_contracts_conformance.py) check this
+    # package against the shared contract. Dev-only: nothing under
+    # imageharbor/ imports it, so the wheel and the Docker image
+    # (`--no-dev`, no `dev` extra) never need it. Source is below.
+    "photo-contracts>=0.1.1",
+    "jsonschema>=4.21",
 ]
 
 [project.urls]
@@ -58,6 +64,10 @@ Changelog = "https://github.com/conradstorz/ImageHarbor/blob/main/CHANGELOG.md"
 
 [project.scripts]
 imageharbor = "imageharbor.cli:main"
+
+[tool.uv.sources]
+# Pinned by tag: bump deliberately, together with any conformance change.
+photo-contracts = { git = "https://github.com/conradstorz/photo-contracts", tag = "v0.1.1" }
 
 [tool.setuptools_scm]
 # A build with no .git and no SETUPTOOLS_SCM_PRETEND_VERSION_FOR_IMAGEHARBOR
