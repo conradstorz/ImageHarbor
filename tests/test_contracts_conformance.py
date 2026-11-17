@@ -12,6 +12,7 @@ Dev-only dependency: nothing under imageharbor/ imports photo_contracts.
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -23,7 +24,8 @@ from photo_contracts import contract, digest, layout  # noqa: E402
 from PIL import Image  # noqa: E402
 
 import imageharbor  # noqa: E402
-from imageharbor import hashing  # noqa: E402
+from imageharbor import api, hashing  # noqa: E402
+from imageharbor.ai_classifier import StubClassifier  # noqa: E402
 from imageharbor.cli import main  # noqa: E402
 from imageharbor.takeout import index_reader  # noqa: E402
 
@@ -107,3 +109,78 @@ def test_digest_encoding_and_filename_parsing_agree(tmp_path):
 
 def test_takeout_index_version_matches_contract():
     assert index_reader.SCHEMA_VERSION == max(contract.TAKEOUT_INDEX_SUPPORTED_VERSIONS)
+    assert index_reader.SUPPORTED_VERSIONS == contract.TAKEOUT_INDEX_SUPPORTED_VERSIONS
+
+
+def _index_declaring(tmp_path, version: int):
+    path = tmp_path / f"index-{version}.sqlite"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT INTO index_meta VALUES ('schema_version', ?)", (str(version),))
+    con.commit()
+    con.close()
+    return path
+
+
+@pytest.mark.parametrize(
+    "version",
+    [v for v in (-1, 0, 1, 2, 99) if v not in contract.TAKEOUT_INDEX_SUPPORTED_VERSIONS],
+)
+def test_takeout_index_rejects_versions_outside_the_contract(tmp_path, version):
+    path = _index_declaring(tmp_path, version)
+    with pytest.raises(index_reader.IndexUnusable, match="schema"):
+        index_reader.IndexPairings.open(path, {})
+
+
+def _enrich_cli(runner, dest, *extra):
+    r = runner.invoke(main, ["enrich", "--dest", str(dest), "--json", *extra])
+    return r, json.loads(r.stdout)
+
+
+class _Down(StubClassifier):
+    def describe(self, image_path, exif_data):
+        raise RuntimeError("backend down")
+
+
+def test_cli_enrich_json_success_matches_schema_and_exit_code(library):
+    src, dest = library
+    imageharbor.process(src, dest)
+    r, doc = _enrich_cli(CliRunner(), dest)
+    assert r.exit_code == contract.EXIT_OK, r.output
+    _check(doc, "enrich_report")
+    assert doc["rows"] == [] and doc["aborted"] is False
+
+
+def test_cli_enrich_io_failure_row_matches_schema_and_exit_code(library):
+    src, dest = library
+    imageharbor.process(src, dest)
+    next(dest.rglob("*.jpg")).unlink()  # organized file vanishes -> an IO row
+    r, doc = _enrich_cli(CliRunner(), dest)
+    assert r.exit_code == contract.EXIT_ROW_ERRORS, r.output
+    _check(doc, "enrich_report")
+    assert doc["rows"], doc
+    assert {row["reason"] for row in doc["rows"]} == {"IO"}
+    assert {row["reason"] for row in doc["rows"]} <= set(contract.ENRICH_FAILURE_REASONS)
+
+
+def test_cli_enrich_ai_failure_rows_match_schema_and_exit_code(library, monkeypatch):
+    src, dest = library
+    imageharbor.process(src, dest)
+    monkeypatch.setattr(api, "_build_classifier", lambda ai: _Down())
+    # breaker disabled: every row is attempted and fails, nothing aborts
+    r, doc = _enrich_cli(CliRunner(), dest, "--breaker-threshold", "0")
+    assert r.exit_code == contract.EXIT_ROW_ERRORS, r.output
+    _check(doc, "enrich_report")
+    assert doc["aborted"] is False and doc["rows"]
+    assert {row["reason"] for row in doc["rows"]} == {"AI"}
+    assert {row["reason"] for row in doc["rows"]} <= set(contract.ENRICH_FAILURE_REASONS)
+
+
+def test_cli_enrich_breaker_abort_matches_schema_and_exit_code(library, monkeypatch):
+    src, dest = library
+    imageharbor.process(src, dest)
+    monkeypatch.setattr(api, "_build_classifier", lambda ai: _Down())
+    r, doc = _enrich_cli(CliRunner(), dest, "--breaker-threshold", "1")
+    assert r.exit_code == contract.EXIT_CONFIG_OR_ABORT, r.output
+    _check(doc, "enrich_report")
+    assert doc["aborted"] is True and doc["rows"]
