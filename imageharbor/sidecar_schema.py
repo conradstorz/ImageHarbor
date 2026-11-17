@@ -187,6 +187,15 @@ def _merge_tiered(base: Any, new: Any, observed_at: str) -> dict[str, Any]:
         _relocate(history, old_core, superseded_at=observed_at)
         return {**new_core, "observed_at": observed_at, "history": history}
 
+    if new_tier == old_tier and all(
+        k in new_core and new_core[k] == v for k, v in old_core.items()
+    ):
+        # Same tier, and the new observation only ADDS keys (e.g. a later
+        # version learning `machine_generated`). That is information gain, not
+        # a competing value: fold it in rather than filing it as rejected.
+        # Idempotent: a second merge finds old_core == new_core above.
+        return {**base, **new_core, "history": history}
+
     _relocate(history, new_core, observed_at=observed_at, rejected=True)
     return {**base, "history": history}
 
