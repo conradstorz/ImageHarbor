@@ -91,6 +91,22 @@ Per-module detail moved out of `CLAUDE.md` (which keeps a one-line module map an
   sidecars with no media member anywhere in the batch — computed by the caller
   from the whole-batch pairing index, and files those under `orphaned/`
   instead of their normal member path.
+  **Basename collisions (fixed, PR #34).** `orphaned/` and `albums/<folder>/`
+  used to store documents under their bare basename, so two same-named members
+  in one archive silently overwrote each other — a never-lose violation.
+  `preserve()` now counts, over the archive's whole member list and before any
+  write, how many non-media members claim each plain stored path (casefolded,
+  so case-insensitive filesystems are covered). Every member of a colliding
+  group is stored as `<stem>-<first 10 hex of sha256(member path)><ext>`; a
+  member with a unique path keeps its plain path. The suffix depends only on
+  the member path, so the layout is independent of processing order and
+  re-preserving stays a no-op. This relies on callers passing the archive's
+  **full** member list on every call (`ingest._preserve_provenance` does,
+  from `takeout.members_all`); a partial list could place a member differently
+  than a full run. Distinct member paths that sanitize to the same name (e.g.
+  `a:b` and `a_b`) are also kept apart. A room written by the old code is not
+  repaired in place — re-ingesting rewrites the lost members at their new
+  suffixed paths.
 - **`tiers.py`** — pure, I/O-free module defining the two independent quality
   ladders (`DATE_*`, `DESC_*`) and the single predicate `is_upgrade(old, new)` that
   governs every rename in the system: a proposed `(date_tier, descriptor_tier)`
@@ -130,6 +146,25 @@ Per-module detail moved out of `CLAUDE.md` (which keeps a one-line module map an
   a description) and a Hangouts/AlbumArchive row id of the form
   `\d{10,}[\W_]?account[\W_]?id[\W_]?\d+` (a Google Takeout filename shape,
   not human intent).
+  **`machine_generated` flag (PR #35).** Google decorates filenames with
+  `(N)`, `-edited`, `-ANIMATION`, `-MOTION`, `~N` and `_BURST<digits>`, so a
+  decorated camera name (`IMG_1234-edited`) fails the camera match and is
+  classified human-authored (tier 30), immune to AI rename.
+  `strip_google_decorations` removes those suffixes (end-anchored,
+  case-insensitive, repeatedly, so `-edited(1)` unwinds) and
+  `is_decorated_camera_name` raises `ResolvedDescriptor.machine_generated`
+  only when the stem actually changed **and** the stripped base matches
+  `CAMERA_PATTERNS` (either the path stem or the Takeout title counts). A
+  decorated *human* name (`Beach trip-edited`) is never flagged. **Flag only:**
+  the tier, placement and renames are unchanged, so a flagged file stays at
+  tier 30. `pipeline.py` writes `machine_generated: true` into the sidecar
+  `descriptor` block (in both `_write_sidecar` and the duplicate-upgrade
+  update); it is written only when true, so unflagged sidecars are
+  byte-identical to before, and it is sidecar-only (no catalog column). The flag
+  is part of the block's value, not an annotation, so `_ANNOTATION_FIELDS` is
+  unchanged; `sidecar_schema._merge_tiered` folds a same-tier update that only
+  *adds* keys into the block, so an existing sidecar gains the flag without
+  history growth, and an unflagged update never drops an existing flag.
 - **`relocate.py`** — target-path computation (`target_path`) and safe
   in-tree relocation (`apply_relocation`, filesystem first then caller updates the
   catalog) plus digest-based self-healing (`find_by_digest`,
