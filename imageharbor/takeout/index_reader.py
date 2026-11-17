@@ -26,6 +26,10 @@ from typing import Any, Mapping
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
+# Exact membership, not "<= newest": a version below the supported set (0, -1)
+# is as unreadable as one above it, and the shared photo-contracts package
+# defines the supported set as exactly these versions.
+SUPPORTED_VERSIONS = frozenset({SCHEMA_VERSION})
 
 _MEDIA_COLUMNS = frozenset({
     "archive", "path", "sidecar_id", "rule", "confidence"})
@@ -113,9 +117,10 @@ class IndexPairings:
             found = int(row[0])
         except (TypeError, ValueError) as exc:
             raise IndexUnusable(f"{path} has a non-numeric schema_version") from exc
-        if found > SCHEMA_VERSION:
+        if found not in SUPPORTED_VERSIONS:
             raise IndexUnusable(
-                f"{path} is schema {found}; this build knows {SCHEMA_VERSION}")
+                f"{path} is schema {found}; this build supports "
+                f"{sorted(SUPPORTED_VERSIONS)}")
         for table, expected in (("media", _MEDIA_COLUMNS),
                                 ("sidecar", _SIDECAR_COLUMNS),
                                 ("archive", _ARCHIVE_COLUMNS)):
