@@ -25,6 +25,14 @@ renamed or moved archive resolves to the same room::
         orphaned/<basename>
         <every other non-media member, at its member path>
 
+A document keeps that plain path unless another member of the same archive
+would land on the same one (two orphaned sidecars with one basename, two
+``Albums.json`` under same-named folders): every member of such a colliding
+group is stored as ``<stem>-<10 hex of sha256(member path)><ext>`` instead, so
+nothing is ever overwritten. The suffix depends only on the member path, and
+collisions are decided over the archive's whole member list, so the layout is
+independent of processing order and re-preserving is still a no-op.
+
 ``manifest.json`` records a digest per preserved document, keyed by member
 path. A member whose digest already matches what the manifest has on record
 is skipped entirely -- no read result is discarded, but nothing is written
@@ -33,6 +41,7 @@ either -- which is what makes re-preserving the same archive a no-op.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -90,8 +99,33 @@ def manifest_path(organized_dir: Path, archive_id: str) -> Path:
     return _room_dir(organized_dir, archive_id) / _MANIFEST_NAME
 
 
-def _stored_path(room: Path, member: "archive.MemberInfo", *, orphaned: bool) -> Path:
+def _disambiguated(basename: str, member_path: str) -> str:
+    """*basename* with a short digest of *member_path* before the extension.
+
+    Depends only on the member itself, so it is identical on every run.
+    """
+    tag = hashlib.sha256(member_path.encode("utf-8", "surrogatepass")).hexdigest()[:10]
+    path = Path(basename)
+    return f"{path.stem}-{tag}{path.suffix}"
+
+
+def _stored_path(
+    room: Path,
+    member: "archive.MemberInfo",
+    *,
+    orphaned: bool,
+    disambiguate: bool = False,
+) -> Path:
+    """Where *member* is stored.
+
+    A member keeps its plain path (bare basename in the ``orphaned/`` and
+    ``albums/<folder>/`` buckets) unless *disambiguate* is set, which the
+    caller does for exactly the members whose plain path another member of
+    the same archive also claims -- see :func:`preserve`.
+    """
     basename = _safe_component(member.path.rpartition("/")[2])
+    if disambiguate:
+        basename = _disambiguated(basename, member.path)
     if orphaned:
         candidate = room / _ORPHANED_DIR / basename
     elif member.kind == archive.KIND_ALBUM:
@@ -100,6 +134,8 @@ def _stored_path(room: Path, member: "archive.MemberInfo", *, orphaned: bool) ->
         candidate = room / _ALBUMS_DIR / folder_safe / basename
     else:
         candidate = room / _safe_relpath(member.path)
+        if disambiguate:
+            candidate = candidate.with_name(basename)
 
     # Defense-in-depth: sanitization above should already guarantee
     # containment, but a member path is never allowed to write outside the
@@ -168,6 +204,27 @@ def preserve(
     zip itself is the original and remains intact regardless.
     """
     orphaned_set = set(orphaned)
+    members = list(members)
+
+    # Collision detection runs over the WHOLE member list before anything is
+    # written, so a member's stored path never depends on processing order.
+    # Members whose plain path is unique keep it untouched; every member of a
+    # colliding group (casefolded, so case-insensitive filesystems are safe
+    # too) gets a digest-of-member-path suffix. Collisions are per archive:
+    # each archive has its own room.
+    claims: dict[str, int] = {}
+    for member in members:
+        if member.kind in (archive.KIND_IMAGE, archive.KIND_VIDEO):
+            continue
+        try:
+            plain = _stored_path(
+                Path("room"), member, orphaned=member.path in orphaned_set,
+            )
+        except ValueError:
+            continue
+        key = plain.as_posix().casefold()
+        claims[key] = claims.get(key, 0) + 1
+
     room = _room_dir(organized_dir, identity.archive_id)
     manifest_file = manifest_path(organized_dir, identity.archive_id)
     manifest = _load_manifest(manifest_file)
@@ -195,7 +252,11 @@ def preserve(
 
         is_orphaned = member.path in orphaned_set
         try:
-            dest = _stored_path(room, member, orphaned=is_orphaned)
+            plain = _stored_path(Path("room"), member, orphaned=is_orphaned)
+            dest = _stored_path(
+                room, member, orphaned=is_orphaned,
+                disambiguate=claims.get(plain.as_posix().casefold(), 0) > 1,
+            )
         except ValueError as exc:
             logger.warning(
                 "Refusing to preserve %s from %s outside its room; skipping: %s",
