@@ -74,9 +74,39 @@ class ResolvedDescriptor:
     value: str
     tier: int
     source: str
+    # True when the stem is a camera/machine name that Google decorated
+    # ("IMG_1234-edited", "IMG_0042(1)"). FLAG ONLY: the tier verdict is
+    # unchanged (such a name is still DESC_HUMAN_FILENAME); this records the
+    # truth beside it.
+    machine_generated: bool = False
 
 
 _NONE = ResolvedDescriptor(value="", tier=tiers.DESC_NONE, source=tiers.DESC_SOURCE_NAMES[tiers.DESC_NONE])
+
+
+# Google Takeout decorations appended to an otherwise untouched file name.
+# Anchored at the END of the stem and stripped repeatedly, so any order
+# ("-edited(1)") unwinds. Deliberately a short closed list: a greedy strip would
+# flag human names, and an over-eager flag is worse than none.
+_DECORATIONS = re.compile(
+    r"(\(\d+\)|-edited|-animation|-motion|~\d+|_burst\d+)$", re.I
+)
+
+
+def strip_google_decorations(stem: str) -> str:
+    """Remove Google Takeout copy/edit decorations from the end of *stem*."""
+    current = stem.strip()
+    while True:
+        stripped = _DECORATIONS.sub("", current)
+        if stripped == current:
+            return current
+        current = stripped
+
+
+def is_decorated_camera_name(stem: str) -> bool:
+    """True if *stem* is a camera name only once Google's decorations are removed."""
+    base = strip_google_decorations(stem)
+    return base != stem.strip() and bool(base) and is_camera_generated(base)
 
 
 def is_camera_generated(stem: str) -> bool:
@@ -142,4 +172,8 @@ def resolve_descriptor(
         value=normalized,
         tier=tiers.DESC_HUMAN_FILENAME,
         source=tiers.DESC_SOURCE_NAMES[tiers.DESC_HUMAN_FILENAME],
+        machine_generated=(
+            is_decorated_camera_name(path_stem)
+            or bool(title_stem and is_decorated_camera_name(title_stem))
+        ),
     )

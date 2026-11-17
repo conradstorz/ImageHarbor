@@ -570,6 +570,7 @@ class Pipeline:
                         "value": best_descriptor,
                         "tier": new[1],
                         "source": descriptor.source,
+                        **({"machine_generated": True} if descriptor.machine_generated else {}),
                     }
 
                 merge_sidecar(proposed, sidecar_updates)
@@ -619,6 +620,9 @@ class Pipeline:
                     "value": descriptor.value,
                     "tier": descriptor.tier,
                     "source": descriptor.source,
+                    # Only ever present when True, so unflagged sidecars stay
+                    # byte-identical to what earlier versions wrote.
+                    **({"machine_generated": True} if descriptor.machine_generated else {}),
                 },
                 "exif": exif_data,
             },
