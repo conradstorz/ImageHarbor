@@ -280,10 +280,10 @@ def test_a_stored_path_escape_is_isolated_and_does_not_abort_the_archive(
 
     real_stored_path = provenance._stored_path
 
-    def _fake_stored_path(room, member, *, orphaned):
+    def _fake_stored_path(room, member, **kwargs):
         if member.path.endswith("evil.json"):
             raise ValueError("simulated sanitization gap")
-        return real_stored_path(room, member, orphaned=orphaned)
+        return real_stored_path(room, member, **kwargs)
 
     monkeypatch.setattr(provenance, "_stored_path", _fake_stored_path)
 
@@ -324,3 +324,110 @@ def test_a_write_failure_is_logged_and_does_not_raise(dirs, monkeypatch, caplog)
         "archive_browser.html" in record.message or "Failed to preserve" in record.message
         for record in caplog.records
     )
+
+
+# --- same-basename collisions (never overwrite, never lose) --------------------
+
+
+def _preserve_all(organized, zip_path, identity, *, orphaned=(), reverse=False):
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        members = _members(zf)
+        if reverse:
+            members = list(reversed(members))
+        return provenance.preserve(organized, identity, zf, members, orphaned=set(orphaned))
+
+
+def _stored(organized, identity) -> dict[str, str]:
+    manifest = json.loads(
+        provenance.manifest_path(organized, identity.archive_id).read_text(encoding="utf-8")
+    )
+    return {d["member"]: d["stored_as"] for d in manifest["documents"]}
+
+
+def _assert_all_bytes_kept(organized, identity, entries) -> dict[str, str]:
+    room = organized / provenance.ROOM_NAME / identity.archive_id
+    stored = _stored(organized, identity)
+    assert set(stored) == set(entries)
+    assert len(set(stored.values())) == len(stored)  # no two share a path
+    for member, rel in stored.items():
+        assert (room / rel).read_bytes() == entries[member]
+    return stored
+
+
+def test_same_basename_orphaned_members_do_not_overwrite(dirs) -> None:
+    archives, organized = dirs
+    a, b = "Takeout/Google Photos/A/x.jpg.json", "Takeout/Google Photos/B/x.jpg.json"
+    entries = {a: b'{"a": 1}', b: b'{"b": 2}'}
+    zip_path = _zip(archives / "t.zip", entries)
+    identity = _identity(zip_path)
+    assert _preserve_all(organized, zip_path, identity, orphaned={a, b}) == 2
+    stored = _assert_all_bytes_kept(organized, identity, entries)
+    assert all(v.startswith("orphaned/") for v in stored.values())
+
+
+def test_same_basename_in_same_album_folder_do_not_overwrite(dirs) -> None:
+    archives, organized = dirs
+    # Same folder name "album" under two different parents -> same bucket.
+    a, b = "Takeout/P1/album/Albums.json", "Takeout/P2/album/Albums.json"
+    entries = {a: b'{"t": "one"}', b: b'{"t": "two"}'}
+    zip_path = _zip(archives / "t.zip", entries)
+    identity = _identity(zip_path)
+    assert _preserve_all(organized, zip_path, identity) == 2
+    stored = _assert_all_bytes_kept(organized, identity, entries)
+    assert all(v.startswith("albums/album/") for v in stored.values())
+
+
+def test_same_basename_in_different_album_folders_stay_plain(dirs) -> None:
+    archives, organized = dirs
+    a, b = "Takeout/P/one/Albums.json", "Takeout/P/two/Albums.json"
+    entries = {a: b"1", b: b"2"}
+    zip_path = _zip(archives / "t.zip", entries)
+    identity = _identity(zip_path)
+    _preserve_all(organized, zip_path, identity)
+    stored = _assert_all_bytes_kept(organized, identity, entries)
+    assert stored[a] == "albums/one/Albums.json"
+    assert stored[b] == "albums/two/Albums.json"
+
+
+def test_unique_orphaned_basename_keeps_its_plain_path(dirs) -> None:
+    archives, organized = dirs
+    p = f"{D}/only.jpg.json"
+    zip_path = _zip(archives / "t.zip", {p: b"{}", f"{D}/other.json": b"{}"})
+    identity = _identity(zip_path)
+    _preserve_all(organized, zip_path, identity, orphaned={p})
+    assert _stored(organized, identity)[p] == "orphaned/only.jpg.json"
+
+
+def test_collision_paths_are_independent_of_member_order(dirs, tmp_path) -> None:
+    archives, organized = dirs
+    a, b = "Takeout/A/x.json", "Takeout/B/x.json"
+    entries = {a: b"a", b: b"b"}
+    zip_path = _zip(archives / "t.zip", entries)
+    identity = _identity(zip_path)
+    _preserve_all(organized, zip_path, identity, orphaned={a, b})
+    forward = _stored(organized, identity)
+
+    other = tmp_path / "org2"
+    other.mkdir()
+    _preserve_all(other, zip_path, identity, orphaned={a, b}, reverse=True)
+    assert _stored(other, identity) == forward
+
+
+def test_re_preserving_colliding_members_is_a_noop(dirs, monkeypatch) -> None:
+    archives, organized = dirs
+    a, b = "Takeout/A/x.json", "Takeout/B/x.json"
+    zip_path = _zip(archives / "t.zip", {a: b"a", b: b"b"})
+    identity = _identity(zip_path)
+    _preserve_all(organized, zip_path, identity, orphaned={a, b})
+    room = organized / provenance.ROOM_NAME / identity.archive_id
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in room.rglob("*") if p.is_file()}
+
+    calls = []
+    real = provenance._write_bytes
+    monkeypatch.setattr(
+        provenance, "_write_bytes", lambda *x, **k: (calls.append(1), real(*x, **k))[1],
+    )
+    assert _preserve_all(organized, zip_path, identity, orphaned={a, b}, reverse=True) == 0
+    assert calls == []
+    after = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in room.rglob("*") if p.is_file()}
+    assert after == before
