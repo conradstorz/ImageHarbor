@@ -73,16 +73,26 @@ def test_cli_json_documents_match_schemas_and_exit_codes(library):
 
 def test_organized_tree_obeys_layout_and_digest_contract(library):
     src, dest = library
+    # A source with a known capture date (from its filename) so the dated
+    # YYYY/YYYY-MM/ branch is exercised, not only Undated/.
+    Image.new("RGB", (8, 8), (10, 10, 200)).save(src / "2019-07-04 beach.jpg")
     imageharbor.process(src, dest)
     seen = 0
+    dated = 0
     for f in dest.rglob("*.jpg"):
         parsed = layout.parse_filename(f.name)
         assert parsed is not None, f
         rel = f.parent.relative_to(dest).as_posix()
         assert layout.folder_matches_name(rel, parsed), (rel, f.name)
         assert digest.sha256_b64url(f) == parsed.digest
+        if f.name.startswith("2019-07-04"):
+            # the known date must survive into both folder and filename
+            assert rel == "2019/2019-07", rel
+            dated += 1
+        else:
+            assert rel == "Undated", rel
         seen += 1
-    assert seen == 2
+    assert seen == 3 and dated == 1
 
 
 def test_digest_encoding_and_filename_parsing_agree(tmp_path):
